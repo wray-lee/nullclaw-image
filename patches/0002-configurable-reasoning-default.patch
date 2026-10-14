@@ -1,0 +1,351 @@
+From aeda0f195096ad4fc67df74810a537ee1ceaa17c Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Thu, 15 Oct 2026 05:37:58 +0900
+Subject: [PATCH] feat(config): add agent.reasoning_mode default
+
+The reasoning display mode always started at `off` and `/restart` and
+`/debug reset` hard-coded it back to `off`, so users on evicted idle
+sessions had to re-run `/reasoning on` constantly.
+
+Add `agent.reasoning_mode` (`off|on|stream`, default `off`) to
+AgentConfig, parse and serialize it with the rest of the agent section,
+and apply it to both `reasoning_mode` and the new
+`default_reasoning_mode` when an Agent is created. Runtime resets now
+restore that configured default; `/reasoning <mode>` still overrides the
+mode for the current session only.
+
+Docs updated in docs/en/configuration.md and docs/zh/configuration.md.
+---
+ docs/en/configuration.md | 18 ++++++++++
+ docs/zh/configuration.md | 18 ++++++++++
+ src/agent/commands.zig   |  2 +-
+ src/agent/root.zig       | 50 ++++++++++++++++++++--------
+ src/config.zig           | 72 ++++++++++++++++++++++++++++++++++++++++
+ src/config_mutator.zig   |  1 +
+ src/config_parse.zig     |  5 +++
+ src/config_types.zig     | 31 +++++++++++++++++
+ 8 files changed, 183 insertions(+), 14 deletions(-)
+
+diff --git a/docs/en/configuration.md b/docs/en/configuration.md
+index 72bb6c4a..bb486295 100644
+--- a/docs/en/configuration.md
++++ b/docs/en/configuration.md
+@@ -230,6 +230,24 @@ Example:
+ }
+ ```
+ 
++### `agent.reasoning_mode`
++
++- Sets the reasoning display mode for newly created sessions. Accepted values are `off`, `on`, and `stream`; the default is `off`.
++- `off` hides reasoning content, `on` prints a `Reasoning:` quote block above the final reply, and `stream` prints reasoning live while the model produces it.
++- `/reasoning <off|on|stream>` overrides the mode for the current session. `/restart` and `/debug reset` restore this configured default instead of always resetting to `off`.
++- Sessions are evicted after `agent.session_idle_timeout_secs`, so setting this avoids re-running `/reasoning on` after every idle eviction.
++- Changes apply to sessions created after a restart.
++
++Example:
++
++```json
++{
++  "agent": {
++    "reasoning_mode": "stream"
++  }
++}
++```
++
+ ### `workspace_audit.llm_triage`
+ 
+ - Selects the provider/model used by `nullclaw workspace audit --llm-triage external`.
+diff --git a/docs/zh/configuration.md b/docs/zh/configuration.md
+index f69b2b97..3bb5baab 100644
+--- a/docs/zh/configuration.md
++++ b/docs/zh/configuration.md
+@@ -210,6 +210,24 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API
+ }
+ ```
+ 
++### `agent.reasoning_mode`
++
++- 设置新建会话的推理展示模式。可选值为 `off`、`on` 和 `stream`，默认值为 `off`。
++- `off` 不展示推理内容；`on` 会在最终回复上方输出 `Reasoning:` 引用块；`stream` 会在模型生成时实时输出推理内容。
++- `/reasoning <off|on|stream>` 可以覆盖当前会话的模式。`/restart` 和 `/debug reset` 会恢复这里配置的默认值，而不是一律重置为 `off`。
++- 会话会在 `agent.session_idle_timeout_secs` 空闲后被回收，因此配置默认值可以避免每次回收后都要重新执行 `/reasoning on`。
++- 修改后需要重启，新的会话才会使用新的默认值。
++
++示例：
++
++```json
++{
++  "agent": {
++    "reasoning_mode": "stream"
++  }
++}
++```
++
+ ### `workspace_audit.llm_triage`
+ 
+ - 选择 `nullclaw workspace audit --llm-triage external` 使用的 provider/model。
+diff --git a/src/agent/commands.zig b/src/agent/commands.zig
+index 7ec79cb7..2c054e94 100644
+--- a/src/agent/commands.zig
++++ b/src/agent/commands.zig
+@@ -3451,7 +3451,7 @@ fn parseDurationSeconds(raw: []const u8) ?u64 {
+ fn resetRuntimeCommandState(self: anytype) void {
+     self.reasoning_effort = null;
+     self.verbose_level = .off;
+-    self.reasoning_mode = .off;
++    self.reasoning_mode = self.default_reasoning_mode;
+     self.usage_mode = .off;
+     self.exec_host = .gateway;
+     self.exec_security = self.default_exec_security;
+diff --git a/src/agent/root.zig b/src/agent/root.zig
+index cb2ba7c9..27fcf6e1 100644
+--- a/src/agent/root.zig
++++ b/src/agent/root.zig
+@@ -107,19 +107,9 @@ pub const Agent = struct {
+         }
+     };
+ 
+-    const ReasoningMode = enum {
+-        off,
+-        on,
+-        stream,
+-
+-        pub fn toSlice(self: ReasoningMode) []const u8 {
+-            return switch (self) {
+-                .off => "off",
+-                .on => "on",
+-                .stream => "stream",
+-            };
+-        }
+-    };
++    /// Reasoning display mode. Shared with the config layer so the configured
++    /// `agent.reasoning_mode` default applies without conversion.
++    const ReasoningMode = config_types.ReasoningMode;
+ 
+     const UsageMode = enum {
+         off,
+@@ -306,6 +296,8 @@ pub const Agent = struct {
+     reasoning_effort: ?[]const u8 = null,
+     verbose_level: VerboseLevel = .off,
+     reasoning_mode: ReasoningMode = .off,
++    /// Configured default restored by `/restart` and `/debug reset`.
++    default_reasoning_mode: ReasoningMode = .off,
+     usage_mode: UsageMode = .off,
+     exec_host: ExecHost = .gateway,
+     default_exec_security: ExecSecurity = .allowlist,
+@@ -619,6 +611,8 @@ pub const Agent = struct {
+             .max_tokens = resolved_max_tokens,
+             .max_tokens_override = cfg.max_tokens,
+             .reasoning_effort = cfg.reasoning_effort,
++            .reasoning_mode = cfg.agent.reasoning_mode,
++            .default_reasoning_mode = cfg.agent.reasoning_mode,
+             .status_show_emojis = cfg.agent.status_show_emojis,
+             .message_timeout_secs = cfg.agent.message_timeout_secs,
+             .log_tool_calls = cfg.diagnostics.log_tool_calls,
+@@ -5353,6 +5347,36 @@ test "Agent.fromConfig applies default_queue_mode" {
+     try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
+ }
+ 
++test "Agent.fromConfig applies agent.reasoning_mode and resets to it" {
++    // Regression: reasoning_mode used to start at .off with no config default,
++    // so idle session eviction forced users to re-run /reasoning on.
++    const allocator = std.testing.allocator;
++    var cfg = Config{
++        .workspace_dir = "/tmp/yc",
++        .config_path = "/tmp/yc/config.json",
++        .default_model = "openai/gpt-4.1-mini",
++        .allocator = allocator,
++    };
++    cfg.agent.reasoning_mode = .stream;
++
++    var noop = observability.NoopObserver{};
++    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
++    defer agent.deinit();
++
++    try std.testing.expectEqual(Agent.ReasoningMode.stream, agent.reasoning_mode);
++    try std.testing.expectEqual(Agent.ReasoningMode.stream, agent.default_reasoning_mode);
++
++    // Per-session override still wins.
++    const override = (try agent.handleSlashCommand("/reasoning on")).?;
++    defer allocator.free(override);
++    try std.testing.expectEqual(Agent.ReasoningMode.on, agent.reasoning_mode);
++
++    // Reset restores the configured default instead of hard-coded .off.
++    const reset = (try agent.handleSlashCommand("/debug reset")).?;
++    defer allocator.free(reset);
++    try std.testing.expectEqual(Agent.ReasoningMode.stream, agent.reasoning_mode);
++}
++
+ test "slash /new clears history" {
+     const allocator = std.testing.allocator;
+     var agent = try makeTestAgent(allocator);
+diff --git a/src/config.zig b/src/config.zig
+index 0c3cbaeb..352898ae 100644
+--- a/src/config.zig
++++ b/src/config.zig
+@@ -1354,6 +1354,7 @@ pub const Config = struct {
+             .max_history_messages = self.agent.max_history_messages,
+             .parallel_tools = self.agent.parallel_tools,
+             .tool_dispatcher = self.agent.tool_dispatcher,
++            .reasoning_mode = self.agent.reasoning_mode,
+             .default_queue_mode = self.agent.default_queue_mode,
+             .session_idle_timeout_secs = self.agent.session_idle_timeout_secs,
+             .compaction_keep_recent = self.agent.compaction_keep_recent,
+@@ -6776,6 +6777,77 @@ test "agent.default_queue_mode rejects invalid values" {
+     );
+ }
+ 
++test "parse agent.reasoning_mode" {
++    // Regression: the configured default must be parsed before Agent creation.
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const allocator = arena.allocator();
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try cfg.parseJson("{\"agent\":{\"reasoning_mode\":\"stream\"}}");
++    try std.testing.expectEqual(config_types.ReasoningMode.stream, cfg.agent.reasoning_mode);
++    try cfg.parseJson("{\"agent\":{\"reasoning_mode\":\"ON\"}}");
++    try std.testing.expectEqual(config_types.ReasoningMode.on, cfg.agent.reasoning_mode);
++}
++
++test "agent.reasoning_mode defaults to off" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const allocator = arena.allocator();
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try cfg.parseJson("{}");
++    try std.testing.expectEqual(config_types.ReasoningMode.off, cfg.agent.reasoning_mode);
++}
++
++test "agent.reasoning_mode rejects invalid values" {
++    // A typo must not silently fall back to off and hide reasoning again.
++    const allocator = std.testing.allocator;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try std.testing.expectError(
++        error.InvalidReasoningMode,
++        cfg.parseJson("{\"agent\":{\"reasoning_mode\":\"verbose\"}}"),
++    );
++    try std.testing.expectError(
++        error.InvalidReasoningMode,
++        cfg.parseJson("{\"agent\":{\"reasoning_mode\":42}}"),
++    );
++}
++
++test "Config.save preserves agent.reasoning_mode" {
++    const allocator = std.testing.allocator;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++
++    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
++    defer allocator.free(base);
++    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
++    defer allocator.free(config_path);
++
++    var cfg = Config{
++        .workspace_dir = base,
++        .config_path = config_path,
++        .allocator = allocator,
++    };
++    cfg.agent.reasoning_mode = .stream;
++    try cfg.save();
++
++    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
++    defer file.close();
++    const content = try file.readToEndAlloc(allocator, 256 * 1024);
++    defer allocator.free(content);
++
++    try std.testing.expect(std.mem.indexOf(u8, content, "    \"reasoning_mode\": \"stream\"") != null);
++
++    var arena = std.heap.ArenaAllocator.init(allocator);
++    defer arena.deinit();
++    var loaded = Config{
++        .workspace_dir = base,
++        .config_path = config_path,
++        .allocator = arena.allocator(),
++    };
++    try loaded.parseJson(content);
++    try std.testing.expectEqual(config_types.ReasoningMode.stream, loaded.agent.reasoning_mode);
++}
++
+ test "save roundtrip preserves heartbeat dispatch settings" {
+     const allocator = std.testing.allocator;
+     var tmp = std.testing.tmpDir(.{});
+diff --git a/src/config_mutator.zig b/src/config_mutator.zig
+index 4d5d53e1..b9a21a08 100644
+--- a/src/config_mutator.zig
++++ b/src/config_mutator.zig
+@@ -124,6 +124,7 @@ pub fn pathRequiresRestart(path: []const u8) bool {
+     if (std.mem.startsWith(u8, path, "runtime.")) return true;
+     if (std.mem.eql(u8, path, "memory.backend") or std.mem.eql(u8, path, "memory.profile")) return true;
+     if (std.mem.eql(u8, path, "agent.default_queue_mode")) return true;
++    if (std.mem.eql(u8, path, "agent.reasoning_mode")) return true;
+     return false;
+ }
+ 
+diff --git a/src/config_parse.zig b/src/config_parse.zig
+index acbcd8f5..2f1480f7 100644
+--- a/src/config_parse.zig
++++ b/src/config_parse.zig
+@@ -1791,6 +1791,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
+             if (ag.object.get("enable_pii_redaction")) |v| {
+                 if (v == .bool) self.agent.enable_pii_redaction = v.bool;
+             }
++            if (ag.object.get("reasoning_mode")) |v| {
++                if (v != .string) return error.InvalidReasoningMode;
++                self.agent.reasoning_mode = types.ReasoningMode.fromSlice(v.string) orelse
++                    return error.InvalidReasoningMode;
++            }
+             if (ag.object.get("default_queue_mode")) |v| {
+                 if (v != .string) return error.InvalidDefaultQueueMode;
+                 self.agent.default_queue_mode = types.QueueMode.fromSlice(v.string) orelse
+diff --git a/src/config_types.zig b/src/config_types.zig
+index 05fc133d..63b23f26 100644
+--- a/src/config_types.zig
++++ b/src/config_types.zig
+@@ -403,6 +403,33 @@ pub const QueueMode = enum {
+     }
+ };
+ 
++/// Reasoning display mode (`/reasoning`). Shared by the config layer and the
++/// agent runtime so `agent.reasoning_mode` needs no conversion on apply.
++pub const ReasoningMode = enum {
++    off,
++    on,
++    stream,
++
++    pub fn toSlice(self: ReasoningMode) []const u8 {
++        return switch (self) {
++            .off => "off",
++            .on => "on",
++            .stream => "stream",
++        };
++    }
++
++    pub fn fromSlice(s: []const u8) ?ReasoningMode {
++        return if (std.ascii.eqlIgnoreCase(s, "off"))
++            .off
++        else if (std.ascii.eqlIgnoreCase(s, "on"))
++            .on
++        else if (std.ascii.eqlIgnoreCase(s, "stream"))
++            .stream
++        else
++            null;
++    }
++};
++
+ pub const AgentConfig = struct {
+     /// When true (default), history is auto-compacted once it crosses the
+     /// token / message thresholds. Set to false to skip proactive LLM
+@@ -413,6 +440,10 @@ pub const AgentConfig = struct {
+     max_history_messages: u32 = 100,
+     parallel_tools: bool = false,
+     tool_dispatcher: []const u8 = "auto",
++    /// Default reasoning display mode for newly created sessions.
++    /// `/reasoning <off|on|stream>` overrides it per session; `/restart` and
++    /// `/debug reset` restore this default instead of hard-coding `off`.
++    reasoning_mode: ReasoningMode = .off,
+     default_queue_mode: QueueMode = .off,
+     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
+     /// Internal parse marker: true only when token_limit is explicitly set in config.
+-- 
+2.56.0
+

@@ -1,0 +1,115 @@
+name: build nullclaw (main + patches)
+
+on:
+  schedule:
+    - cron: "37 3 * * *"          # daily: build only when upstream main or patches changed
+  push:
+    branches: [main]
+    paths: ["patches/**", ".github/workflows/build.yml"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Upstream ref (default: main)"
+        required: false
+      force:
+        description: "Rebuild even if the image tag already exists"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: nullclaw/nullclaw
+  IMAGE: ghcr.io/${{ github.repository_owner }}/nullclaw
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: self
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Image tag = upstream commit + hash of the patch set, so either changing triggers a rebuild.
+      - name: Resolve tags
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ref="${{ inputs.ref }}"; [ -n "$ref" ] || ref=main
+          sha=$(gh api "repos/$UPSTREAM/commits/$ref" --jq .sha)
+          rev=$(cat self/patches/*.patch 2>/dev/null | sha256sum | cut -c1-8)
+          full="${sha:0:10}-$rev"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "image tag: $full"
+          if [ "${{ inputs.force }}" != "true" ] && docker manifest inspect "$IMAGE:$full" >/dev/null 2>&1; then
+            echo "$IMAGE:$full already exists, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.tag.outputs.skip != 'true'
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.tag.outputs.sha }}
+          path: src
+
+      - name: Apply patches
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          for p in self/patches/*.patch; do
+            [ -e "$p" ] || continue
+            echo "applying $p"
+            git -C src apply --verbose "../$p"
+          done
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.tag.outputs.skip != 'true'
+
+      # Upstream Dockerfile, release target (non-root). Zig cross-compiles for the baseline x86-64 CPU.
+      - name: Build
+        if: steps.tag.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          file: src/Dockerfile
+          target: release
+          platforms: linux/amd64
+          build-args: VERSION=main-${{ steps.tag.outputs.full }}
+          load: true
+          tags: nullclaw:candidate
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=main-${{ steps.tag.outputs.full }}
+
+      # Target hosts are x86-64-v2 (no AVX2): refuse binaries that require v3/v4.
+      - name: Verify binary
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          docker run --rm --entrypoint nullclaw nullclaw:candidate --version
+          cid=$(docker create nullclaw:candidate); docker cp "$cid:/usr/local/bin/nullclaw" ./nc-bin; docker rm "$cid" >/dev/null
+          isa=$(readelf -n ./nc-bin | grep -i 'ISA needed' || true)
+          echo "ISA note: ${isa:-none}"
+          if echo "$isa" | grep -qE 'x86-64-v[34]'; then echo "binary requires x86-64-v3+"; exit 1; fi
+
+      - name: Push
+        if: steps.tag.outputs.skip != 'true'
+        run: |
+          for t in "${{ steps.tag.outputs.full }}" latest; do
+            docker tag nullclaw:candidate "$IMAGE:$t"
+            docker push "$IMAGE:$t"
+          done
