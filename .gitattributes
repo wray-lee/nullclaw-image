@@ -1,0 +1,3 @@
+# Patches must stay byte-identical: the image tag is a hash of the patch set,
+# and `git apply` on Linux rejects CRLF-terminated lines.
+*.patch text eol=lf

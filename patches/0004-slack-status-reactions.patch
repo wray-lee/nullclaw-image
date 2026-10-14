@@ -1,0 +1,703 @@
+From ec560c263345b2ffa7b52631afeb5c6bab9d33e7 Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Thu, 15 Oct 2026 07:09:35 +0900
+Subject: [PATCH] feat(slack): show the task lifecycle as reactions
+
+Slack had no reaction support at all: `status_reactions` and
+`reaction_emojis` existed only on Telegram, and the lifecycle hooks that
+drive them live in the Telegram polling loop, which Slack never runs.
+
+Add the same configuration to `channels.slack.accounts.<id>` and drive it
+from the bus path instead:
+
+- `config_types.SlackReactionEmojisConfig` holds Slack reaction *names*
+  (`eyes`, `hourglass_flowing_sand`, `white_check_mark`, `x`), not emoji;
+  an empty name clears the state.
+- `Channel.setTaskReaction` is a new vtable hook so the daemon can name a
+  lifecycle state on any channel; the channel keeps ownership of the
+  mapping from state to its own configured reaction. `Channel.TaskReaction`
+  is shared with Telegram, whose existing enum becomes an alias.
+- `SlackChannel.setTaskReaction` resolves the state to a plan of
+  `reactions.add` / `reactions.remove` calls. Slack adds reactions instead
+  of replacing them, so the state being left behind is removed explicitly;
+  a state that reuses the name already on the message costs no call, which
+  makes `accepted` and `running` sharing one name free.
+- `daemon.processInboundMessage` emits accepted -> running -> done/failed,
+  the same sequence the Telegram loop uses, including on every failure
+  path so a turn never leaves a stale reaction behind.
+- `already_reacted` and `no_reaction` are treated as success; an auth
+  failure such as `missing_scope` disables reactions for the account after
+  logging once.
+
+The transition table is a pure function (`planTaskReaction`), so the state
+machine is covered without a network.
+
+Docs updated in docs/en/configuration.md and docs/zh/configuration.md.
+
+Validation: `zig build test --summary all` (7589 passed, 14 skipped, 0
+leaked) and `zig fmt --check` on the changed files, both in the Zig
+0.16.0 container.
+---
+ docs/en/configuration.md  |  25 ++++
+ docs/zh/configuration.md  |  20 +++
+ src/channels/root.zig     |  27 +++++
+ src/channels/slack.zig    | 248 ++++++++++++++++++++++++++++++++++++++
+ src/channels/telegram.zig |  10 +-
+ src/config.zig            |  43 +++++++
+ src/config_types.zig      |  16 +++
+ src/daemon.zig            |  42 ++++++-
+ 8 files changed, 424 insertions(+), 7 deletions(-)
+
+diff --git a/docs/en/configuration.md b/docs/en/configuration.md
+index b5788dd1..a44adf52 100644
+--- a/docs/en/configuration.md
++++ b/docs/en/configuration.md
+@@ -1069,6 +1069,31 @@ Parameters:
+ - `group_policy` (default: `mention_only`) - `open`, `allowlist`, `mention_only`
+ - `reply_to_mode` (default: `off`) - `off` threads only when the triggering message is already a thread reply; `all` always replies in a thread
+ - `streaming` (default: `false`) - Show the reply while it is still being generated. See below
++- `status_reactions` (default: `false`) - Show the task lifecycle as a reaction on the message that triggered it: `accepted`, `running`, then `done` or `failed`. Needs the `reactions:write` scope. See below
++- `reaction_emojis` (default: `eyes`, `hourglass_flowing_sand`, `white_check_mark`, `x`) - Per-state overrides for `accepted`, `running`, `done`, `failed`. Slack takes short names, not the emoji themselves; an empty string clears the reaction for that state
++
++#### Slack status reactions
++
++With `status_reactions = true`, nullclaw reacts to the triggering message with
++`reactions.add` and switches the reaction as the turn progresses, then removes it
++on the final state when that state's emoji is empty. Slack adds reactions instead
++of replacing them, so the previous state is removed explicitly.
++
++Give `accepted` and `running` the same name to keep the traffic to one reaction
++per turn:
++
++```json
++"status_reactions": true,
++"reaction_emojis": {
++  "accepted": "hourglass_flowing_sand",
++  "running": "hourglass_flowing_sand",
++  "done": "",
++  "failed": "warning"
++}
++```
++
++An app without `reactions:write` answers `missing_scope`; nullclaw logs it once
++and stops trying for that account.
+ 
+ #### Slack streaming replies
+ 
+diff --git a/docs/zh/configuration.md b/docs/zh/configuration.md
+index 9ff5d0f1..132cea4b 100644
+--- a/docs/zh/configuration.md
++++ b/docs/zh/configuration.md
+@@ -871,8 +871,28 @@ Slack 示例：
+ - `dm_policy`（默认 `pairing`）——`allow`、`deny`、`allowlist`/`pairing`
+ - `group_policy`（默认 `mention_only`）——`open`、`allowlist`、`mention_only`
+ - `reply_to_mode`（默认 `off`）——`off` 仅在触发消息本身已是 thread 回复时才用 thread；`all` 始终在 thread 中回复
++- `status_reactions`（默认 `false`）——在触发消息上用 reaction 显示任务状态：`accepted`、`running`，最后是 `done` 或 `failed`。需要 `reactions:write` 权限
++- `reaction_emojis`（默认 `eyes`、`hourglass_flowing_sand`、`white_check_mark`、`x`）——按状态覆盖 `accepted`、`running`、`done`、`failed`。Slack 用短名而非 emoji 本身；空字符串表示该状态不加 reaction（并移除已有的）
+ - `streaming`（默认 `false`）——在回复仍在生成时就展示，见下文
+ 
++#### Slack 状态 reaction
++
++`status_reactions = true` 时，nullclaw 用 `reactions.add` 在触发消息上加 reaction，随任务推进在 `accepted`、`running`、`done`/`failed` 之间切换，并在该状态的短名为空时用 `reactions.remove` 移除。Slack 的 reaction 是累加而非替换，因此会显式移除上一个状态。
++
++把 `accepted` 和 `running` 设为同一个短名，可以让每轮只产生一次 reaction 请求：
++
++```json
++"status_reactions": true,
++"reaction_emojis": {
++  "accepted": "hourglass_flowing_sand",
++  "running": "hourglass_flowing_sand",
++  "done": "",
++  "failed": "warning"
++}
++```
++
++若应用没有 `reactions:write`，Slack 返回 `missing_scope`，nullclaw 只记录一次并停止对该账号尝试。
++
+ #### Slack 流式回复
+ 
+ 开启 `streaming = true` 后，nullclaw 会边生成边推送，而不是等完整回复再发送。按回复目标选择两条通路：
+diff --git a/src/channels/root.zig b/src/channels/root.zig
+index 311037b0..e7ed44e4 100644
+--- a/src/channels/root.zig
++++ b/src/channels/root.zig
+@@ -124,6 +124,19 @@ pub const Channel = struct {
+         message_id: []const u8,
+         emoji: ?[]const u8 = null,
+     };
++    /// Task lifecycle states a channel can show as a reaction on the message
++    /// that triggered the task.
++    pub const TaskReaction = enum {
++        accepted,
++        running,
++        done,
++        failed,
++    };
++    pub const TaskReactionUpdate = struct {
++        target: []const u8,
++        message_id: []const u8,
++        reaction: TaskReaction,
++    };
+ 
+     fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}
+     fn defaultStopTyping(_: *anyopaque, _: []const u8) anyerror!void {}
+@@ -133,6 +146,9 @@ pub const Channel = struct {
+     fn defaultMarkRead(_: *anyopaque, _: MessageRef) anyerror!void {
+         return error.NotSupported;
+     }
++    fn defaultSetTaskReaction(_: *anyopaque, _: TaskReactionUpdate) anyerror!void {
++        return error.NotSupported;
++    }
+     fn defaultSupportsStreamingOutbound(_: *anyopaque) bool {
+         return false;
+     }
+@@ -185,6 +201,8 @@ pub const Channel = struct {
+         setReaction: *const fn (ptr: *anyopaque, update: ReactionUpdate) anyerror!void = &defaultSetReaction,
+         /// Mark the referenced message as read.
+         markRead: *const fn (ptr: *anyopaque, message_ref: MessageRef) anyerror!void = &defaultMarkRead,
++        /// Show a task lifecycle state as a reaction on the triggering message.
++        setTaskReaction: *const fn (ptr: *anyopaque, update: TaskReactionUpdate) anyerror!void = &defaultSetTaskReaction,
+         /// Whether the channel can consume `.chunk` staged outbound events.
+         supportsStreamingOutbound: *const fn (ptr: *anyopaque) bool = &defaultSupportsStreamingOutbound,
+         /// Whether the channel can create, edit, and delete host-managed draft messages.
+@@ -266,6 +284,10 @@ pub const Channel = struct {
+         return self.vtable.markRead(self.ptr, message_ref);
+     }
+ 
++    pub fn setTaskReaction(self: Channel, update: TaskReactionUpdate) !void {
++        return self.vtable.setTaskReaction(self.ptr, update);
++    }
++
+     pub fn supportsStreamingOutbound(self: Channel) bool {
+         return self.vtable.supportsStreamingOutbound(self.ptr);
+     }
+@@ -1058,6 +1080,11 @@ test "Channel message operations default to not supported" {
+         .message_id = "m-1",
+         .emoji = ":+1:",
+     }));
++    try std.testing.expectError(error.NotSupported, channel.setTaskReaction(.{
++        .target = "chat-1",
++        .message_id = "m-1",
++        .reaction = .accepted,
++    }));
+     try std.testing.expectError(error.NotSupported, channel.editMessage(.{
+         .target = "chat-1",
+         .message_id = "m-1",
+diff --git a/src/channels/slack.zig b/src/channels/slack.zig
+index f29dda19..b00f62c4 100644
+--- a/src/channels/slack.zig
++++ b/src/channels/slack.zig
+@@ -106,6 +106,98 @@ fn buildThreadStatusRequestBody(
+     return try body_list.toOwnedSlice(allocator);
+ }
+ 
++/// Slack targets are `channel_id` or `channel_id:thread_ts`; a reaction is
++/// keyed by channel only, so the thread suffix is dropped.
++fn slackChannelIdOf(target: []const u8) ?[]const u8 {
++    if (target.len == 0) return null;
++    const idx = std.mem.indexOfScalar(u8, target, ':') orelse return target;
++    if (idx == 0) return null;
++    return target[0..idx];
++}
++
++/// The API calls one lifecycle transition needs. Slack adds reactions instead
++/// of replacing them, so the state being left behind has to be removed
++/// explicitly; a state that reuses the emoji already on the message needs no
++/// call at all.
++pub const ReactionPlan = struct {
++    removals: [2]?[]const u8 = .{ null, null },
++    removals_len: u8 = 0,
++    add: ?[]const u8 = null,
++};
++
++const superseded_none = [_]root.Channel.TaskReaction{};
++const superseded_accepted = [_]root.Channel.TaskReaction{.accepted};
++const superseded_running = [_]root.Channel.TaskReaction{ .accepted, .running };
++
++fn supersededReactions(reaction: root.Channel.TaskReaction) []const root.Channel.TaskReaction {
++    return switch (reaction) {
++        .accepted => &superseded_none,
++        .running => &superseded_accepted,
++        .done, .failed => &superseded_running,
++    };
++}
++
++fn reactionEmoji(
++    emojis: config_types.SlackReactionEmojisConfig,
++    reaction: root.Channel.TaskReaction,
++) ?[]const u8 {
++    const name = switch (reaction) {
++        .accepted => emojis.accepted,
++        .running => emojis.running,
++        .done => emojis.done,
++        .failed => emojis.failed,
++    };
++    return if (name.len == 0) null else name;
++}
++
++/// Pure so the transition table is testable without a network.
++pub fn planTaskReaction(
++    emojis: config_types.SlackReactionEmojisConfig,
++    reaction: root.Channel.TaskReaction,
++) ReactionPlan {
++    var plan = ReactionPlan{};
++    const add = reactionEmoji(emojis, reaction);
++    for (supersededReactions(reaction)) |previous| {
++        const emoji = reactionEmoji(emojis, previous) orelse continue;
++        if (add) |next| {
++            if (std.mem.eql(u8, next, emoji)) continue;
++        }
++        var seen = false;
++        for (plan.removals[0..plan.removals_len]) |existing| {
++            if (existing) |already| {
++                if (std.mem.eql(u8, already, emoji)) seen = true;
++            }
++        }
++        if (seen) continue;
++        plan.removals[plan.removals_len] = emoji;
++        plan.removals_len += 1;
++    }
++    plan.add = add;
++    return plan;
++}
++
++fn buildReactionRequestBody(
++    allocator: std.mem.Allocator,
++    channel_id: []const u8,
++    ts: []const u8,
++    emoji: []const u8,
++) ![]u8 {
++    var body_list: std.ArrayListUnmanaged(u8) = .empty;
++    errdefer body_list.deinit(allocator);
++    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_list);
++    errdefer body_writer.deinit();
++    const bw = &body_writer.writer;
++    try bw.writeAll("{\"channel\":");
++    try root.appendJsonStringW(bw, channel_id);
++    try bw.writeAll(",\"timestamp\":");
++    try root.appendJsonStringW(bw, ts);
++    try bw.writeAll(",\"name\":");
++    try root.appendJsonStringW(bw, emoji);
++    try bw.writeByte('}');
++    body_list = body_writer.toArrayList();
++    return try body_list.toOwnedSlice(allocator);
++}
++
+ /// Slack channel — socket/http event pipeline for inbound, chat.postMessage for outbound.
+ pub const SlackChannel = struct {
+     allocator: std.mem.Allocator,
+@@ -127,6 +219,12 @@ pub const SlackChannel = struct {
+     /// Set once a chat.startStream call proves this app/workspace can never
+     /// stream; every later turn uses the chat.postMessage + chat.update path.
+     native_stream_disabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
++    /// Show task lifecycle on the triggering message via reactions.add/remove.
++    status_reactions_enabled: bool = false,
++    reaction_emojis: config_types.SlackReactionEmojisConfig = .{},
++    /// Set once the API proves this app can never react (`missing_scope` and
++    /// friends); later turns skip the calls entirely.
++    reactions_disabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+     /// Guards `stream_states` and the API calls made from it.
+     stream_mu: std_compat.sync.Mutex = .{},
+     stream_states: std.StringHashMapUnmanaged(stream_presenter.StreamState) = .empty,
+@@ -229,9 +327,61 @@ pub const SlackChannel = struct {
+         ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
+         ch.reply_to_mode = cfg.reply_to_mode;
+         ch.streaming_enabled = cfg.streaming;
++        ch.status_reactions_enabled = cfg.status_reactions;
++        ch.reaction_emojis = cfg.reaction_emojis;
+         return ch;
+     }
+ 
++    /// React to the message that triggered a task, mirroring the Telegram
++    /// lifecycle. Best-effort: a failure is logged, never propagated.
++    pub fn setTaskReaction(
++        self: *SlackChannel,
++        target: []const u8,
++        message_id: ?[]const u8,
++        reaction: root.Channel.TaskReaction,
++    ) void {
++        if (!self.status_reactions_enabled) return;
++        if (self.reactions_disabled.load(.acquire)) return;
++        const ts = message_id orelse return;
++        const channel_id = slackChannelIdOf(target) orelse return;
++        if (ts.len == 0) return;
++
++        const plan = planTaskReaction(self.reaction_emojis, reaction);
++        for (plan.removals[0..plan.removals_len]) |removal| {
++            if (removal) |emoji| self.callReactionApi("reactions.remove", channel_id, ts, emoji);
++        }
++        if (plan.add) |emoji| self.callReactionApi("reactions.add", channel_id, ts, emoji);
++    }
++
++    fn callReactionApi(
++        self: *SlackChannel,
++        endpoint: []const u8,
++        channel_id: []const u8,
++        ts: []const u8,
++        emoji: []const u8,
++    ) void {
++        const body = buildReactionRequestBody(self.allocator, channel_id, ts, emoji) catch return;
++        defer self.allocator.free(body);
++
++        var result = self.callSlackApi(endpoint, body, channel_id) catch |err| {
++            log.debug("Slack {s} failed: {}", .{ endpoint, err });
++            return;
++        };
++        defer result.deinit(self.allocator);
++
++        const code = result.error_code orelse return;
++        // The reaction is already in the wanted state.
++        if (std.mem.eql(u8, code, "already_reacted") or std.mem.eql(u8, code, "no_reaction")) return;
++        if (isAuthFailureCode(code)) {
++            if (!self.reactions_disabled.swap(true, .acq_rel)) {
++                log.warn(
++                    "Slack status reactions unavailable for this app ({s}); disabling them for {s}",
++                    .{ code, self.account_id },
++                );
++            }
++        }
++    }
++
+     /// Set the thread timestamp for threaded replies.
+     pub fn setThreadTs(self: *SlackChannel, ts: ?[]const u8) void {
+         self.thread_ts = ts;
+@@ -1453,6 +1603,11 @@ pub const SlackChannel = struct {
+ 
+     const StreamState = stream_presenter.StreamState;
+ 
++    fn vtableSetTaskReaction(ptr: *anyopaque, update: root.Channel.TaskReactionUpdate) anyerror!void {
++        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
++        self.setTaskReaction(update.target, update.message_id, update.reaction);
++    }
++
+     fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
+         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+         return self.streaming_enabled;
+@@ -1921,6 +2076,7 @@ pub const SlackChannel = struct {
+         .healthCheck = &vtableHealthCheck,
+         .startTyping = &vtableStartTyping,
+         .stopTyping = &vtableStopTyping,
++        .setTaskReaction = &vtableSetTaskReaction,
+         .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
+     };
+ 
+@@ -2981,6 +3137,98 @@ test "slack channel interface returns slack name" {
+     try std.testing.expectEqualStrings("slack", iface.name());
+ }
+ 
++test "slack reaction plan clears the state it supersedes" {
++    const emojis = config_types.SlackReactionEmojisConfig{};
++
++    const accepted = planTaskReaction(emojis, .accepted);
++    try std.testing.expectEqual(@as(u8, 0), accepted.removals_len);
++    try std.testing.expectEqualStrings("eyes", accepted.add.?);
++
++    const running = planTaskReaction(emojis, .running);
++    try std.testing.expectEqual(@as(u8, 1), running.removals_len);
++    try std.testing.expectEqualStrings("eyes", running.removals[0].?);
++    try std.testing.expectEqualStrings("hourglass_flowing_sand", running.add.?);
++
++    const done = planTaskReaction(emojis, .done);
++    try std.testing.expectEqual(@as(u8, 2), done.removals_len);
++    try std.testing.expectEqualStrings("eyes", done.removals[0].?);
++    try std.testing.expectEqualStrings("hourglass_flowing_sand", done.removals[1].?);
++    try std.testing.expectEqualStrings("white_check_mark", done.add.?);
++
++    const failed = planTaskReaction(emojis, .failed);
++    try std.testing.expectEqual(@as(u8, 2), failed.removals_len);
++    try std.testing.expectEqualStrings("x", failed.add.?);
++}
++
++test "slack reaction plan reuses an emoji two states share" {
++    const emojis = config_types.SlackReactionEmojisConfig{
++        .accepted = "hourglass_flowing_sand",
++        .running = "hourglass_flowing_sand",
++        .done = "",
++        .failed = "warning",
++    };
++
++    // Same emoji as the state being left, so the reaction stays put.
++    const running = planTaskReaction(emojis, .running);
++    try std.testing.expectEqual(@as(u8, 0), running.removals_len);
++    try std.testing.expectEqualStrings("hourglass_flowing_sand", running.add.?);
++
++    // Empty string clears the state instead of setting one.
++    const done = planTaskReaction(emojis, .done);
++    try std.testing.expectEqual(@as(u8, 1), done.removals_len);
++    try std.testing.expectEqualStrings("hourglass_flowing_sand", done.removals[0].?);
++    try std.testing.expect(done.add == null);
++
++    const failed = planTaskReaction(emojis, .failed);
++    try std.testing.expectEqual(@as(u8, 1), failed.removals_len);
++    try std.testing.expectEqualStrings("warning", failed.add.?);
++}
++
++test "slack reaction plan with every emoji empty is a no-op" {
++    const emojis = config_types.SlackReactionEmojisConfig{
++        .accepted = "",
++        .running = "",
++        .done = "",
++        .failed = "",
++    };
++    const done = planTaskReaction(emojis, .done);
++    try std.testing.expectEqual(@as(u8, 0), done.removals_len);
++    try std.testing.expect(done.add == null);
++}
++
++test "slackChannelIdOf drops the thread suffix" {
++    try std.testing.expectEqualStrings("C123", slackChannelIdOf("C123:1700000000.000000").?);
++    try std.testing.expectEqualStrings("C123", slackChannelIdOf("C123").?);
++    try std.testing.expect(slackChannelIdOf("") == null);
++    try std.testing.expect(slackChannelIdOf(":1700000000.000000") == null);
++}
++
++test "slack setTaskReaction is inert until status_reactions is on" {
++    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{ .bot_token = "tok" });
++    ch.setTaskReaction("C123:1700000000.000000", "1700000000.000001", .accepted);
++
++    ch.status_reactions_enabled = true;
++    ch.setTaskReaction("C123:1700000000.000000", "1700000000.000001", .accepted);
++    ch.setTaskReaction("C123:1700000000.000000", null, .running);
++    ch.setTaskReaction("", "1700000000.000001", .failed);
++
++    ch.reactions_disabled.store(true, .release);
++    ch.setTaskReaction("C123:1700000000.000000", "1700000000.000001", .done);
++}
++
++test "slack vtable exposes the task reaction hook" {
++    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{
++        .bot_token = "tok",
++        .status_reactions = true,
++    });
++    const channel = ch.channel();
++    try channel.setTaskReaction(.{
++        .target = "C123:1700000000.000000",
++        .message_id = "1700000000.000001",
++        .reaction = .running,
++    });
++}
++
+ test "slack channel api base constant" {
+     try std.testing.expectEqualStrings("https://slack.com/api", SlackChannel.API_BASE);
+ }
+diff --git a/src/channels/telegram.zig b/src/channels/telegram.zig
+index 6f3e3447..411af14d 100644
+--- a/src/channels/telegram.zig
++++ b/src/channels/telegram.zig
+@@ -139,12 +139,10 @@ const ParsedTelegramTarget = struct {
+     message_thread_id: ?i64 = null,
+ };
+ 
+-pub const TaskReaction = enum {
+-    accepted,
+-    running,
+-    done,
+-    failed,
+-};
++/// Shared with `Channel.TaskReaction`: the lifecycle states a channel can
++/// show as a reaction, so the daemon can drive any channel that implements
++/// `Channel.setTaskReaction`.
++pub const TaskReaction = root.Channel.TaskReaction;
+ 
+ fn parseTelegramTarget(target: []const u8) ParsedTelegramTarget {
+     const separators = [_][]const u8{ THREAD_TARGET_SEPARATOR, TOPIC_TARGET_SEPARATOR };
+diff --git a/src/config.zig b/src/config.zig
+index 1422cfcb..fb382c55 100644
+--- a/src/config.zig
++++ b/src/config.zig
+@@ -7194,6 +7194,49 @@ test "parse slack streaming from config" {
+     allocator.free(cfg.channels.slack);
+ }
+ 
++test "parse slack status reactions default to off" {
++    const allocator = std.testing.allocator;
++    const json =
++        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try cfg.parseJson(json);
++    try std.testing.expect(cfg.channels.slack.len > 0);
++    try std.testing.expect(!cfg.channels.slack[0].status_reactions);
++    try std.testing.expectEqualStrings("eyes", cfg.channels.slack[0].reaction_emojis.accepted);
++    try std.testing.expectEqualStrings("hourglass_flowing_sand", cfg.channels.slack[0].reaction_emojis.running);
++    try std.testing.expectEqualStrings("white_check_mark", cfg.channels.slack[0].reaction_emojis.done);
++    try std.testing.expectEqualStrings("x", cfg.channels.slack[0].reaction_emojis.failed);
++    allocator.free(cfg.channels.slack[0].account_id);
++    allocator.free(cfg.channels.slack[0].bot_token);
++    allocator.free(cfg.channels.slack[0].allow_from);
++    allocator.free(cfg.channels.slack);
++}
++
++test "parse slack status reactions from config" {
++    const allocator = std.testing.allocator;
++    const json =
++        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123", "status_reactions": true, "reaction_emojis": {"accepted": "hourglass_flowing_sand", "running": "hourglass_flowing_sand", "done": "", "failed": "warning"}}}}}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try cfg.parseJson(json);
++    try std.testing.expect(cfg.channels.slack.len > 0);
++    const sc = cfg.channels.slack[0];
++    try std.testing.expect(sc.status_reactions);
++    try std.testing.expectEqualStrings("hourglass_flowing_sand", sc.reaction_emojis.accepted);
++    try std.testing.expectEqualStrings("hourglass_flowing_sand", sc.reaction_emojis.running);
++    try std.testing.expectEqualStrings("", sc.reaction_emojis.done);
++    try std.testing.expectEqualStrings("warning", sc.reaction_emojis.failed);
++    allocator.free(sc.account_id);
++    allocator.free(sc.bot_token);
++    allocator.free(sc.allow_from);
++    allocator.free(sc.reaction_emojis.accepted);
++    allocator.free(sc.reaction_emojis.running);
++    allocator.free(sc.reaction_emojis.done);
++    allocator.free(sc.reaction_emojis.failed);
++    allocator.free(cfg.channels.slack);
++}
++
+ test "save writes slack streaming" {
+     const allocator = std.testing.allocator;
+     const accounts = [_]SlackConfig{.{
+diff --git a/src/config_types.zig b/src/config_types.zig
+index 93089b67..1e0242af 100644
+--- a/src/config_types.zig
++++ b/src/config_types.zig
+@@ -692,6 +692,16 @@ pub const SlackReplyToMode = enum {
+     all,
+ };
+ 
++/// Slack reaction names, e.g. `eyes`, `hourglass_flowing_sand`,
++/// `white_check_mark`, `x`. Slack has no emoji-picker equivalent for bots, so
++/// these are short names rather than the emoji themselves.
++pub const SlackReactionEmojisConfig = struct {
++    accepted: []const u8 = "eyes",
++    running: []const u8 = "hourglass_flowing_sand",
++    done: []const u8 = "white_check_mark",
++    failed: []const u8 = "x",
++};
++
+ pub const SlackConfig = struct {
+     account_id: []const u8 = "default",
+     mode: SlackReceiveMode = .socket,
+@@ -709,6 +719,12 @@ pub const SlackConfig = struct {
+     /// elsewhere it falls back to a chat.postMessage that is edited with chat.update.
+     /// Off by default: it needs the app's "Agents & AI Apps" feature and paid-plan scopes.
+     streaming: bool = false,
++    /// Show task lifecycle on the triggering user message via Slack reactions.
++    /// Needs the `reactions:write` scope.
++    status_reactions: bool = false,
++    /// Per-state reaction overrides. Empty string clears the reaction for that
++    /// state; two states that share a name cost no extra API call.
++    reaction_emojis: SlackReactionEmojisConfig = .{},
+ };
+ 
+ pub const TeamsConfig = struct {
+diff --git a/src/daemon.zig b/src/daemon.zig
+index c2b73d9f..93320b08 100644
+--- a/src/daemon.zig
++++ b/src/daemon.zig
+@@ -1011,6 +1011,26 @@ fn markInboundMessageRead(
+     };
+ }
+ 
++/// Show a task lifecycle state on the message that triggered the turn.
++/// Channels that do not implement it answer `error.NotSupported`.
++fn setInboundTaskReaction(
++    channel: ?channels_mod.Channel,
++    target: []const u8,
++    message_id: ?[]const u8,
++    reaction: channels_mod.Channel.TaskReaction,
++) void {
++    const ch = channel orelse return;
++    const id = message_id orelse return;
++    ch.setTaskReaction(.{
++        .target = target,
++        .message_id = id,
++        .reaction = reaction,
++    }) catch |err| switch (err) {
++        error.NotSupported => {},
++        else => log.debug("inbound setTaskReaction failed: {}", .{err}),
++    };
++}
++
+ fn sendInboundProcessingIndicator(
+     allocator: std.mem.Allocator,
+     registry: *const dispatch.ChannelRegistry,
+@@ -1309,6 +1329,8 @@ fn processInboundMessage(
+ 
+     if (runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content) == .skip) return;
+ 
++    setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .accepted);
++
+     const typing_recipient = sendInboundProcessingIndicator(
+         allocator,
+         registry,
+@@ -1366,6 +1388,8 @@ fn processInboundMessage(
+         defer channels_mod.max.setInteractiveOwnerContext(null);
+     }
+ 
++    setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .running);
++
+     const reply = runtime.session_mgr.processMessageStreaming(
+         routing_plan.session_key,
+         msg.content,
+@@ -1374,6 +1398,7 @@ fn processInboundMessage(
+         null,
+     ) catch |err| {
+         log.warn("inbound dispatch process failed: {}", .{err});
++        setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
+ 
+         // Send user-visible error reply back to the originating channel
+         const err_msg: []const u8 = switch (err) {
+@@ -1406,11 +1431,22 @@ fn processInboundMessage(
+                     routing_plan.outbound_chat_id,
+                     reply,
+                     outbound_draft_id,
+-                ) catch return;
++                ) catch {
++                    setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
++                    return;
++                };
++                var published = true;
+                 event_bus.publishOutbound(out) catch |publish_err| {
+                     out.deinit(allocator);
++                    published = false;
+                     log.err("inbound dispatch publishOutbound failed: {}", .{publish_err});
+                 };
++                setInboundTaskReaction(
++                    outbound_channel,
++                    msg.chat_id,
++                    parsed_meta.fields.message_id,
++                    if (published) .done else .failed,
++                );
+                 return;
+             };
+             defer payload.deinit(allocator);
+@@ -1420,6 +1456,7 @@ fn processInboundMessage(
+                 .message_id = parsed_meta.fields.message_id.?,
+                 .payload = payload.payload(),
+             })) |_| {
++                setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .done);
+                 return;
+             } else |err| {
+                 log.warn("editMessage failed; falling back to normal outbound: {}", .{err});
+@@ -1436,6 +1473,7 @@ fn processInboundMessage(
+         outbound_draft_id,
+     ) catch |err| {
+         log.err("inbound dispatch makeOutbound failed: {}", .{err});
++        setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
+         return;
+     };
+ 
+@@ -1444,9 +1482,11 @@ fn processInboundMessage(
+         if (err != error.Closed) {
+             log.err("inbound dispatch publishOutbound failed: {}", .{err});
+         }
++        setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
+         return;
+     };
+ 
++    setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .done);
+     health.markComponentOk("inbound_dispatcher");
+     const dispatch_count = evict_counter.fetchAdd(1, .monotonic) + 1;
+     if (shouldRunInboundIdleEviction(dispatch_count)) {
+-- 
+2.56.0
+

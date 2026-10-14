@@ -1,0 +1,456 @@
+From 1a374c1a3b726938f59f1fa7944537362e3534eb Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Thu, 15 Oct 2026 06:20:43 +0900
+Subject: [PATCH] fix(providers): route configured providers by explicit prefix
+
+Only `reliability.fallback_providers` were registered as ReliableProvider
+extras, so a model reference such as `newapi/dpsk` for a provider that is
+configured under `models.providers` but is not a fallback target was not
+recognized: the prefix was stripped and the bare model was sent to the
+primary provider, which rejected it ("Model dpsk is not allowed").
+`/model newapi/dpsk` was therefore unusable.
+
+Every configured provider is now also routable by an explicit
+`provider/model` prefix. Routing and failover stay separate: the
+`routable` entries are only consulted when the caller spells out the
+provider prefix, while the failover chain still contains exactly the
+`reliability.fallback_providers` (plus rotated keys) in their configured
+order, so a bare model keeps its existing failover behavior.
+---
+ src/providers/reliable.zig       | 159 +++++++++++++++++++++++++------
+ src/providers/runtime_bundle.zig | 147 +++++++++++++++++++++++++++-
+ 2 files changed, 274 insertions(+), 32 deletions(-)
+
+diff --git a/src/providers/reliable.zig b/src/providers/reliable.zig
+index 08808e85..a038f9eb 100644
+--- a/src/providers/reliable.zig
++++ b/src/providers/reliable.zig
+@@ -133,6 +133,10 @@ pub const ReliableProvider = struct {
+     inner: Provider,
+     /// Additional fallback providers (empty by default for backward compat).
+     extras: []const ProviderEntry = &.{},
++    /// Providers reachable only through an explicit `provider/model` prefix —
++    /// every provider configured under `models.providers`. They are never
++    /// failover targets, so the failover order stays `extras`-only.
++    routable: []const ProviderEntry = &.{},
+     /// Per-model fallback chains.
+     model_fallbacks: []const ModelFallbackEntry = &.{},
+     /// List of provider names (for diagnostics/logging).
+@@ -199,6 +203,14 @@ pub const ReliableProvider = struct {
+         return r;
+     }
+ 
++    /// Set providers reachable by an explicit `provider/model` prefix but never
++    /// used as failover targets.
++    pub fn withRoutable(self: ReliableProvider, routable: []const ProviderEntry) ReliableProvider {
++        var r = self;
++        r.routable = routable;
++        return r;
++    }
++
+     /// Set per-model fallback chains.
+     pub fn withModelFallbacks(self: ReliableProvider, fallbacks: []const ModelFallbackEntry) ReliableProvider {
+         var r = self;
+@@ -232,42 +244,57 @@ pub const ReliableProvider = struct {
+         return std.ascii.eqlIgnoreCase(provider_name, requested);
+     }
+ 
+-    fn resolveProviderTarget(self: *const ReliableProvider, model_ref: []const u8) ResolvedProviderTarget {
+-        var best_target: ?ResolvedProviderTarget = null;
+-        var best_prefix_len: usize = 0;
+-
+-        if (model_refs.matchExplicitProviderPrefix(model_ref, self.inner.getName())) |split| {
+-            best_target = .{
+-                .provider = self.inner,
+-                .model = split.model,
+-                .explicit = true,
+-            };
+-            best_prefix_len = self.inner.getName().len;
+-        }
+-
+-        for (self.extras) |entry| {
++    /// Record the longest `provider/model` prefix match among `entries`.
++    /// Matches against both the configured entry name and the provider runtime
++    /// name, keeping the longest prefix so nested gateway names win.
++    fn matchExplicitProviders(
++        model_ref: []const u8,
++        entries: []const ProviderEntry,
++        best_target: *?ResolvedProviderTarget,
++        best_prefix_len: *usize,
++    ) void {
++        for (entries) |entry| {
+             if (model_refs.matchExplicitProviderPrefix(model_ref, entry.name)) |split| {
+-                if (entry.name.len > best_prefix_len) {
+-                    best_target = .{
++                if (entry.name.len > best_prefix_len.*) {
++                    best_target.* = .{
+                         .provider = entry.provider,
+                         .model = split.model,
+                         .explicit = true,
+                     };
+-                    best_prefix_len = entry.name.len;
++                    best_prefix_len.* = entry.name.len;
+                 }
+             }
+             const provider_runtime_name = entry.provider.getName();
+             if (model_refs.matchExplicitProviderPrefix(model_ref, provider_runtime_name)) |split| {
+-                if (provider_runtime_name.len > best_prefix_len) {
+-                    best_target = .{
++                if (provider_runtime_name.len > best_prefix_len.*) {
++                    best_target.* = .{
+                         .provider = entry.provider,
+                         .model = split.model,
+                         .explicit = true,
+                     };
+-                    best_prefix_len = provider_runtime_name.len;
++                    best_prefix_len.* = provider_runtime_name.len;
+                 }
+             }
+         }
++    }
++
++    fn resolveProviderTarget(self: *const ReliableProvider, model_ref: []const u8) ResolvedProviderTarget {
++        var best_target: ?ResolvedProviderTarget = null;
++        var best_prefix_len: usize = 0;
++
++        if (model_refs.matchExplicitProviderPrefix(model_ref, self.inner.getName())) |split| {
++            best_target = .{
++                .provider = self.inner,
++                .model = split.model,
++                .explicit = true,
++            };
++            best_prefix_len = self.inner.getName().len;
++        }
++
++        // Explicit `provider/model` refs win over failover entries, and
++        // configured-but-not-failover providers are routable too.
++        matchExplicitProviders(model_ref, self.extras, &best_target, &best_prefix_len);
++        matchExplicitProviders(model_ref, self.routable, &best_target, &best_prefix_len);
+ 
+         const split = model_refs.splitProviderModel(model_ref) orelse model_refs.ProviderModelRef{
+             .provider = null,
+@@ -293,6 +320,17 @@ pub const ReliableProvider = struct {
+                     };
+                 }
+             }
++            for (self.routable) |entry| {
++                if (matchesProvider(entry.name, requested_provider) or
++                    matchesProvider(entry.provider.getName(), requested_provider))
++                {
++                    return .{
++                        .provider = entry.provider,
++                        .model = split.model,
++                        .explicit = true,
++                    };
++                }
++            }
+             if (matchesProvider(self.inner.getName(), requested_provider)) {
+                 return .{
+                     .provider = self.inner,
+@@ -699,6 +737,9 @@ pub const ReliableProvider = struct {
+         for (self.extras) |entry| {
+             entry.provider.deinit();
+         }
++        for (self.routable) |entry| {
++            entry.provider.deinit();
++        }
+     }
+ 
+     fn warmupImpl(ptr: *anyopaque) void {
+@@ -707,6 +748,9 @@ pub const ReliableProvider = struct {
+         for (self.extras) |entry| {
+             entry.provider.warmup();
+         }
++        for (self.routable) |entry| {
++            entry.provider.warmup();
++        }
+     }
+ };
+ 
+@@ -1362,7 +1406,7 @@ test "warmup calls inner and extras" {
+     try std.testing.expect(extra_mock.warmed_up);
+ }
+ 
+-/// Mock provider with a name, a fail switch, and the streaming
++/// Mock provider with a routable name, a fail switch, and the streaming
+ /// native-tools capability, used by the routing/capability tests below.
+ const StreamingToolsMock = struct {
+     name: []const u8,
+@@ -1449,24 +1493,79 @@ test "ReliableProvider delegates supportsStreamingNativeTools to a capable inner
+ }
+ 
+ test "ReliableProvider resolves supportsStreamingNativeTools through an explicit prefix" {
+-    // Regression: a wrapper must report the capability of the provider that
+-    // actually serves the request, not of the primary one.
+-    var primary = StreamingToolsMock{ .name = "primary", .streaming_native_tools = true };
+-    var newapi = StreamingToolsMock{ .name = "newapi", .streaming_native_tools = false };
++    // Regression: a wrapper that is not itself capable must still report true
++    // when the resolved target (here a routable, non-failover provider) is.
++    var primary = StreamingToolsMock{ .name = "primary", .streaming_native_tools = false };
++    var newapi = StreamingToolsMock{ .name = "newapi", .streaming_native_tools = true };
+ 
+-    const extras = [_]ProviderEntry{
++    const routable = [_]ProviderEntry{
+         .{ .name = "newapi", .provider = newapi.toProvider() },
+     };
+-    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withExtras(&extras);
++    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withRoutable(&routable);
+     const prov = reliable.provider();
+ 
+-    // The prefix wins over the (capable) primary provider.
+-    try std.testing.expect(!prov.supportsStreamingNativeTools("newapi/dpsk"));
++    try std.testing.expect(prov.supportsStreamingNativeTools("newapi/dpsk"));
+     // A bare model still resolves to the primary provider.
+-    try std.testing.expect(prov.supportsStreamingNativeTools("dpsk"));
++    try std.testing.expect(!prov.supportsStreamingNativeTools("dpsk"));
+ }
+ 
++test "ReliableProvider routes an explicit prefix to a non-failover provider" {
++    // Regression: `/model newapi/dpsk` used to strip the prefix and send `dpsk`
++    // to the primary provider because only fallback providers were routable.
++    var primary = StreamingToolsMock{ .name = "primary", .streaming_native_tools = false };
++    var newapi = StreamingToolsMock{ .name = "newapi", .streaming_native_tools = true };
+ 
++    const routable = [_]ProviderEntry{
++        .{ .name = "newapi", .provider = newapi.toProvider() },
++    };
++    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withRoutable(&routable);
++    const prov = reliable.provider();
++
++    var response = try prov.chat(
++        std.testing.allocator,
++        .{ .messages = &.{}, .model = "newapi/dpsk" },
++        "newapi/dpsk",
++        0.7,
++    );
++    defer response.deinit(std.testing.allocator);
++
++    try std.testing.expectEqualStrings("routed", response.content.?);
++    try std.testing.expectEqualStrings("dpsk", newapi.lastModel());
++    try std.testing.expectEqual(@as(u32, 1), newapi.calls);
++    try std.testing.expectEqual(@as(u32, 0), primary.calls);
++}
++
++test "ReliableProvider keeps failover limited to extras" {
++    var primary = StreamingToolsMock{ .name = "primary", .streaming_native_tools = false, .fail = true };
++    var fallback = StreamingToolsMock{ .name = "fallback", .streaming_native_tools = false };
++    var newapi = StreamingToolsMock{ .name = "newapi", .streaming_native_tools = true };
++
++    const extras = [_]ProviderEntry{
++        .{ .name = "fallback", .provider = fallback.toProvider() },
++    };
++    const routable = [_]ProviderEntry{
++        .{ .name = "newapi", .provider = newapi.toProvider() },
++    };
++    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50)
++        .withExtras(&extras)
++        .withRoutable(&routable);
++    const prov = reliable.provider();
++
++    var response = try prov.chat(
++        std.testing.allocator,
++        .{ .messages = &.{}, .model = "dpsk" },
++        "dpsk",
++        0.7,
++    );
++    defer response.deinit(std.testing.allocator);
++
++    // Bare model: primary fails, configured fallback serves it, and the
++    // routable-only provider is never used as a failover target.
++    try std.testing.expectEqualStrings("routed", response.content.?);
++    try std.testing.expectEqual(@as(u32, 1), primary.calls);
++    try std.testing.expectEqual(@as(u32, 1), fallback.calls);
++    try std.testing.expectEqual(@as(u32, 0), newapi.calls);
++}
+ 
+ test "multi-provider fallback: primary fails, extra succeeds" {
+     var primary = MockInnerProvider{ .call_count = 0, .fail_until = 100, .supports_tools = false };
+diff --git a/src/providers/runtime_bundle.zig b/src/providers/runtime_bundle.zig
+index 3a520e3c..258768c0 100644
+--- a/src/providers/runtime_bundle.zig
++++ b/src/providers/runtime_bundle.zig
+@@ -75,6 +75,54 @@ fn appendHolderPlan(
+     return plans.items.len;
+ }
+ 
++/// Provider names reachable through an explicit `provider/model` prefix but
++/// deliberately kept out of the failover chain.
++///
++/// Every provider configured under `models.providers` qualifies, except the
++/// default provider (already the primary) and providers already covered by
++/// `reliability.fallback_providers` (which keep their configured failover
++/// order). When the inner provider is the router it already resolves explicit
++/// refs against the same provider set, so no extra entries are built.
++fn collectRoutableProviderNames(
++    allocator: std.mem.Allocator,
++    cfg: *const Config,
++    has_router: bool,
++) ![]const []const u8 {
++    if (has_router) return &.{};
++
++    var names: std.ArrayListUnmanaged([]const u8) = .empty;
++    errdefer names.deinit(allocator);
++
++    for (cfg.providers) |provider_cfg| {
++        if (provider_names.providerNamesMatch(provider_cfg.name, cfg.default_provider)) continue;
++
++        var already_known = false;
++        for (cfg.reliability.fallback_providers) |fallback| {
++            if (provider_names.providerNamesMatch(provider_cfg.name, fallback)) {
++                already_known = true;
++                break;
++            }
++        }
++        if (!already_known) {
++            for (names.items) |existing| {
++                if (provider_names.providerNamesMatch(provider_cfg.name, existing)) {
++                    already_known = true;
++                    break;
++                }
++            }
++        }
++        if (already_known) continue;
++
++        try names.append(allocator, provider_cfg.name);
++    }
++
++    if (names.items.len == 0) {
++        names.deinit(allocator);
++        return &.{};
++    }
++    return try names.toOwnedSlice(allocator);
++}
++
+ /// Runtime provider wiring with optional reliability wrapper.
+ ///
+ /// Owns:
+@@ -265,7 +313,19 @@ pub const RuntimeProviderBundle = struct {
+             }
+         }
+ 
+-        const extra_count = cfg.reliability.fallback_providers.len + rotating_key_count;
++        // Only fallback providers (plus rotated keys) join the failover chain;
++        // every other configured provider stays reachable by explicit
++        // `provider/model` prefix so `/model <provider>/<model>` works without
++        // turning it into a failover target.
++        const failover_entry_count = cfg.reliability.fallback_providers.len + rotating_key_count;
++        const routable_provider_names = try collectRoutableProviderNames(
++            allocator,
++            cfg,
++            bundle.router_ptr != null,
++        );
++        defer allocator.free(routable_provider_names);
++
++        const extra_count = failover_entry_count + routable_provider_names.len;
+         const need_reliable =
+             cfg.reliability.provider_retries > 0 or
+             cfg.reliability.model_fallbacks.len > 0 or
+@@ -327,6 +387,29 @@ pub const RuntimeProviderBundle = struct {
+                 }
+             }
+ 
++            // Explicit-prefix-only providers are appended after the failover
++            // entries; the two slices are split again when wiring the wrapper.
++            for (routable_provider_names) |provider_name| {
++                const routable_key = api_key.resolveApiKeyFromConfig(
++                    allocator,
++                    provider_name,
++                    cfg.providers,
++                ) catch null;
++                bundle.extra_keys.?[extra_i] = routable_key;
++                bundle.extra_holders.?[extra_i] = @import("root.zig").holderFromConfig(
++                    allocator,
++                    cfg,
++                    provider_name,
++                    routable_key,
++                );
++                bundle.extra_holders_initialized = extra_i + 1;
++                bundle.reliable_entries.?[extra_i] = .{
++                    .name = provider_name,
++                    .provider = bundle.extra_holders.?[extra_i].provider(),
++                };
++                extra_i += 1;
++            }
++
+             std.debug.assert(extra_i == extra_count);
+         }
+ 
+@@ -351,7 +434,8 @@ pub const RuntimeProviderBundle = struct {
+         );
+ 
+         if (bundle.reliable_entries) |entries| {
+-            reliable_impl = reliable_impl.withExtras(entries);
++            reliable_impl = reliable_impl.withExtras(entries[0..failover_entry_count]);
++            reliable_impl = reliable_impl.withRoutable(entries[failover_entry_count..]);
+         }
+         if (bundle.model_fallbacks) |model_fallbacks| {
+             reliable_impl = reliable_impl.withModelFallbacks(model_fallbacks);
+@@ -618,6 +702,65 @@ test "RuntimeProviderBundle threads extra_body_params to primary provider" {
+     try std.testing.expectEqualStrings("{\"seed\":123}", bundle.primary_holder.?.compatible.extra_body_params.?);
+ }
+ 
++test "RuntimeProviderBundle makes non-fallback configured providers routable" {
++    // Regression: `/model newapi/dpsk` stripped the prefix and sent `dpsk` to
++    // the primary provider because only fallback_providers were registered.
++    const providers_cfg = [_]@import("../config_types.zig").ProviderEntry{
++        .{ .name = "openrouter", .api_key = "primary-key" },
++        .{ .name = "newapi", .api_key = "newapi-key", .base_url = "https://newapi.example.com/v1" },
++    };
++    var cfg = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .allocator = std.testing.allocator,
++        .default_provider = "openrouter",
++        .providers = &providers_cfg,
++    };
++    cfg.reliability.provider_retries = 1;
++
++    var bundle = try RuntimeProviderBundle.init(std.testing.allocator, &cfg);
++    defer bundle.deinit();
++
++    const reliable_ptr = bundle.reliable_ptr orelse return error.TestUnexpectedResult;
++    // The failover chain stays empty: newapi is reachable by prefix only.
++    try std.testing.expectEqual(@as(usize, 0), reliable_ptr.extras.len);
++    try std.testing.expectEqual(@as(usize, 1), reliable_ptr.routable.len);
++    try std.testing.expectEqualStrings("newapi", reliable_ptr.routable[0].name);
++
++    const prov = bundle.provider();
++    // The explicit prefix resolves to the capable configured provider...
++    try std.testing.expect(prov.supportsStreamingNativeTools("newapi/dpsk"));
++    // ...while a bare model still resolves to the non-capable primary.
++    try std.testing.expect(!prov.supportsStreamingNativeTools("dpsk"));
++}
++
++test "RuntimeProviderBundle keeps fallback providers in the failover chain" {
++    const providers_cfg = [_]@import("../config_types.zig").ProviderEntry{
++        .{ .name = "openrouter", .api_key = "primary-key" },
++        .{ .name = "newapi", .api_key = "newapi-key" },
++        .{ .name = "groq", .api_key = "gsk_fb" },
++    };
++    var cfg = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .allocator = std.testing.allocator,
++        .default_provider = "openrouter",
++        .providers = &providers_cfg,
++    };
++    cfg.reliability.provider_retries = 1;
++    cfg.reliability.fallback_providers = &.{"groq"};
++
++    var bundle = try RuntimeProviderBundle.init(std.testing.allocator, &cfg);
++    defer bundle.deinit();
++
++    const reliable_ptr = bundle.reliable_ptr orelse return error.TestUnexpectedResult;
++    // groq is a failover target; newapi is routable-only.
++    try std.testing.expectEqual(@as(usize, 1), reliable_ptr.extras.len);
++    try std.testing.expectEqualStrings("groq", reliable_ptr.extras[0].name);
++    try std.testing.expectEqual(@as(usize, 1), reliable_ptr.routable.len);
++    try std.testing.expectEqualStrings("newapi", reliable_ptr.routable[0].name);
++}
++
+ test "RuntimeProviderBundle threads max_streaming_prompt_bytes to fallback providers" {
+     // GAP-17: Fallback providers listed in reliability.fallback_providers must
+     // also have their limit wired through from the per-provider config.
+-- 
+2.56.0
+

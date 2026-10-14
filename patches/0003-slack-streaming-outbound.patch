@@ -1,0 +1,2910 @@
+From 94a34ba0a672dedf7b09f1c0571350a722e59273 Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Thu, 15 Oct 2026 05:44:56 +0900
+Subject: [PATCH 1/2] feat(slack): stream outbound replies while they are
+ generated
+
+Slack was the only streaming-capable channel without an outbound stream
+sink, so replies only appeared once the model had finished. Add
+`channels.slack.accounts.<id>.streaming` (default false) and wire the
+channel into the existing `.chunk`/`.final` outbound staging:
+
+- In a thread, use Slack's native AI streaming methods:
+  chat.startStream, throttled chat.appendStream deltas, then
+  chat.stopStream.
+- Elsewhere, and whenever Slack rejects the native methods, post one
+  message with chat.postMessage and edit it with throttled chat.update.
+
+Deltas are coalesced to at most one API call per second per turn so each
+method stays inside its rate-limit tier, and tool-call markup is stripped
+before anything is sent. A permanent error (missing_scope,
+channel_type_not_supported, invalid_thread_ts, ...) disables the native
+path for the account so later turns go straight to edited messages.
+
+`/reasoning stream` now also shows the thinking live in the draft on
+Slack and Telegram: the daemon forwards `<think>` blocks (TagFilter
+passthrough mode) only for sessions that stream reasoning and only to
+channels that render them, and the draft presenters render them as `>`
+quotes. The delivered reply is unchanged - the provider still strips
+think blocks from the final content, and `.off`/`.on` previews stay
+stripped as before. A Slack turn that streamed reasoning rewrites the
+stopped message in place instead of posting the reply twice.
+
+Validation: `zig build test --summary all` (7555 passed, 0 leaked) and
+`zig fmt --check` on the changed files, both in the Zig 0.16.0 container.
+---
+ docs/en/configuration.md                  | 107 +++
+ docs/zh/configuration.md                  |  83 +++
+ src/channels/slack.zig                    | 736 ++++++++++++++++++++-
+ src/channels/slack_stream_presenter.zig   | 767 ++++++++++++++++++++++
+ src/channels/telegram_draft_presenter.zig |  34 +-
+ src/config.zig                            |  68 ++
+ src/config_types.zig                      |   5 +
+ src/daemon.zig                            |  64 +-
+ src/providers/helpers.zig                 |  77 +++
+ src/providers/root.zig                    |   1 +
+ src/session.zig                           |  11 +
+ src/streaming.zig                         | 105 ++-
+ 12 files changed, 2044 insertions(+), 14 deletions(-)
+ create mode 100755 src/channels/slack_stream_presenter.zig
+
+diff --git a/docs/en/configuration.md b/docs/en/configuration.md
+index bb486295..b5788dd1 100644
+--- a/docs/en/configuration.md
++++ b/docs/en/configuration.md
+@@ -1034,6 +1034,113 @@ Common issues:
+ - Bot offline: Check `nullclaw service status`, verify token hasn't been reset
+ - No response in guilds: Check `require_mention` setting, verify Read Messages permission
+ 
++### Slack
++
++Slack example:
++
++```json
++{
++  "channels": {
++    "slack": {
++      "accounts": {
++        "default": {
++          "bot_token": "xoxb-YOUR_BOT_TOKEN",
++          "app_token": "xapp-YOUR_APP_TOKEN",
++          "channel_id": "C0123456789",
++          "allow_from": ["U0123456789"],
++          "reply_to_mode": "all",
++          "streaming": true
++        }
++      }
++    }
++  }
++}
++```
++
++Parameters:
++- `mode` (default: `socket`) - `socket` uses Socket Mode (needs `app_token`); `http` receives Events API webhooks at `webhook_path` and needs `signing_secret`
++- `bot_token` (required) - Bot User OAuth token (`xoxb-...`)
++- `app_token` (optional) - App-level token (`xapp-...`), required for `mode = socket`
++- `signing_secret` (optional) - Required for `mode = http`
++- `webhook_path` (default: `/slack/events`) - Webhook path for `mode = http`
++- `channel_id` (optional) - Channel polled by the history fallback when Socket Mode is unavailable
++- `allow_from` (default: []) - User ID allowlist. An omitted or empty list denies inbound messages; use `["*"]` only when you intentionally want an open bot
++- `dm_policy` (default: `pairing`) - `allow`, `deny`, `allowlist`/`pairing`
++- `group_policy` (default: `mention_only`) - `open`, `allowlist`, `mention_only`
++- `reply_to_mode` (default: `off`) - `off` threads only when the triggering message is already a thread reply; `all` always replies in a thread
++- `streaming` (default: `false`) - Show the reply while it is still being generated. See below
++
++#### Slack streaming replies
++
++With `streaming = true`, nullclaw publishes the model output progressively instead of
++waiting for the complete reply. Two transports are used, chosen per reply target:
++
++- **Native streaming** - for a threaded target (`reply_to_mode = all`, an inbound thread
++  reply, or an assistant thread) nullclaw calls `chat.startStream`, then throttled
++  `chat.appendStream` calls, then `chat.stopStream`. Slack only accepts a stream inside a
++  thread, so a top-level target never uses this path.
++- **Edited message** - for top-level targets, and whenever Slack rejects the native
++  methods, nullclaw posts one message with `chat.postMessage` and updates it with
++  throttled `chat.update` calls.
++
++Deltas are coalesced (at most one API call per second per turn) to stay inside Slack's
++per-method rate limits. Tool-call markup is always stripped before anything is sent. If a
++native streaming call fails with a permanent error (`channel_type_not_supported`,
++`missing_scope`, `invalid_thread_ts`, ...), nullclaw stops trying the native methods for
++that account and uses edited messages from then on.
++
++#### Live reasoning in drafts
++
++`/reasoning stream` makes the model's thinking visible while it is produced, in the live
++draft on Slack and Telegram. The thinking is rendered as a `>` quote (Slack blockquote,
++`>`-prefixed lines on Telegram drafts, which are sent without a parse mode) and the answer
++appears below it once the model starts writing. Long thinking is truncated to the platform
++limit keeping the tail, and the existing per-turn throttling applies to it like any other
++delta.
++
++The delivered reply never contains the thinking, whatever the mode:
++
++- `stream` - the thinking is shown live in the draft only.
++- `on` - the thinking is not shown live; a `Reasoning:` block is appended to the final reply.
++- `off` - the thinking is discarded.
++
++Because a streamed draft contains text the final reply omits, Slack rewrites the stopped
++message in place (`chat.update`) when a turn streamed reasoning, instead of posting the
++reply a second time. On channels that have nowhere to show reasoning, the live preview stays
++stripped.
++
++Required Slack app settings:
++
++1. Enable **Agents & AI Apps** (shown as **Agents**) under *Features* in the app settings.
++   This is the feature gate for `chat.startStream` and requires a paid Slack plan.
++2. Bot token scopes: `chat:write` (required for all outbound replies) plus `assistant:write`
++   (added automatically when the app is declared as an agent). Add `im:history` and
++   `channels:history` if you rely on history polling.
++3. Events: `app_mention`, `message.im`, `message.channels` (and
++   `assistant_thread_started` / `assistant_thread_context_changed` for assistant threads).
++4. Reinstall the app after changing scopes, then restart nullclaw.
++
++Without the feature or the scope, `streaming = true` is harmless: the first
++`chat.startStream` call is rejected, the reply falls back to the edited-message path, and
++the warning is logged once per account.
++
++Verification:
++```bash
++nullclaw channel start slack
++nullclaw channel status
++```
++
++`nullclaw channel start slack` starts only the first configured Slack account. For
++multi-account validation, run `nullclaw gateway` and send a test message to each configured bot.
++
++Common issues:
++- Replies arrive only when complete: check that `streaming` is `true`, that the app has the
++  Agents & AI Apps feature enabled, and look for `Slack native streaming unavailable for this app`
++  in the logs
++- `missing_scope` in the logs: reinstall the app after adding `chat:write` and `assistant:write`
++- No streaming in channels: Slack only streams inside threads, so set `reply_to_mode` to `all`
++- No response at all: check `allow_from`, and in groups that the bot is mentioned
++
+ ### `memory`
+ 
+ - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
+diff --git a/docs/zh/configuration.md b/docs/zh/configuration.md
+index 3bb5baab..9ff5d0f1 100644
+--- a/docs/zh/configuration.md
++++ b/docs/zh/configuration.md
+@@ -836,6 +836,89 @@ Max 说明：
+ - `require_mention = true` 仅影响群聊。私聊和 `bot_started` deep link 不受影响。
+ - Max inline button 在 nullclaw 中是一次性的：有效点击后原始键盘会被清除，避免过期按钮。
+ 
++### Slack
++
++Slack 示例：
++
++```json
++{
++  "channels": {
++    "slack": {
++      "accounts": {
++        "default": {
++          "bot_token": "xoxb-YOUR_BOT_TOKEN",
++          "app_token": "xapp-YOUR_APP_TOKEN",
++          "channel_id": "C0123456789",
++          "allow_from": ["U0123456789"],
++          "reply_to_mode": "all",
++          "streaming": true
++        }
++      }
++    }
++  }
++}
++```
++
++参数说明：
++
++- `mode`（默认 `socket`）——`socket` 使用 Socket Mode（需要 `app_token`）；`http` 在 `webhook_path` 接收 Events API webhook，需要 `signing_secret`
++- `bot_token`（必填）——Bot User OAuth token（`xoxb-...`）
++- `app_token`（可选）——App-level token（`xapp-...`），`mode = socket` 时必填
++- `signing_secret`（可选）——`mode = http` 时必填
++- `webhook_path`（默认 `/slack/events`）——`mode = http` 的 webhook 路径
++- `channel_id`（可选）——Socket Mode 不可用时，history 轮询回退所轮询的频道
++- `allow_from`（默认 `[]`）——用户 ID 白名单。留空或省略会拒绝所有入站消息；仅在确实需要开放 bot 时使用 `["*"]`
++- `dm_policy`（默认 `pairing`）——`allow`、`deny`、`allowlist`/`pairing`
++- `group_policy`（默认 `mention_only`）——`open`、`allowlist`、`mention_only`
++- `reply_to_mode`（默认 `off`）——`off` 仅在触发消息本身已是 thread 回复时才用 thread；`all` 始终在 thread 中回复
++- `streaming`（默认 `false`）——在回复仍在生成时就展示，见下文
++
++#### Slack 流式回复
++
++开启 `streaming = true` 后，nullclaw 会边生成边推送，而不是等完整回复再发送。按回复目标选择两条通路：
++
++- **原生流式**——目标是 thread 时（`reply_to_mode = all`、入站消息本身是 thread 回复，或 assistant thread），nullclaw 依次调用 `chat.startStream`、限流的 `chat.appendStream`，最后 `chat.stopStream`。Slack 只允许在 thread 内流式输出，因此顶层目标不会走这条通路。
++- **编辑消息**——顶层目标，或 Slack 拒绝原生方法时，nullclaw 用 `chat.postMessage` 发一条消息，再用限流的 `chat.update` 更新它。
++
++增量会被合并（每轮最多每秒一次 API 调用），以落在 Slack 各方法的速率限制内。工具调用标记在发送前始终会被剥离。如果原生流式调用返回永久性错误（`channel_type_not_supported`、`missing_scope`、`invalid_thread_ts` 等），nullclaw 会对该账号停止尝试原生方法，之后改用编辑消息。
++
++#### 草稿中的实时推理
++
++使用 `/reasoning stream` 时，模型的思考过程会在生成过程中实时显示在 Slack 与 Telegram 的草稿里。思考内容以 `>` 引用形式渲染（Slack 为 blockquote；Telegram 草稿不设置 parse mode，因此是带 `>` 前缀的纯文本），模型开始写正文后答案出现在其下方。过长的思考会按平台上限截断并保留尾部，同时沿用原有的每轮限流。
++
++无论哪种模式，最终送达的回复都不包含思考内容：
++
++- `stream`——思考只在草稿中实时展示。
++- `on`——不实时展示，改由最终回复追加 `Reasoning:` 区块。
++- `off`——丢弃思考内容。
++
++由于草稿中包含最终回复不包含的文本，当某一轮流式输出了推理内容时，Slack 会用 `chat.update` 就地改写已结束的消息，而不是再发一条回复。对于没有地方展示推理内容的渠道，实时预览仍保持剥离。
++
++Slack 应用侧必需配置：
++
++1. 在应用设置的 *Features* 中启用 **Agents & AI Apps**（界面可能只显示 **Agents**）。这是 `chat.startStream` 的功能开关，且需要付费 Slack 套餐。
++2. Bot token scopes：`chat:write`（所有出站回复必需），以及 `assistant:write`（把应用声明为 agent 时会自动添加）。如果依赖 history 轮询，再加 `im:history` 与 `channels:history`。
++3. Events：`app_mention`、`message.im`、`message.channels`（assistant thread 另需 `assistant_thread_started` / `assistant_thread_context_changed`）。
++4. 修改 scope 后需重新安装应用，然后重启 nullclaw。
++
++即使没有该功能或 scope，`streaming = true` 也不会造成故障：第一次 `chat.startStream` 会被拒绝，回复自动回退到编辑消息通路，且每个账号只记录一次警告。
++
++验证：
++
++```bash
++nullclaw channel start slack
++nullclaw channel status
++```
++
++`nullclaw channel start slack` 只启动第一个配置的 Slack 账号。多账号验证请运行 `nullclaw gateway`，并给每个 bot 各发一条测试消息。
++
++常见问题：
++
++- 回复仍是完整后才出现：确认 `streaming` 为 `true`、应用已启用 Agents & AI Apps，并在日志中查找 `Slack native streaming unavailable for this app`
++- 日志出现 `missing_scope`：添加 `chat:write` 与 `assistant:write` 后重新安装应用
++- 频道里没有流式输出：Slack 只支持在 thread 内流式输出，请把 `reply_to_mode` 设为 `all`
++- 完全没有回复：检查 `allow_from`；在群里还需确认 bot 被 @ 提及
++
+ ### `memory`
+ 
+ - `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。
+diff --git a/src/channels/slack.zig b/src/channels/slack.zig
+index 3e016482..f29dda19 100644
+--- a/src/channels/slack.zig
++++ b/src/channels/slack.zig
+@@ -6,6 +6,7 @@ const config_types = @import("../config_types.zig");
+ const interaction_choices = @import("../interactions/choices.zig");
+ const bus_mod = @import("../bus.zig");
+ const websocket = @import("../websocket.zig");
++const stream_presenter = @import("slack_stream_presenter.zig");
+ 
+ const Atomic = @import("../portable_atomic.zig").Atomic;
+ 
+@@ -121,6 +122,14 @@ pub const SlackChannel = struct {
+     last_ts_by_channel: std.StringHashMapUnmanaged([]u8) = .empty,
+     thread_ts: ?[]const u8 = null,
+     reply_to_mode: config_types.SlackReplyToMode = .off,
++    /// Emit progressive replies through the streaming Web API / edited messages.
++    streaming_enabled: bool = false,
++    /// Set once a chat.startStream call proves this app/workspace can never
++    /// stream; every later turn uses the chat.postMessage + chat.update path.
++    native_stream_disabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
++    /// Guards `stream_states` and the API calls made from it.
++    stream_mu: std_compat.sync.Mutex = .{},
++    stream_states: std.StringHashMapUnmanaged(stream_presenter.StreamState) = .empty,
+     policy: root.ChannelPolicy = .{},
+     bus: ?*bus_mod.Bus = null,
+     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+@@ -219,6 +228,7 @@ pub const SlackChannel = struct {
+         ch.signing_secret = cfg.signing_secret;
+         ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
+         ch.reply_to_mode = cfg.reply_to_mode;
++        ch.streaming_enabled = cfg.streaming;
+         return ch;
+     }
+ 
+@@ -359,6 +369,24 @@ pub const SlackChannel = struct {
+         provided: ?[]const u8 = null,
+     };
+ 
++    /// Owned `ts` / `error` fields of a Slack Web API response.
++    const SlackApiResult = struct {
++        ts: ?[]u8 = null,
++        error_code: ?[]u8 = null,
++
++        pub fn deinit(self: *SlackApiResult, allocator: std.mem.Allocator) void {
++            if (self.ts) |ts| allocator.free(ts);
++            if (self.error_code) |code| allocator.free(code);
++            self.* = .{};
++        }
++
++        pub fn takeTs(self: *SlackApiResult) ?[]u8 {
++            const ts = self.ts;
++            self.ts = null;
++            return ts;
++        }
++    };
++
+     fn slackApiErrorInfo(obj: std.json.ObjectMap) ?SlackApiErrorInfo {
+         const err_val = obj.get("error") orelse return null;
+         if (err_val != .string or err_val.string.len == 0) return null;
+@@ -959,10 +987,14 @@ pub const SlackChannel = struct {
+ 
+     // ── Channel vtable ──────────────────────────────────────────────
+ 
++    /// `thread_ts` is passed explicitly rather than read from `self.thread_ts`
++    /// so callers on the streaming path do not depend on the mutable field that
++    /// `parseTarget` rewrites.
+     fn appendPostMessageBody(
+         self: *SlackChannel,
+         body_list: *std.ArrayListUnmanaged(u8),
+         actual_channel: []const u8,
++        thread_ts: ?[]const u8,
+         text: []const u8,
+     ) !void {
+         const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
+@@ -972,7 +1004,7 @@ pub const SlackChannel = struct {
+         try body_list.appendSlice(self.allocator, actual_channel);
+         try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
+         try root.json_util.appendJsonString(body_list, self.allocator, mrkdwn_text);
+-        if (self.thread_ts) |tts| {
++        if (thread_ts) |tts| {
+             try body_list.appendSlice(self.allocator, ",\"thread_ts\":\"");
+             try body_list.appendSlice(self.allocator, tts);
+             try body_list.append(self.allocator, '"');
+@@ -1176,6 +1208,10 @@ pub const SlackChannel = struct {
+     /// Send a message to a Slack channel via chat.postMessage API.
+     /// The target may contain "channel_id:thread_ts" for threaded replies.
+     pub fn sendMessage(self: *SlackChannel, target_channel: []const u8, text: []const u8) !void {
++        // Tests must never reach the network; payload builders are covered
++        // directly (see appendPostMessageBody tests).
++        if (builtin.is_test) return;
++
+         const url = API_BASE ++ "/chat.postMessage";
+ 
+         // Parse target for thread_ts (channel_id:thread_ts)
+@@ -1184,7 +1220,7 @@ pub const SlackChannel = struct {
+         // Build JSON body
+         var body_list: std.ArrayListUnmanaged(u8) = .empty;
+         defer body_list.deinit(self.allocator);
+-        try self.appendPostMessageBody(&body_list, actual_channel, text);
++        try self.appendPostMessageBody(&body_list, actual_channel, self.thread_ts, text);
+ 
+         // Build auth header: "Authorization: Bearer xoxb-..."
+         var auth_buf: [512]u8 = undefined;
+@@ -1362,6 +1398,7 @@ pub const SlackChannel = struct {
+         }
+         self.deinitPendingInteractions();
+         self.clearChannelCursors();
++        self.deinitStreamStates();
+         if (self.last_ts_owned) {
+             self.allocator.free(self.last_ts);
+             self.last_ts = "0";
+@@ -1399,15 +1436,492 @@ pub const SlackChannel = struct {
+         try self.stopTyping(recipient);
+     }
+ 
++    // ── Streaming outbound ──────────────────────────────────────────
++    //
++    // Slack has two ways to show a reply while it is still being generated:
++    //
++    //   native   chat.startStream → throttled chat.appendStream → chat.stopStream.
++    //            Slack only accepts a stream inside a thread, so this path needs
++    //            a "channel_id:thread_ts" target (reply_to_mode = all, or an
++    //            inbound thread reply / assistant thread).
++    //   fallback chat.postMessage, then throttled chat.update edits of that same
++    //            message. Used for top-level targets and whenever the native
++    //            methods are unavailable to this app.
++    //
++    // Deltas are coalesced by slack_stream_presenter so a token stream turns into
++    // at most one API call per second per turn.
++
++    const StreamState = stream_presenter.StreamState;
++
++    fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
++        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
++        return self.streaming_enabled;
++    }
++
++    fn vtableSendEvent(
++        ptr: *anyopaque,
++        target: []const u8,
++        message: []const u8,
++        media: []const []const u8,
++        stage: root.Channel.OutboundStage,
++    ) anyerror!void {
++        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
++
++        if (!self.streaming_enabled) {
++            if (stage == .final and message.len > 0) return vtableSend(ptr, target, message, media);
++            return;
++        }
++
++        switch (stage) {
++            .chunk => {
++                if (message.len == 0) return;
++                self.streamChunk(target, message);
++            },
++            .final => {
++                if (message.len == 0) {
++                    self.finishStreamStateFor(target);
++                    return;
++                }
++                try self.streamFinal(target, message, media);
++            },
++        }
++    }
++
++    fn deinitStreamStates(self: *SlackChannel) void {
++        self.stream_mu.lock();
++        defer self.stream_mu.unlock();
++        stream_presenter.deinitStreamStates(self.allocator, &self.stream_states);
++    }
++
++    /// The turn ended without a reply body; close the turn so late deltas are
++    /// dropped instead of opening a new stream.
++    fn finishStreamStateFor(self: *SlackChannel, target: []const u8) void {
++        self.stream_mu.lock();
++        defer self.stream_mu.unlock();
++
++        const now_ms = std_compat.time.milliTimestamp();
++        if (self.stream_states.getPtr(target)) |state| state.finishTurn(self.allocator, now_ms);
++    }
++
++    fn streamChunk(self: *SlackChannel, target: []const u8, chunk: []const u8) void {
++        // The mutex also covers the API call: chunks arrive on the outbound
++        // dispatcher thread while the final reply may arrive on the durable
++        // outbox worker, and both must see the same stream state.
++        self.stream_mu.lock();
++        defer self.stream_mu.unlock();
++
++        const now_ms = std_compat.time.milliTimestamp();
++        const state = self.ensureStreamStateLocked(target, now_ms) catch |err| {
++            log.warn("Slack streaming state allocation failed: {}", .{err});
++            return;
++        };
++        // The final reply may already have been delivered for this turn (see
++        // STREAM_LATE_CHUNK_GRACE_MS); those leftovers must not open a new stream.
++        if (state.send_failed or state.isLateChunk(now_ms)) return;
++
++        var flush = stream_presenter.appendStreamChunk(self.allocator, state, chunk, now_ms) catch |err| {
++            log.warn("Slack streaming buffer append failed: {}", .{err});
++            return;
++        } orelse return;
++        defer flush.deinit(self.allocator);
++
++        self.publishStreamFlushLocked(target, state, &flush);
++    }
++
++    fn ensureStreamStateLocked(self: *SlackChannel, target: []const u8, now_ms: i64) !*StreamState {
++        self.pruneFinishedStreamStatesLocked(now_ms);
++
++        const gop = try self.stream_states.getOrPut(self.allocator, target);
++        if (!gop.found_existing) {
++            gop.key_ptr.* = try self.allocator.dupe(u8, target);
++            const has_thread = stream_presenter.resolveStreamTarget(target).thread_ts != null;
++            gop.value_ptr.* = .{
++                .mode = stream_presenter.chooseTurnTransport(
++                    has_thread,
++                    self.native_stream_disabled.load(.acquire),
++                ),
++            };
++        }
++        return gop.value_ptr;
++    }
++
++    /// Drop finished targets once the map grows, so a long-running bot does not
++    /// accumulate one entry per Slack thread it has ever answered in.
++    fn pruneFinishedStreamStatesLocked(self: *SlackChannel, now_ms: i64) void {
++        if (self.stream_states.count() <= stream_presenter.STREAM_MAX_TRACKED_TARGETS) return;
++
++        var stale: [stream_presenter.STREAM_MAX_TRACKED_TARGETS][]const u8 = undefined;
++        var stale_len: usize = 0;
++        var it = self.stream_states.iterator();
++        while (it.next()) |entry| {
++            if (entry.value_ptr.finished_at_ms == 0) continue;
++            if (entry.value_ptr.isLateChunk(now_ms)) continue;
++            if (stale_len == stale.len) break;
++            stale[stale_len] = entry.key_ptr.*;
++            stale_len += 1;
++        }
++        for (stale[0..stale_len]) |key| {
++            stream_presenter.clearStreamState(self.allocator, &self.stream_states, key);
++        }
++    }
++
++    fn publishStreamFlushLocked(
++        self: *SlackChannel,
++        target: []const u8,
++        state: *StreamState,
++        flush: *const stream_presenter.StreamFlush,
++    ) void {
++        const parsed = stream_presenter.resolveStreamTarget(target);
++
++        if (state.mode == .native) {
++            if (state.message_ts.len == 0) {
++                self.startNativeStreamLocked(parsed, state, flush.text) catch |err| {
++                    log.warn("Slack chat.startStream failed ({s}); using edited messages", .{@errorName(err)});
++                    state.mode = .fallback;
++                };
++            } else {
++                // Keep the native transport: the streamed message still has to be
++                // closed with chat.stopStream, and the final reply reconciles it.
++                self.appendNativeStreamLocked(parsed, state, flush.delta()) catch |err| {
++                    log.warn("Slack chat.appendStream failed ({s}); continuing without live updates", .{@errorName(err)});
++                    state.send_failed = true;
++                };
++            }
++            if (state.mode == .native) return;
++        }
++
++        if (state.mode != .fallback or state.send_failed) return;
++
++        if (state.message_ts.len == 0) {
++            const ts = self.postMessageForStream(parsed, flush.text) catch |err| {
++                log.warn("Slack streaming chat.postMessage failed ({s}); reply will be sent complete", .{@errorName(err)});
++                state.send_failed = true;
++                return;
++            };
++            defer self.allocator.free(ts);
++            state.setMessageTs(self.allocator, ts) catch |err| {
++                log.warn("Slack streaming state allocation failed: {}", .{err});
++                state.send_failed = true;
++            };
++            return;
++        }
++
++        self.updateStreamMessage(parsed, state.message_ts, flush.text) catch |err| {
++            log.warn("Slack streaming chat.update failed ({s}); continuing without live updates", .{@errorName(err)});
++            state.send_failed = true;
++        };
++    }
++
++    fn startNativeStreamLocked(
++        self: *SlackChannel,
++        parsed: stream_presenter.StreamTarget,
++        state: *StreamState,
++        text: []const u8,
++    ) !void {
++        const thread_ts = parsed.thread_ts orelse {
++            // Defensive: ensureStreamStateLocked already picks the fallback
++            // transport for a top-level target.
++            state.mode = .fallback;
++            return error.SlackStreamNotThreaded;
++        };
++
++        const chunks = try stream_presenter.splitForLimit(
++            self.allocator,
++            text,
++            stream_presenter.STREAM_MARKDOWN_MAX_BYTES,
++        );
++        defer stream_presenter.freeChunks(self.allocator, chunks);
++
++        const body = try stream_presenter.buildStartStreamBody(
++            self.allocator,
++            parsed.channel_id,
++            thread_ts,
++            chunks[0],
++        );
++        defer self.allocator.free(body);
++
++        var result = try self.callSlackApi("chat.startStream", body, parsed.channel_id);
++        defer result.deinit(self.allocator);
++
++        if (result.error_code) |code| {
++            try self.recordNativeStreamFailure(code);
++            return error.SlackStreamRejected;
++        }
++        const ts = result.ts orelse return error.SlackStreamRejected;
++        try state.setMessageTs(self.allocator, ts);
++
++        for (chunks[1..]) |chunk| {
++            try self.appendNativeStreamLocked(parsed, state, chunk);
++        }
++    }
++
++    fn appendNativeStreamLocked(
++        self: *SlackChannel,
++        parsed: stream_presenter.StreamTarget,
++        state: *StreamState,
++        text: []const u8,
++    ) !void {
++        if (text.len == 0) return;
++
++        const chunks = try stream_presenter.splitForLimit(
++            self.allocator,
++            text,
++            stream_presenter.STREAM_MARKDOWN_MAX_BYTES,
++        );
++        defer stream_presenter.freeChunks(self.allocator, chunks);
++
++        for (chunks) |chunk| {
++            const body = try stream_presenter.buildAppendStreamBody(
++                self.allocator,
++                parsed.channel_id,
++                state.message_ts,
++                chunk,
++            );
++            defer self.allocator.free(body);
++
++            var result = try self.callSlackApi("chat.appendStream", body, parsed.channel_id);
++            defer result.deinit(self.allocator);
++            if (result.error_code) |code| try self.recordNativeStreamFailure(code);
++        }
++    }
++
++    /// Map an API error to the retry policy for this turn and for the account.
++    fn recordNativeStreamFailure(self: *SlackChannel, code: []const u8) !void {
++        if (stream_presenter.classifyStreamFailure(code) == .disable_native) {
++            if (!self.native_stream_disabled.swap(true, .acq_rel)) {
++                log.warn(
++                    "Slack native streaming unavailable for this app ({s}); falling back to edited messages",
++                    .{code},
++                );
++            }
++        }
++        return error.SlackStreamRejected;
++    }
++
++    fn postMessageForStream(
++        self: *SlackChannel,
++        parsed: stream_presenter.StreamTarget,
++        text: []const u8,
++    ) ![]u8 {
++        var body_list: std.ArrayListUnmanaged(u8) = .empty;
++        defer body_list.deinit(self.allocator);
++        try self.appendPostMessageBody(&body_list, parsed.channel_id, parsed.thread_ts, text);
++
++        var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id);
++        defer result.deinit(self.allocator);
++        return result.takeTs() orelse error.SlackStreamRejected;
++    }
++
++    fn updateStreamMessage(
++        self: *SlackChannel,
++        parsed: stream_presenter.StreamTarget,
++        ts: []const u8,
++        markdown_text: []const u8,
++    ) !void {
++        const mrkdwn = try markdownToSlackMrkdwn(self.allocator, markdown_text);
++        defer self.allocator.free(mrkdwn);
++
++        // chat.update rejects text above 4,000 chars with `msg_too_long`; the
++        // final reply is delivered separately once it no longer fits.
++        const chunks = try stream_presenter.splitForLimit(
++            self.allocator,
++            mrkdwn,
++            stream_presenter.STREAM_UPDATE_MAX_BYTES,
++        );
++        defer stream_presenter.freeChunks(self.allocator, chunks);
++
++        const body = try stream_presenter.buildUpdateBody(self.allocator, parsed.channel_id, ts, chunks[0]);
++        defer self.allocator.free(body);
++
++        var result = try self.callSlackApi("chat.update", body, parsed.channel_id);
++        defer result.deinit(self.allocator);
++        if (result.error_code) |code| {
++            if (stream_presenter.classifyStreamFailure(code) == .disable_native) {
++                self.native_stream_disabled.store(true, .release);
++            }
++            return error.SlackStreamRejected;
++        }
++    }
++
++    /// Deliver the authoritative final reply.
++    ///
++    /// The streamed text is only a preview: the model may have produced
++    /// intermediate text before a tool call, and redaction rehydration can
++    /// rewrite the reply after the last delta. When the streamed content is a
++    /// prefix of the final text we append the remainder and stop the stream, so
++    /// the message already shows the final reply. Otherwise the stream is
++    /// stopped and the final reply is posted as its own message, which is what
++    /// Telegram does for every turn.
++    fn streamFinal(
++        self: *SlackChannel,
++        target: []const u8,
++        message: []const u8,
++        media: []const []const u8,
++    ) !void {
++        self.stream_mu.lock();
++        defer self.stream_mu.unlock();
++
++        const now_ms = std_compat.time.milliTimestamp();
++        const state = self.stream_states.getPtr(target) orelse
++            return vtableSend(@ptrCast(self), target, message, media);
++        // Keep the entry: late deltas of this turn are dropped by isLateChunk.
++        defer state.finishTurn(self.allocator, now_ms);
++
++        if (state.message_ts.len == 0) {
++            // Nothing was ever flushed (short reply inside the throttle window),
++            // or the fallback message could not be created.
++            return vtableSend(@ptrCast(self), target, message, media);
++        }
++
++        const parsed = stream_presenter.resolveStreamTarget(target);
++
++        if (state.mode == .native) {
++            const stream_completed = if (stream_presenter.pendingFinalSuffix(message, state.sent)) |suffix| blk: {
++                self.appendNativeStreamLocked(parsed, state, suffix) catch |err| {
++                    log.warn("Slack chat.appendStream final delta failed ({s})", .{@errorName(err)});
++                    break :blk false;
++                };
++                break :blk true;
++            } else false;
++
++            self.stopNativeStream(parsed, state.message_ts) catch |err| {
++                log.warn("Slack chat.stopStream failed ({s})", .{@errorName(err)});
++            };
++            if (stream_completed) return;
++            // A streamed reasoning quote is deliberately absent from the final
++            // reply, so that turn's snapshot can never be a prefix of it.
++            // Rewrite the stopped message in place rather than leaving the
++            // thinking behind and posting the reply a second time.
++            if (state.rendered_reasoning) {
++                return self.deliverFallbackFinal(parsed, state.message_ts, message, media, target);
++            }
++            // When the stream could not be completed the streamed message keeps
++            // an intermediate prefix, so the reply is posted again in full.
++            return vtableSend(@ptrCast(self), target, message, media);
++        }
++
++        try self.deliverFallbackFinal(parsed, state.message_ts, message, media, target);
++    }
++
++    fn deliverFallbackFinal(
++        self: *SlackChannel,
++        parsed: stream_presenter.StreamTarget,
++        ts: []const u8,
++        message: []const u8,
++        media: []const []const u8,
++        target: []const u8,
++    ) !void {
++        const chunks = try stream_presenter.splitForLimit(
++            self.allocator,
++            message,
++            stream_presenter.STREAM_UPDATE_MAX_BYTES,
++        );
++        defer stream_presenter.freeChunks(self.allocator, chunks);
++
++        self.updateStreamMessage(parsed, ts, chunks[0]) catch |err| {
++            log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
++            return vtableSend(@ptrCast(self), target, message, media);
++        };
++
++        // Anything past the first chat.update-able slice goes out as follow-up
++        // messages in the same thread.
++        const followups = @min(chunks.len - 1, stream_presenter.STREAM_MAX_FOLLOWUPS);
++        if (chunks.len - 1 > followups) {
++            log.warn("Slack streaming reply truncated: {} overflow chunks dropped", .{chunks.len - 1 - followups});
++        }
++        for (chunks[1 .. 1 + followups]) |chunk| {
++            self.postStreamFollowup(parsed, chunk) catch |err| {
++                log.warn("Slack streaming follow-up post failed ({s})", .{@errorName(err)});
++                break;
++            };
++        }
++    }
++
++    fn postStreamFollowup(
++        self: *SlackChannel,
++        parsed: stream_presenter.StreamTarget,
++        markdown_text: []const u8,
++    ) !void {
++        var body_list: std.ArrayListUnmanaged(u8) = .empty;
++        defer body_list.deinit(self.allocator);
++        try self.appendPostMessageBody(&body_list, parsed.channel_id, parsed.thread_ts, markdown_text);
++
++        var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id);
++        result.deinit(self.allocator);
++    }
++
++    fn stopNativeStream(
++        self: *SlackChannel,
++        parsed: stream_presenter.StreamTarget,
++        ts: []const u8,
++    ) !void {
++        const body = try stream_presenter.buildStopStreamBody(self.allocator, parsed.channel_id, ts);
++        defer self.allocator.free(body);
++
++        var result = try self.callSlackApi("chat.stopStream", body, parsed.channel_id);
++        defer result.deinit(self.allocator);
++        if (result.error_code) |code| try self.recordNativeStreamFailure(code);
++    }
++
++    /// POST a Slack Web API method and return the parsed `ts` / `error` fields.
++    /// Transport and JSON failures surface as errors; API-level failures are
++    /// reported through `error_code` so callers can apply a retry policy.
++    fn callSlackApi(
++        self: *SlackChannel,
++        endpoint: []const u8,
++        body: []const u8,
++        context: ?[]const u8,
++    ) !SlackApiResult {
++        // Streaming outbound must never touch the network under `zig build test`;
++        // the throttling/fallback state machine is covered through this stub.
++        if (builtin.is_test) {
++            return .{ .ts = try self.allocator.dupe(u8, "1700000000.000000") };
++        }
++
++        const url = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ API_BASE, endpoint });
++        defer self.allocator.free(url);
++
++        var auth_buf: [512]u8 = undefined;
++        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
++        try auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
++        const auth_header = auth_writer.buffered();
++
++        const resp = root.http_util.curlPost(self.allocator, url, body, &.{auth_header}) catch |err| {
++            log.err("Slack {s} POST failed: {}", .{ endpoint, err });
++            return error.SlackApiError;
++        };
++        defer self.allocator.free(resp);
++
++        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch
++            return error.SlackApiError;
++        defer parsed.deinit();
++        if (parsed.value != .object) return error.SlackApiError;
++
++        var result = SlackApiResult{};
++        errdefer result.deinit(self.allocator);
++        if (parsed.value.object.get("ts")) |ts_val| {
++            if (ts_val == .string and ts_val.string.len > 0) {
++                result.ts = try self.allocator.dupe(u8, ts_val.string);
++            }
++        }
++        if (slackApiErrorInfo(parsed.value.object)) |info| {
++            logSlackApiError(endpoint, context, info);
++            result.error_code = try self.allocator.dupe(u8, info.code);
++        }
++        return result;
++    }
++
+     pub const vtable = root.Channel.VTable{
+         .start = &vtableStart,
+         .stop = &vtableStop,
+         .send = &vtableSend,
++        .sendEvent = &vtableSendEvent,
+         .sendRich = &vtableSendRich,
+         .name = &vtableName,
+         .healthCheck = &vtableHealthCheck,
+         .startTyping = &vtableStartTyping,
+         .stopTyping = &vtableStopTyping,
++        .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
+     };
+ 
+     pub fn channel(self: *SlackChannel) root.Channel {
+@@ -2196,6 +2710,222 @@ test "slack channel vtable compiles" {
+     try std.testing.expect(@TypeOf(vt) == root.Channel.VTable);
+ }
+ 
++// ════════════════════════════════════════════════════════════════════════════
++// Streaming outbound
++//
++// `callSlackApi` is stubbed under `builtin.is_test`, so these tests drive the
++// whole start/append/stop and postMessage/update state machine without network.
++// ════════════════════════════════════════════════════════════════════════════
++
++fn initStreamingChannel(streaming: bool) SlackChannel {
++    return SlackChannel.initFromConfig(std.testing.allocator, .{
++        .account_id = "sl-main",
++        .bot_token = "xoxb-test",
++        .streaming = streaming,
++    });
++}
++
++test "slack streaming is disabled by default" {
++    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{ .bot_token = "xoxb-test" });
++    defer ch.channel().stop();
++
++    try std.testing.expect(!ch.streaming_enabled);
++    try std.testing.expect(!ch.channel().supportsStreamingOutbound());
++}
++
++test "slack initFromConfig enables streaming from config" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++
++    try std.testing.expect(ch.streaming_enabled);
++    try std.testing.expect(ch.channel().supportsStreamingOutbound());
++}
++
++test "slack streaming chunk opens a native stream for a thread target" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++
++    try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++
++    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(stream_presenter.StreamMode.native, state.mode);
++    try std.testing.expect(!state.send_failed);
++    try std.testing.expectEqualStrings("1700000000.000000", state.message_ts);
++}
++
++test "slack streaming keeps the native path across chunks of one turn" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++
++    try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++    try ch.channel().sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
++
++    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(stream_presenter.StreamMode.native, state.mode);
++    try std.testing.expectEqualStrings(("x" ** 200) ++ ("y" ** 200), state.sent);
++}
++
++test "slack streaming uses edited messages when the target has no thread" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++
++    try ch.channel().sendEvent("C1", "x" ** 200, &.{}, .chunk);
++
++    const state = ch.stream_states.getPtr("C1") orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, state.mode);
++    try std.testing.expectEqualStrings("1700000000.000000", state.message_ts);
++}
++
++test "slack streaming uses edited messages when native streaming is disabled" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++    ch.native_stream_disabled.store(true, .release);
++
++    try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++
++    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, state.mode);
++}
++
++test "slack streaming final appends the remainder and closes the stream" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++    const iface = ch.channel();
++
++    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++    // The final reply extends the streamed prefix, so no second message is posted.
++    try iface.sendEvent("C1:1700.1", ("x" ** 200) ++ " done", &.{}, .final);
++
++    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++    try std.testing.expect(state.finished_at_ms != 0);
++    try std.testing.expectEqual(@as(usize, 0), state.buffer.items.len);
++}
++
++test "slack streaming final posts the reply when it diverges from the stream" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++    const iface = ch.channel();
++
++    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++    // The model emitted text before a tool call, so the final reply is not an
++    // extension of the streamed prefix and is delivered as its own message.
++    try iface.sendEvent("C1:1700.1", "unrelated answer", &.{}, .final);
++
++    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++    try std.testing.expect(state.finished_at_ms != 0);
++}
++
++test "slack streaming final rewrites the message after streamed reasoning" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++    const iface = ch.channel();
++
++    // reasoning_mode == .stream: the streamed preview carries the quoted
++    // thinking, which the final reply deliberately omits, so the snapshot can
++    // never be a prefix of it. The stopped message is rewritten in place with
++    // chat.update instead of posting the reply as a second message.
++    try iface.sendEvent("C1:1700.1", "<think>weighing the options</think>", &.{}, .chunk);
++    try iface.sendEvent("C1:1700.1", "final answer", &.{}, .final);
++
++    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++    try std.testing.expect(state.finished_at_ms != 0);
++    try std.testing.expect(!state.rendered_reasoning);
++}
++
++test "slack streaming drops deltas that arrive after the final reply" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++    const iface = ch.channel();
++
++    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++    try iface.sendEvent("C1:1700.1", ("x" ** 200) ++ " done", &.{}, .final);
++
++    // Regression: the durable outbox worker can deliver the final reply before
++    // the outbound dispatcher has drained the last deltas of the same turn.
++    // Those leftovers must not open a second stream.
++    try iface.sendEvent("C1:1700.1", "late tail deltas" ** 20, &.{}, .chunk);
++
++    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(@as(usize, 0), state.buffer.items.len);
++}
++
++test "slack streaming final without streaming enabled is delivered complete" {
++    var ch = initStreamingChannel(false);
++    defer ch.channel().stop();
++    const iface = ch.channel();
++
++    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++    try iface.sendEvent("C1:1700.1", "complete reply", &.{}, .final);
++
++    try std.testing.expectEqual(@as(usize, 0), ch.stream_states.count());
++}
++
++test "slack streaming final updates the fallback message in place" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++    const iface = ch.channel();
++
++    try iface.sendEvent("C1", "x" ** 200, &.{}, .chunk);
++    try iface.sendEvent("C1", ("x" ** 200) ++ " tail", &.{}, .final);
++
++    const state = ch.stream_states.getPtr("C1") orelse return error.TestUnexpectedResult;
++    try std.testing.expect(state.finished_at_ms != 0);
++}
++
++test "slack streaming final splits overflowing fallback replies" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++    const iface = ch.channel();
++
++    const long = "z" ** (stream_presenter.STREAM_UPDATE_MAX_BYTES * 3);
++    try iface.sendEvent("C1", "x" ** 200, &.{}, .chunk);
++    try iface.sendEvent("C1", long, &.{}, .final);
++
++    const state = ch.stream_states.getPtr("C1") orelse return error.TestUnexpectedResult;
++    try std.testing.expect(state.finished_at_ms != 0);
++}
++
++test "slack streaming ignores chunks when streaming is disabled" {
++    var ch = initStreamingChannel(false);
++    defer ch.channel().stop();
++
++    try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++
++    try std.testing.expectEqual(@as(usize, 0), ch.stream_states.count());
++}
++
++test "slack streaming chunk for an empty message is ignored" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++
++    try ch.channel().sendEvent("C1:1700.1", "", &.{}, .chunk);
++
++    try std.testing.expectEqual(@as(usize, 0), ch.stream_states.count());
++}
++
++test "slack streaming short reply never opens a stream" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++
++    try ch.channel().sendEvent("C1:1700.1", "ok", &.{}, .chunk);
++
++    // Nothing was flushed inside the coalescing window, so no message exists.
++    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(@as(usize, 0), state.message_ts.len);
++    try std.testing.expectEqual(@as(usize, 0), state.sent.len);
++}
++
++test "slack stop releases streaming buffers" {
++    var ch = initStreamingChannel(true);
++    const iface = ch.channel();
++
++    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++    try iface.sendEvent("C1", "y" ** 200, &.{}, .chunk);
++
++    iface.stop();
++    try std.testing.expectEqual(@as(usize, 0), ch.stream_states.count());
++}
++
+ test "sendMessage payload converts markdown to mrkdwn" {
+     const allowed = [_][]const u8{};
+     var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+@@ -2203,7 +2933,7 @@ test "sendMessage payload converts markdown to mrkdwn" {
+     var body_list: std.ArrayListUnmanaged(u8) = .empty;
+     defer body_list.deinit(std.testing.allocator);
+ 
+-    try ch.appendPostMessageBody(&body_list, "C123", "**hello** world");
++    try ch.appendPostMessageBody(&body_list, "C123", null, "**hello** world");
+ 
+     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body_list.items, .{});
+     defer parsed.deinit();
+diff --git a/src/channels/slack_stream_presenter.zig b/src/channels/slack_stream_presenter.zig
+new file mode 100755
+index 00000000..b8b774d5
+--- /dev/null
++++ b/src/channels/slack_stream_presenter.zig
+@@ -0,0 +1,767 @@
++const std = @import("std");
++const json_util = @import("../json_util.zig");
++const providers = @import("../providers/root.zig");
++
++// Slack's streaming Web API methods are tiered per minute, so tiny deltas must
++// be coalesced before they turn into HTTP calls:
++//   chat.startStream  — Tier 2 (20+/min)
++//   chat.appendStream — Tier 4 (100+/min)
++//   chat.stopStream   — Tier 2 (20+/min)
++//   chat.update       — Tier 3 (50+/min)   (fallback path)
++//   chat.postMessage  — ~1 message/second/channel (fallback path)
++// A one-second floor keeps every method comfortably inside its tier while still
++// looking live to a human reader.
++pub const STREAM_FLUSH_MIN_INTERVAL_MS: i64 = std.time.ms_per_s;
++pub const STREAM_FLUSH_MIN_DELTA_BYTES: usize = 128;
++
++/// `markdown_text` cap accepted by chat.startStream/chat.appendStream/chat.stopStream.
++pub const STREAM_MARKDOWN_MAX_BYTES: usize = 12_000;
++/// `text` cap accepted by chat.update; Slack answers `msg_too_long` above this.
++pub const STREAM_UPDATE_MAX_BYTES: usize = 4_000;
++/// Upper bound on follow-up messages posted when the final reply overflows.
++pub const STREAM_MAX_FOLLOWUPS: usize = 8;
++/// How long a finalized target keeps ignoring `.chunk` events. The daemon
++/// publishes the final reply on the durable outbox worker while the outbound
++/// dispatcher may still be draining deltas of the same turn; without this the
++/// leftovers would open a second stream for a turn that already ended.
++pub const STREAM_LATE_CHUNK_GRACE_MS: i64 = 5 * std.time.ms_per_s;
++/// Above this many tracked targets the channel sweeps finalized entries.
++pub const STREAM_MAX_TRACKED_TARGETS: usize = 64;
++
++pub const StreamMode = enum {
++    /// chat.startStream / chat.appendStream / chat.stopStream.
++    native,
++    /// chat.postMessage + chat.update edits of a single message.
++    fallback,
++};
++
++/// A Slack outbound target is either a bare channel id or "channel_id:thread_ts".
++pub const StreamTarget = struct {
++    channel_id: []const u8,
++    thread_ts: ?[]const u8 = null,
++};
++
++/// Slack only accepts a stream inside a thread, and an app without the
++/// Agents & AI Apps feature can never stream at all. Everything else uses
++/// chat.postMessage + chat.update edits.
++pub fn chooseTurnTransport(has_thread: bool, native_disabled: bool) StreamMode {
++    if (native_disabled or !has_thread) return .fallback;
++    return .native;
++}
++
++/// Split "channel_id:thread_ts" into its parts. Slack channel ids never contain
++/// a colon, so the first colon is always the separator.
++pub fn resolveStreamTarget(target: []const u8) StreamTarget {
++    const idx = std.mem.indexOfScalar(u8, target, ':') orelse
++        return .{ .channel_id = target };
++    const thread_ts = target[idx + 1 ..];
++    if (thread_ts.len == 0) return .{ .channel_id = target[0..idx] };
++    return .{ .channel_id = target[0..idx], .thread_ts = thread_ts };
++}
++
++pub const StreamState = struct {
++    /// Raw markdown deltas accumulated for this turn.
++    buffer: std.ArrayListUnmanaged(u8) = .empty,
++    /// Last snapshot handed to the transport (owned). Used to compute the
++    /// incremental suffix for chat.appendStream.
++    sent: []u8 = &.{},
++    last_flush_time: i64 = 0,
++    started_at_ms: i64 = 0,
++    /// Streaming message ts returned by chat.startStream / chat.postMessage.
++    message_ts: []u8 = &.{},
++    /// Transport chosen for this turn; switches to `.fallback` if the native
++    /// start call is rejected.
++    mode: StreamMode = .native,
++    /// A live update failed; stop flushing this turn and let the final reply
++    /// reconcile the message.
++    send_failed: bool = false,
++    /// A reasoning block was rendered into this turn's stream. The final reply
++    /// never contains the thinking, so the streamed snapshot cannot be a prefix
++    /// of it; the final pass rewrites the message in place instead of posting a
++    /// second copy.
++    rendered_reasoning: bool = false,
++    /// Set when the final reply was delivered for this target.
++    finished_at_ms: i64 = 0,
++
++    pub fn deinit(self: *StreamState, allocator: std.mem.Allocator) void {
++        self.buffer.deinit(allocator);
++        if (self.sent.len > 0) allocator.free(self.sent);
++        if (self.message_ts.len > 0) allocator.free(self.message_ts);
++        self.* = .{};
++    }
++
++    /// Release the per-turn buffers and mark the turn finished. The entry stays
++    /// in the channel map so late deltas of the same turn are recognised.
++    pub fn finishTurn(self: *StreamState, allocator: std.mem.Allocator, now_ms: i64) void {
++        self.buffer.deinit(allocator);
++        self.buffer = .empty;
++        if (self.sent.len > 0) allocator.free(self.sent);
++        self.sent = &.{};
++        if (self.message_ts.len > 0) allocator.free(self.message_ts);
++        self.message_ts = &.{};
++        self.last_flush_time = 0;
++        self.started_at_ms = 0;
++        self.send_failed = false;
++        self.rendered_reasoning = false;
++        self.finished_at_ms = now_ms;
++    }
++
++    /// True while `.chunk` events for this target belong to a turn that already
++    /// delivered its final reply.
++    pub fn isLateChunk(self: *const StreamState, now_ms: i64) bool {
++        if (self.finished_at_ms == 0) return false;
++        return now_ms - self.finished_at_ms < STREAM_LATE_CHUNK_GRACE_MS;
++    }
++
++    pub fn setMessageTs(self: *StreamState, allocator: std.mem.Allocator, ts: []const u8) !void {
++        const owned = try allocator.dupe(u8, ts);
++        if (self.message_ts.len > 0) allocator.free(self.message_ts);
++        self.message_ts = owned;
++    }
++};
++
++/// Result of a throttled flush: `text` is the full cleaned snapshot for this
++/// turn and `text[delta_start..]` is the part that has not been sent yet.
++pub const StreamFlush = struct {
++    text: []u8,
++    delta_start: usize,
++
++    pub fn deinit(self: *StreamFlush, allocator: std.mem.Allocator) void {
++        allocator.free(self.text);
++        self.text = &.{};
++    }
++
++    pub fn delta(self: *const StreamFlush) []const u8 {
++        return self.text[self.delta_start..];
++    }
++};
++
++pub fn hasVisibleStreamText(text: []const u8) bool {
++    return std.mem.trim(u8, text, " \t\r\n").len != 0;
++}
++
++fn shouldFlush(state: *const StreamState, now_ms: i64) bool {
++    if (state.buffer.items.len - state.sent.len >= STREAM_FLUSH_MIN_DELTA_BYTES) return true;
++    return now_ms - state.last_flush_time >= STREAM_FLUSH_MIN_INTERVAL_MS;
++}
++
++/// Snapshot the buffered stream for the wire.
++///
++/// `<think>` blocks only arrive when the daemon forwards them, which it does
++/// solely for `reasoning_mode == .stream`; every other mode already had them
++/// stripped upstream, so the quote rendering is a no-op there.
++fn snapshotStreamText(allocator: std.mem.Allocator, state: *const StreamState) ![]u8 {
++    const rendered = try providers.quoteThinkBlocks(allocator, state.buffer.items);
++    defer allocator.free(rendered);
++    return allocator.dupe(u8, rendered);
++}
++
++/// Append a delta and return a flush when the coalescing window has elapsed.
++/// Reasoning blocks are rendered as quotes here as well as upstream, and the
++/// final reply always goes through `stripThinkBlocks`, so the delivered message
++/// never carries the thinking.
++pub fn appendStreamChunk(
++    allocator: std.mem.Allocator,
++    state: *StreamState,
++    chunk: []const u8,
++    now_ms: i64,
++) !?StreamFlush {
++    if (chunk.len == 0) return null;
++    // A delta this long after the previous turn finished belongs to a new turn.
++    if (state.finished_at_ms != 0 and !state.isLateChunk(now_ms)) state.finished_at_ms = 0;
++    if (state.started_at_ms == 0) {
++        // Start the coalescing window on the first delta so a short reply never
++        // opens a stream just to close it immediately (each start/stop pair
++        // costs a Tier-2 call).
++        state.started_at_ms = now_ms;
++        state.last_flush_time = now_ms;
++    }
++
++    try state.buffer.appendSlice(allocator, chunk);
++    // Checked on the accumulated buffer: a `<think>` tag split across chunks is
++    // only complete once both halves have arrived.
++    if (std.mem.indexOf(u8, state.buffer.items, "<think>") != null) state.rendered_reasoning = true;
++    if (!shouldFlush(state, now_ms)) return null;
++
++    const text = try snapshotStreamText(allocator, state);
++    errdefer allocator.free(text);
++
++    if (!hasVisibleStreamText(text)) {
++        allocator.free(text);
++        return null;
++    }
++
++    // Normally the snapshot extends what we already sent. If a late `<think>`
++    // rewrite moved earlier bytes, resend the whole snapshot instead of a
++    // suffix that would drop text.
++    const delta_start = if (std.mem.startsWith(u8, text, state.sent)) state.sent.len else 0;
++
++    const sent_copy = try allocator.dupe(u8, text);
++    if (state.sent.len > 0) allocator.free(state.sent);
++    state.sent = sent_copy;
++    state.last_flush_time = now_ms;
++
++    return .{ .text = text, .delta_start = delta_start };
++}
++
++/// Suffix of `final_text` that still has to be streamed so the message content
++/// ends up equal to `final_text`. Returns null when the streamed prefix is not
++/// a prefix of the final text (the caller must then deliver a fresh message).
++pub fn pendingFinalSuffix(final_text: []const u8, sent: []const u8) ?[]const u8 {
++    if (!std.mem.startsWith(u8, final_text, sent)) return null;
++    return final_text[sent.len..];
++}
++
++pub fn clearStreamState(
++    allocator: std.mem.Allocator,
++    states: *std.StringHashMapUnmanaged(StreamState),
++    target: []const u8,
++) void {
++    if (states.fetchRemove(target)) |entry| {
++        allocator.free(entry.key);
++        var state = entry.value;
++        state.deinit(allocator);
++    }
++}
++
++pub fn deinitStreamStates(
++    allocator: std.mem.Allocator,
++    states: *std.StringHashMapUnmanaged(StreamState),
++) void {
++    var it = states.iterator();
++    while (it.next()) |entry| {
++        allocator.free(entry.key_ptr.*);
++        entry.value_ptr.deinit(allocator);
++    }
++    states.deinit(allocator);
++    states.* = .empty;
++}
++
++// ---------------------------------------------------------------------------
++// Request bodies
++// ---------------------------------------------------------------------------
++
++pub fn buildStartStreamBody(
++    allocator: std.mem.Allocator,
++    channel_id: []const u8,
++    thread_ts: ?[]const u8,
++    markdown_text: []const u8,
++) ![]u8 {
++    var body: std.ArrayListUnmanaged(u8) = .empty;
++    errdefer body.deinit(allocator);
++
++    try body.appendSlice(allocator, "{\"channel\":");
++    try json_util.appendJsonString(&body, allocator, channel_id);
++    if (thread_ts) |ts| {
++        try body.appendSlice(allocator, ",\"thread_ts\":");
++        try json_util.appendJsonString(&body, allocator, ts);
++    }
++    try body.appendSlice(allocator, ",\"markdown_text\":");
++    try json_util.appendJsonString(&body, allocator, markdown_text);
++    try body.append(allocator, '}');
++    return body.toOwnedSlice(allocator);
++}
++
++pub fn buildAppendStreamBody(
++    allocator: std.mem.Allocator,
++    channel_id: []const u8,
++    ts: []const u8,
++    markdown_text: []const u8,
++) ![]u8 {
++    var body: std.ArrayListUnmanaged(u8) = .empty;
++    errdefer body.deinit(allocator);
++
++    try body.appendSlice(allocator, "{\"channel\":");
++    try json_util.appendJsonString(&body, allocator, channel_id);
++    try body.appendSlice(allocator, ",\"ts\":");
++    try json_util.appendJsonString(&body, allocator, ts);
++    try body.appendSlice(allocator, ",\"markdown_text\":");
++    try json_util.appendJsonString(&body, allocator, markdown_text);
++    try body.append(allocator, '}');
++    return body.toOwnedSlice(allocator);
++}
++
++/// `chat.stopStream` only finalizes; the content was already sent through
++/// start/append. Passing `markdown_text` here would append it a second time.
++pub fn buildStopStreamBody(
++    allocator: std.mem.Allocator,
++    channel_id: []const u8,
++    ts: []const u8,
++) ![]u8 {
++    var body: std.ArrayListUnmanaged(u8) = .empty;
++    errdefer body.deinit(allocator);
++
++    try body.appendSlice(allocator, "{\"channel\":");
++    try json_util.appendJsonString(&body, allocator, channel_id);
++    try body.appendSlice(allocator, ",\"ts\":");
++    try json_util.appendJsonString(&body, allocator, ts);
++    try body.append(allocator, '}');
++    return body.toOwnedSlice(allocator);
++}
++
++pub fn buildUpdateBody(
++    allocator: std.mem.Allocator,
++    channel_id: []const u8,
++    ts: []const u8,
++    text: []const u8,
++) ![]u8 {
++    var body: std.ArrayListUnmanaged(u8) = .empty;
++    errdefer body.deinit(allocator);
++
++    try body.appendSlice(allocator, "{\"channel\":");
++    try json_util.appendJsonString(&body, allocator, channel_id);
++    try body.appendSlice(allocator, ",\"ts\":");
++    try json_util.appendJsonString(&body, allocator, ts);
++    try body.appendSlice(allocator, ",\"text\":");
++    try json_util.appendJsonString(&body, allocator, text);
++    try body.append(allocator, '}');
++    return body.toOwnedSlice(allocator);
++}
++
++// ---------------------------------------------------------------------------
++// Failure classification
++// ---------------------------------------------------------------------------
++
++pub const StreamFailure = enum {
++    /// This turn cannot stream natively; retry the API on a later turn.
++    abandon_turn,
++    /// This workspace/app/channel can never stream natively; stop trying for
++    /// the lifetime of the account.
++    disable_native,
++};
++
++const native_disabling_codes = [_][]const u8{
++    // The method itself is unavailable to this app or channel type.
++    "channel_type_not_supported",
++    "method_not_supported_for_channel_type",
++    "unknown_method",
++    "not_allowed",
++    "invalid_thread_ts",
++    "restricted_action_thread_only_channel",
++    "restricted_action_non_threadable_channel",
++    "restricted_action_thread_locked",
++    // Credential/feature gating: Agents & AI Apps toggle or assistant scopes.
++    "missing_scope",
++    "not_allowed_token_type",
++    "no_permission",
++    "restricted_action",
++    "invalid_arguments",
++    "missing_recipient_user_id",
++    "missing_recipient_team_id",
++};
++
++/// Map a Slack `error` string to a retry policy. Unknown codes are treated as
++/// transient so a new Slack error never permanently disables streaming.
++pub fn classifyStreamFailure(code: []const u8) StreamFailure {
++    for (native_disabling_codes) |known| {
++        if (std.mem.eql(u8, code, known)) return .disable_native;
++    }
++    return .abandon_turn;
++}
++
++// ---------------------------------------------------------------------------
++// Length handling
++// ---------------------------------------------------------------------------
++
++fn utf8SafeCut(text: []const u8, limit: usize) usize {
++    var cut = @min(limit, text.len);
++    while (cut > 0 and (text[cut] & 0xC0) == 0x80) cut -= 1;
++    return cut;
++}
++
++/// Split `text` into pieces of at most `limit` bytes, preferring a newline
++/// boundary so code blocks and lists stay readable. Caller frees each piece
++/// and the returned slice via `freeChunks`.
++pub fn splitForLimit(
++    allocator: std.mem.Allocator,
++    text: []const u8,
++    limit: usize,
++) ![][]const u8 {
++    std.debug.assert(limit > 0);
++    var chunks: std.ArrayListUnmanaged([]const u8) = .empty;
++    errdefer {
++        for (chunks.items) |chunk| allocator.free(chunk);
++        chunks.deinit(allocator);
++    }
++
++    var rest = text;
++    while (rest.len > limit) {
++        var cut = utf8SafeCut(rest, limit);
++        if (std.mem.lastIndexOfScalar(u8, rest[0..cut], '\n')) |nl| {
++            if (nl > 0) cut = nl;
++        }
++        try chunks.append(allocator, try allocator.dupe(u8, rest[0..cut]));
++        rest = rest[cut..];
++        // Drop the boundary newline so the next chunk does not start blank.
++        if (rest.len > 0 and rest[0] == '\n') rest = rest[1..];
++    }
++    if (rest.len > 0) try chunks.append(allocator, try allocator.dupe(u8, rest));
++    return chunks.toOwnedSlice(allocator);
++}
++
++pub fn freeChunks(allocator: std.mem.Allocator, chunks: [][]const u8) void {
++    for (chunks) |chunk| allocator.free(chunk);
++    allocator.free(chunks);
++}
++
++// ---------------------------------------------------------------------------
++// Tests
++// ---------------------------------------------------------------------------
++
++test "chooseTurnTransport requires a thread and an enabled app" {
++    try std.testing.expect(chooseTurnTransport(true, false) == .native);
++    try std.testing.expect(chooseTurnTransport(true, true) == .fallback);
++    try std.testing.expect(chooseTurnTransport(false, false) == .fallback);
++    try std.testing.expect(chooseTurnTransport(false, true) == .fallback);
++}
++
++test "resolveStreamTarget splits channel and thread" {
++    const threaded = resolveStreamTarget("C123:1700000000.000100");
++    try std.testing.expectEqualStrings("C123", threaded.channel_id);
++    try std.testing.expectEqualStrings("1700000000.000100", threaded.thread_ts.?);
++
++    const plain = resolveStreamTarget("C123");
++    try std.testing.expectEqualStrings("C123", plain.channel_id);
++    try std.testing.expect(plain.thread_ts == null);
++
++    const empty_thread = resolveStreamTarget("C123:");
++    try std.testing.expectEqualStrings("C123", empty_thread.channel_id);
++    try std.testing.expect(empty_thread.thread_ts == null);
++
++    const dm = resolveStreamTarget("D123:1700000000.000100");
++    try std.testing.expectEqualStrings("D123", dm.channel_id);
++    try std.testing.expectEqualStrings("1700000000.000100", dm.thread_ts.?);
++}
++
++test "appendStreamChunk keeps short deltas buffered inside the window" {
++    var state = StreamState{};
++    defer state.deinit(std.testing.allocator);
++
++    try std.testing.expect((try appendStreamChunk(std.testing.allocator, &state, "hi", 1_000)) == null);
++    try std.testing.expect((try appendStreamChunk(std.testing.allocator, &state, " there", 1_500)) == null);
++    try std.testing.expectEqual(@as(usize, 0), state.sent.len);
++}
++
++test "appendStreamChunk flushes after the minimum interval" {
++    var state = StreamState{};
++    defer state.deinit(std.testing.allocator);
++
++    try std.testing.expect((try appendStreamChunk(std.testing.allocator, &state, "hello", 1_000)) == null);
++
++    var flush = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        " world",
++        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer flush.deinit(std.testing.allocator);
++
++    try std.testing.expectEqualStrings("hello world", flush.text);
++    try std.testing.expectEqual(@as(usize, 0), flush.delta_start);
++    try std.testing.expectEqualStrings("hello world", flush.delta());
++}
++
++test "appendStreamChunk does not open a stream for a reply inside the window" {
++    var state = StreamState{};
++    defer state.deinit(std.testing.allocator);
++
++    try std.testing.expect((try appendStreamChunk(std.testing.allocator, &state, "ok", 1_000)) == null);
++    try std.testing.expect((try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        " thanks!",
++        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS - 1,
++    )) == null);
++}
++
++test "appendStreamChunk flushes on the minimum delta before the interval" {
++    var state = StreamState{};
++    defer state.deinit(std.testing.allocator);
++
++    const big = "x" ** (STREAM_FLUSH_MIN_DELTA_BYTES + 1);
++    var flush = (try appendStreamChunk(std.testing.allocator, &state, big, 1_000)) orelse
++        return error.TestUnexpectedResult;
++    defer flush.deinit(std.testing.allocator);
++    try std.testing.expectEqualStrings(big, flush.text);
++}
++
++test "appendStreamChunk returns only the unsent suffix on later flushes" {
++    var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
++    defer state.deinit(std.testing.allocator);
++
++    var first = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "alpha",
++        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer first.deinit(std.testing.allocator);
++
++    var second = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        " beta",
++        1_000 + 2 * STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer second.deinit(std.testing.allocator);
++
++    try std.testing.expectEqualStrings("alpha beta", second.text);
++    try std.testing.expectEqualStrings(" beta", second.delta());
++}
++
++test "appendStreamChunk ignores empty and whitespace-only buffers" {
++    var state = StreamState{};
++    defer state.deinit(std.testing.allocator);
++
++    try std.testing.expect((try appendStreamChunk(std.testing.allocator, &state, "", 5_000)) == null);
++    try std.testing.expect((try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "  \n\t",
++        5_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) == null);
++    try std.testing.expectEqual(@as(usize, 0), state.sent.len);
++}
++
++test "appendStreamChunk renders streamed reasoning as a Slack quote" {
++    var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
++    defer state.deinit(std.testing.allocator);
++
++    var flush = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "<think>private reasoning</think>Visible answer",
++        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer flush.deinit(std.testing.allocator);
++
++    try std.testing.expectEqualStrings("> private reasoning\n\nVisible answer", flush.text);
++    try std.testing.expect(state.rendered_reasoning);
++}
++
++test "appendStreamChunk leaves drafts without reasoning untouched" {
++    var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
++    defer state.deinit(std.testing.allocator);
++
++    // reasoning_mode off/on: the daemon strips think blocks before the channel
++    // sees them, so the streamed text is exactly the visible answer.
++    var flush = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "Visible answer",
++        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer flush.deinit(std.testing.allocator);
++
++    try std.testing.expectEqualStrings("Visible answer", flush.text);
++    try std.testing.expect(!state.rendered_reasoning);
++}
++
++test "appendStreamChunk resends the snapshot when a late think block rewrites it" {
++    var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
++    defer state.deinit(std.testing.allocator);
++
++    // The first flush ends mid-tag, so "<thi" is still literal text.
++    var first = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "a<thi",
++        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer first.deinit(std.testing.allocator);
++    try std.testing.expectEqualStrings("a<thi", first.text);
++
++    // The rest of the tag arrives later: the rendered snapshot no longer
++    // extends what was already sent, so the whole snapshot is resent.
++    var second = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "nk>b</think>c",
++        1_000 + 2 * STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer second.deinit(std.testing.allocator);
++    try std.testing.expectEqualStrings("a\n> b\n\nc", second.text);
++    try std.testing.expectEqual(@as(usize, 0), second.delta_start);
++    try std.testing.expect(state.rendered_reasoning);
++}
++
++test "pendingFinalSuffix returns the unsent remainder for a prefix reply" {
++    try std.testing.expectEqualStrings(" world", pendingFinalSuffix("hello world", "hello").?);
++    try std.testing.expectEqualStrings("", pendingFinalSuffix("hello", "hello").?);
++    try std.testing.expect(pendingFinalSuffix("other", "hello") == null);
++}
++
++test "classifyStreamFailure disables native streaming for feature gating codes" {
++    try std.testing.expect(classifyStreamFailure("missing_scope") == .disable_native);
++    try std.testing.expect(classifyStreamFailure("channel_type_not_supported") == .disable_native);
++    try std.testing.expect(classifyStreamFailure("invalid_thread_ts") == .disable_native);
++    try std.testing.expect(classifyStreamFailure("not_allowed") == .disable_native);
++    try std.testing.expect(classifyStreamFailure("restricted_action_thread_only_channel") == .disable_native);
++    try std.testing.expect(classifyStreamFailure("missing_recipient_user_id") == .disable_native);
++}
++
++test "classifyStreamFailure keeps transient errors retryable" {
++    try std.testing.expect(classifyStreamFailure("ratelimited") == .abandon_turn);
++    try std.testing.expect(classifyStreamFailure("internal_error") == .abandon_turn);
++    try std.testing.expect(classifyStreamFailure("service_unavailable") == .abandon_turn);
++    try std.testing.expect(classifyStreamFailure("message_not_in_streaming_state") == .abandon_turn);
++    try std.testing.expect(classifyStreamFailure("some_new_slack_error") == .abandon_turn);
++}
++
++test "buildStartStreamBody includes thread_ts when threaded" {
++    const body = try buildStartStreamBody(std.testing.allocator, "C123", "1700.1", "hello *world*");
++    defer std.testing.allocator.free(body);
++
++    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
++    defer parsed.deinit();
++    try std.testing.expectEqualStrings("C123", parsed.value.object.get("channel").?.string);
++    try std.testing.expectEqualStrings("1700.1", parsed.value.object.get("thread_ts").?.string);
++    try std.testing.expectEqualStrings("hello *world*", parsed.value.object.get("markdown_text").?.string);
++}
++
++test "buildStartStreamBody omits thread_ts for top-level streams" {
++    const body = try buildStartStreamBody(std.testing.allocator, "C123", null, "hi");
++    defer std.testing.allocator.free(body);
++
++    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
++    defer parsed.deinit();
++    try std.testing.expect(parsed.value.object.get("thread_ts") == null);
++}
++
++test "buildAppendStreamBody carries channel ts and markdown_text" {
++    const body = try buildAppendStreamBody(std.testing.allocator, "C123", "1700.1", "more \"text\"");
++    defer std.testing.allocator.free(body);
++
++    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
++    defer parsed.deinit();
++    try std.testing.expectEqualStrings("C123", parsed.value.object.get("channel").?.string);
++    try std.testing.expectEqualStrings("1700.1", parsed.value.object.get("ts").?.string);
++    try std.testing.expectEqualStrings("more \"text\"", parsed.value.object.get("markdown_text").?.string);
++}
++
++test "buildStopStreamBody sends only channel and ts" {
++    const body = try buildStopStreamBody(std.testing.allocator, "C123", "1700.1");
++    defer std.testing.allocator.free(body);
++
++    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
++    defer parsed.deinit();
++    try std.testing.expectEqual(@as(usize, 2), parsed.value.object.count());
++    try std.testing.expect(parsed.value.object.get("markdown_text") == null);
++}
++
++test "buildUpdateBody carries the replacement text" {
++    const body = try buildUpdateBody(std.testing.allocator, "C123", "1700.1", "*final*");
++    defer std.testing.allocator.free(body);
++
++    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
++    defer parsed.deinit();
++    try std.testing.expectEqualStrings("C123", parsed.value.object.get("channel").?.string);
++    try std.testing.expectEqualStrings("1700.1", parsed.value.object.get("ts").?.string);
++    try std.testing.expectEqualStrings("*final*", parsed.value.object.get("text").?.string);
++}
++
++test "buildStartStreamBody escapes quotes and newlines" {
++    const body = try buildStartStreamBody(std.testing.allocator, "C123", "1700.1", "a\"b\nc");
++    defer std.testing.allocator.free(body);
++
++    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
++    defer parsed.deinit();
++    try std.testing.expectEqualStrings("a\"b\nc", parsed.value.object.get("markdown_text").?.string);
++}
++
++test "splitForLimit keeps short text intact" {
++    const chunks = try splitForLimit(std.testing.allocator, "short", 100);
++    defer freeChunks(std.testing.allocator, chunks);
++    try std.testing.expectEqual(@as(usize, 1), chunks.len);
++    try std.testing.expectEqualStrings("short", chunks[0]);
++}
++
++test "splitForLimit splits long text and prefers newline boundaries" {
++    const text = ("a" ** 40) ++ "\n" ++ ("b" ** 40);
++    const chunks = try splitForLimit(std.testing.allocator, text, 50);
++    defer freeChunks(std.testing.allocator, chunks);
++    try std.testing.expectEqual(@as(usize, 2), chunks.len);
++    try std.testing.expectEqualStrings("a" ** 40, chunks[0]);
++    try std.testing.expectEqualStrings("b" ** 40, chunks[1]);
++}
++
++test "splitForLimit never cuts a multibyte character" {
++    const text = "é" ** 60; // 2 bytes each = 120 bytes
++    const chunks = try splitForLimit(std.testing.allocator, text, 7);
++    defer freeChunks(std.testing.allocator, chunks);
++    for (chunks) |chunk| {
++        try std.testing.expect(chunk.len % 2 == 0);
++        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk));
++    }
++}
++
++test "splitForLimit handles text without newlines" {
++    const chunks = try splitForLimit(std.testing.allocator, "x" ** 25, 10);
++    defer freeChunks(std.testing.allocator, chunks);
++    try std.testing.expectEqual(@as(usize, 3), chunks.len);
++    try std.testing.expectEqual(@as(usize, 10), chunks[0].len);
++    try std.testing.expectEqual(@as(usize, 5), chunks[2].len);
++}
++
++test "finishTurn clears per-turn state and marks the target finished" {
++    var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
++    defer state.deinit(std.testing.allocator);
++
++    var flush = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "hello",
++        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    flush.deinit(std.testing.allocator);
++    try state.setMessageTs(std.testing.allocator, "1700.1");
++
++    state.finishTurn(std.testing.allocator, 9_000);
++
++    try std.testing.expectEqual(@as(usize, 0), state.buffer.items.len);
++    try std.testing.expectEqual(@as(usize, 0), state.sent.len);
++    try std.testing.expectEqual(@as(usize, 0), state.message_ts.len);
++    try std.testing.expect(state.isLateChunk(9_000));
++}
++
++test "isLateChunk expires after the grace window" {
++    var state = StreamState{};
++    defer state.deinit(std.testing.allocator);
++
++    try std.testing.expect(!state.isLateChunk(1_000));
++
++    state.finishTurn(std.testing.allocator, 1_000);
++    try std.testing.expect(state.isLateChunk(1_000 + STREAM_LATE_CHUNK_GRACE_MS - 1));
++    try std.testing.expect(!state.isLateChunk(1_000 + STREAM_LATE_CHUNK_GRACE_MS));
++}
++
++test "appendStreamChunk starts a fresh turn after the grace window" {
++    var state = StreamState{};
++    defer state.deinit(std.testing.allocator);
++
++    state.finishTurn(std.testing.allocator, 1_000);
++
++    const big = "n" ** (STREAM_FLUSH_MIN_DELTA_BYTES + 1);
++    var flush = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        big,
++        1_000 + STREAM_LATE_CHUNK_GRACE_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer flush.deinit(std.testing.allocator);
++
++    try std.testing.expectEqualStrings(big, flush.text);
++    try std.testing.expectEqual(@as(i64, 0), state.finished_at_ms);
++}
++
++test "clearStreamState frees the target entry" {
++    var states: std.StringHashMapUnmanaged(StreamState) = .empty;
++    defer deinitStreamStates(std.testing.allocator, &states);
++
++    const key = try std.testing.allocator.dupe(u8, "C123");
++    try states.put(std.testing.allocator, key, StreamState{});
++    try states.getPtr("C123").?.setMessageTs(std.testing.allocator, "1700.1");
++
++    clearStreamState(std.testing.allocator, &states, "C123");
++    try std.testing.expect(states.count() == 0);
++}
+diff --git a/src/channels/telegram_draft_presenter.zig b/src/channels/telegram_draft_presenter.zig
+index f65148d1..3132d987 100644
+--- a/src/channels/telegram_draft_presenter.zig
++++ b/src/channels/telegram_draft_presenter.zig
+@@ -75,10 +75,16 @@ fn hasPendingVisibleDraft(state: *const DraftState) bool {
+     return hasVisibleDraftText(state.buffer.items[state.last_flush_len..]);
+ }
+ 
++/// Snapshot the buffered draft for the wire.
++///
++/// `<think>` blocks only reach a channel when the daemon forwards them, which
++/// it does solely for `reasoning_mode == .stream`; in every other mode they are
++/// already stripped upstream, so quoting them here is a no-op and `.off`/`.on`
++/// drafts stay exactly as they were.
+ fn snapshotDraftText(allocator: std.mem.Allocator, state: *const DraftState) ![]u8 {
+-    const stripped = try providers.stripThinkBlocks(allocator, state.buffer.items);
+-    defer allocator.free(stripped);
+-    return allocator.dupe(u8, stripped);
++    const rendered = try providers.quoteThinkBlocks(allocator, state.buffer.items);
++    defer allocator.free(rendered);
++    return allocator.dupe(u8, rendered);
+ }
+ 
+ fn alignUtf8Start(text: []const u8, start: usize) usize {
+@@ -268,7 +274,7 @@ test "appendDraftChunk flushes visible content after interval" {
+     try std.testing.expectEqual(@as(usize, 5), draft.last_flush_len);
+ }
+ 
+-test "appendDraftChunk strips think blocks from flushed draft" {
++test "appendDraftChunk renders streamed reasoning as a quote" {
+     var draft: DraftState = .{ .draft_id = 31 };
+     defer draft.deinit(std.testing.allocator);
+ 
+@@ -283,6 +289,26 @@ test "appendDraftChunk strips think blocks from flushed draft" {
+         tmp.deinit(std.testing.allocator);
+     }
+ 
++    try std.testing.expectEqualStrings("> private\n\nVisible answer", flush.text);
++}
++
++test "appendDraftChunk leaves drafts without reasoning untouched" {
++    var draft: DraftState = .{ .draft_id = 32 };
++    defer draft.deinit(std.testing.allocator);
++
++    // reasoning_mode off/on: the daemon strips think blocks before they reach
++    // the channel, so the draft is exactly the visible answer.
++    const flush = (try appendDraftChunk(
++        std.testing.allocator,
++        &draft,
++        "Visible answer",
++        DRAFT_FLUSH_MIN_INTERVAL_MS + 1,
++    )) orelse return error.TestUnexpectedResult;
++    defer {
++        var tmp = flush;
++        tmp.deinit(std.testing.allocator);
++    }
++
+     try std.testing.expectEqualStrings("Visible answer", flush.text);
+ }
+ 
+diff --git a/src/config.zig b/src/config.zig
+index 352898ae..1422cfcb 100644
+--- a/src/config.zig
++++ b/src/config.zig
+@@ -7163,6 +7163,74 @@ test "parse slack accounts" {
+     allocator.free(cfg.channels.slack);
+ }
+ 
++test "parse slack streaming defaults to false" {
++    const allocator = std.testing.allocator;
++    const json =
++        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try cfg.parseJson(json);
++    try std.testing.expect(cfg.channels.slack.len > 0);
++    try std.testing.expect(!cfg.channels.slack[0].streaming);
++    allocator.free(cfg.channels.slack[0].account_id);
++    allocator.free(cfg.channels.slack[0].bot_token);
++    allocator.free(cfg.channels.slack[0].allow_from);
++    allocator.free(cfg.channels.slack);
++}
++
++test "parse slack streaming from config" {
++    const allocator = std.testing.allocator;
++    const json =
++        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123", "streaming": true, "reply_to_mode": "all"}}}}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try cfg.parseJson(json);
++    try std.testing.expect(cfg.channels.slack.len > 0);
++    try std.testing.expect(cfg.channels.slack[0].streaming);
++    try std.testing.expect(cfg.channels.slack[0].reply_to_mode == .all);
++    allocator.free(cfg.channels.slack[0].account_id);
++    allocator.free(cfg.channels.slack[0].bot_token);
++    allocator.free(cfg.channels.slack[0].allow_from);
++    allocator.free(cfg.channels.slack);
++}
++
++test "save writes slack streaming" {
++    const allocator = std.testing.allocator;
++    const accounts = [_]SlackConfig{.{
++        .account_id = "main",
++        .bot_token = "xoxb-123",
++        .streaming = true,
++    }};
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    cfg.channels.slack = &accounts;
++
++    var out: std.ArrayListUnmanaged(u8) = .empty;
++    defer out.deinit(allocator);
++    var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
++    try cfg.writeChannelsSection(&writer.writer);
++    out = writer.toArrayList();
++
++    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"streaming\": true") != null);
++}
++
++test "save omits slack streaming when disabled" {
++    const allocator = std.testing.allocator;
++    const accounts = [_]SlackConfig{.{
++        .account_id = "main",
++        .bot_token = "xoxb-123",
++    }};
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    cfg.channels.slack = &accounts;
++
++    var out: std.ArrayListUnmanaged(u8) = .empty;
++    defer out.deinit(allocator);
++    var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
++    try cfg.writeChannelsSection(&writer.writer);
++    out = writer.toArrayList();
++
++    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"streaming\": false") != null);
++}
++
+ test "parse irc accounts" {
+     const allocator = std.testing.allocator;
+     const json =
+diff --git a/src/config_types.zig b/src/config_types.zig
+index 63b23f26..93089b67 100644
+--- a/src/config_types.zig
++++ b/src/config_types.zig
+@@ -704,6 +704,11 @@ pub const SlackConfig = struct {
+     dm_policy: []const u8 = "pairing",
+     group_policy: []const u8 = "mention_only",
+     reply_to_mode: SlackReplyToMode = .off,
++    /// Stream replies while the model is still generating them.
++    /// In a thread this uses Slack's native chat.startStream/appendStream/stopStream;
++    /// elsewhere it falls back to a chat.postMessage that is edited with chat.update.
++    /// Off by default: it needs the app's "Agents & AI Apps" feature and paid-plan scopes.
++    streaming: bool = false,
+ };
+ 
+ pub const TeamsConfig = struct {
+diff --git a/src/daemon.zig b/src/daemon.zig
+index b3dfd916..c2b73d9f 100644
+--- a/src/daemon.zig
++++ b/src/daemon.zig
+@@ -1174,13 +1174,24 @@ fn makeAssistantReplyPayload(allocator: std.mem.Allocator, reply: []const u8) !A
+     };
+ }
+ 
++/// Channels whose draft presenter knows how to render a forwarded `<think>`
++/// block. Everything else keeps the stripped preview: it has nowhere to put the
++/// reasoning, and forwarding the tags would leak them into a live message.
++fn channelShowsLiveReasoning(channel: []const u8) bool {
++    return std.mem.eql(u8, channel, "telegram") or std.mem.eql(u8, channel, "slack");
++}
++
+ fn makeStreamingSinkForChannel(
+     streaming_supported: bool,
+     raw_sink: streaming.Sink,
+     filter: *streaming.TagFilter,
++    stream_reasoning: bool,
+ ) ?streaming.Sink {
+     if (!streaming_supported) return null;
+-    filter.* = streaming.TagFilter.init(raw_sink);
++    filter.* = streaming.TagFilter.initWithThinkMode(
++        raw_sink,
++        if (stream_reasoning) .passthrough else .strip,
++    );
+     return filter.sink();
+ }
+ 
+@@ -1338,7 +1349,16 @@ fn processInboundMessage(
+             .callback = publishStreamingChunk,
+             .ctx = @ptrCast(&streaming_ctx),
+         };
+-        stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
++        // Reasoning is only forwarded when the session streams it and the
++        // outbound channel renders it; otherwise the preview stays stripped.
++        const stream_reasoning = channelShowsLiveReasoning(routing_plan.outbound_channel) and
++            runtime.session_mgr.streamsReasoning(routing_plan.session_key);
++        stream_sink = makeStreamingSinkForChannel(
++            use_streaming_outbound,
++            raw_sink,
++            &outbound_tag_filter,
++            stream_reasoning,
++        );
+     }
+ 
+     if (std.mem.eql(u8, msg.channel, "max")) {
+@@ -1864,7 +1884,7 @@ test "makeStreamingSinkForChannel filters chunks when streaming is enabled" {
+ 
+     var collector = Collector{};
+     var filter: streaming.TagFilter = undefined;
+-    const sink = makeStreamingSinkForChannel(true, collector.sink(), &filter).?;
++    const sink = makeStreamingSinkForChannel(true, collector.sink(), &filter, false).?;
+     sink.emitChunk("A<|tool_call_begin|>{\"name\":\"shell\"}<|tool_call_end|>B");
+     sink.emitFinal();
+ 
+@@ -1872,6 +1892,40 @@ test "makeStreamingSinkForChannel filters chunks when streaming is enabled" {
+     try std.testing.expect(collector.got_final);
+ }
+ 
++test "makeStreamingSinkForChannel keeps reasoning when the session streams it" {
++    const Noop = struct {
++        fn callback(_: *anyopaque, _: streaming.Event) void {}
++    };
++
++    var filter: streaming.TagFilter = undefined;
++    _ = makeStreamingSinkForChannel(true, .{
++        .callback = Noop.callback,
++        .ctx = undefined,
++    }, &filter, true).?;
++    try std.testing.expectEqual(streaming.ThinkMode.passthrough, filter.think);
++}
++
++test "makeStreamingSinkForChannel strips reasoning by default" {
++    const Noop = struct {
++        fn callback(_: *anyopaque, _: streaming.Event) void {}
++    };
++
++    var filter: streaming.TagFilter = undefined;
++    _ = makeStreamingSinkForChannel(true, .{
++        .callback = Noop.callback,
++        .ctx = undefined,
++    }, &filter, false).?;
++    try std.testing.expectEqual(streaming.ThinkMode.strip, filter.think);
++}
++
++test "channelShowsLiveReasoning only enables channels that render it" {
++    try std.testing.expect(channelShowsLiveReasoning("telegram"));
++    try std.testing.expect(channelShowsLiveReasoning("slack"));
++    try std.testing.expect(!channelShowsLiveReasoning("max"));
++    try std.testing.expect(!channelShowsLiveReasoning("dingtalk"));
++    try std.testing.expect(!channelShowsLiveReasoning("web"));
++}
++
+ test "makeStreamingSinkForChannel returns sink when streaming is enabled" {
+     const Noop = struct {
+         fn callback(_: *anyopaque, _: streaming.Event) void {}
+@@ -1881,7 +1935,7 @@ test "makeStreamingSinkForChannel returns sink when streaming is enabled" {
+     const sink = makeStreamingSinkForChannel(true, .{
+         .callback = Noop.callback,
+         .ctx = undefined,
+-    }, &filter);
++    }, &filter, false);
+     try std.testing.expect(sink != null);
+ }
+ 
+@@ -1894,7 +1948,7 @@ test "makeStreamingSinkForChannel returns null when streaming is disabled" {
+     const sink = makeStreamingSinkForChannel(false, .{
+         .callback = Noop.callback,
+         .ctx = undefined,
+-    }, &filter);
++    }, &filter, true);
+     try std.testing.expect(sink == null);
+ }
+ 
+diff --git a/src/providers/helpers.zig b/src/providers/helpers.zig
+index 5a07259e..944d2334 100644
+--- a/src/providers/helpers.zig
++++ b/src/providers/helpers.zig
+@@ -91,6 +91,55 @@ pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
+     return allocator.dupe(u8, trimmed);
+ }
+ 
++/// Render `<think>…</think>` blocks as `>`-quoted lines instead of dropping
++/// them. Live channel drafts use this when `reasoning_mode == .stream` so the
++/// thinking is visible while it is produced; the delivered reply always goes
++/// through `stripThinkBlocks`, so the quote never reaches the final message.
++/// An unterminated block (mid-stream) is quoted up to the end of `text`.
++pub fn quoteThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
++    if (std.mem.indexOf(u8, text, think_open_tag) == null) return stripThinkBlocks(allocator, text);
++
++    var out: std.ArrayListUnmanaged(u8) = .empty;
++    errdefer out.deinit(allocator);
++
++    var i: usize = 0;
++    var depth: usize = 0;
++    var at_line_start = false;
++    while (i < text.len) {
++        if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
++            depth += 1;
++            i += think_open_tag.len;
++            if (depth == 1) {
++                try out.appendSlice(allocator, "\n> ");
++                at_line_start = false;
++            }
++            continue;
++        }
++        if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
++            if (depth > 0) depth -= 1;
++            i += think_close_tag.len;
++            if (depth == 0) {
++                try out.appendSlice(allocator, "\n\n");
++                at_line_start = false;
++            }
++            continue;
++        }
++        const byte = text[i];
++        if (depth > 0) {
++            if (at_line_start) try out.appendSlice(allocator, "> ");
++            at_line_start = byte == '\n';
++        }
++        try out.append(allocator, byte);
++        i += 1;
++    }
++
++    const quoted = try out.toOwnedSlice(allocator);
++    const trimmed = std.mem.trim(u8, quoted, " \t\r\n");
++    if (trimmed.ptr == quoted.ptr and trimmed.len == quoted.len) return quoted;
++    defer allocator.free(quoted);
++    return allocator.dupe(u8, trimmed);
++}
++
+ fn appendReasoningDetailText(
+     out: *std.ArrayListUnmanaged(u8),
+     allocator: std.mem.Allocator,
+@@ -866,3 +915,31 @@ test "appendVertexThinkingConfig uses uppercase thinkingLevel for gemini-3 flash
+     try std.testing.expectEqualStrings("MEDIUM", thinking.get("thinkingLevel").?.string);
+     try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
+ }
++
++test "quoteThinkBlocks renders reasoning as a quote and keeps the answer" {
++    const alloc = std.testing.allocator;
++    const out = try quoteThinkBlocks(alloc, "<think>step one\nstep two</think>The answer");
++    defer alloc.free(out);
++    try std.testing.expectEqualStrings("> step one\n> step two\n\nThe answer", out);
++}
++
++test "quoteThinkBlocks leaves plain text untouched" {
++    const alloc = std.testing.allocator;
++    const out = try quoteThinkBlocks(alloc, "Just the answer");
++    defer alloc.free(out);
++    try std.testing.expectEqualStrings("Just the answer", out);
++}
++
++test "quoteThinkBlocks quotes an unterminated reasoning block" {
++    const alloc = std.testing.allocator;
++    const out = try quoteThinkBlocks(alloc, "<think>still thinking");
++    defer alloc.free(out);
++    try std.testing.expectEqualStrings("> still thinking", out);
++}
++
++test "quoteThinkBlocks drops a stray close tag" {
++    const alloc = std.testing.allocator;
++    const out = try quoteThinkBlocks(alloc, "answer</think> tail");
++    defer alloc.free(out);
++    try std.testing.expectEqualStrings("answer tail", out);
++}
+diff --git a/src/providers/root.zig b/src/providers/root.zig
+index 2e9d0924..752178d8 100644
+--- a/src/providers/root.zig
++++ b/src/providers/root.zig
+@@ -65,6 +65,7 @@ pub const curlPostFormTimed = helpers.curlPostFormTimed;
+ pub const SplitThinkContent = helpers.SplitThinkContent;
+ pub const splitThinkContent = helpers.splitThinkContent;
+ pub const stripThinkBlocks = helpers.stripThinkBlocks;
++pub const quoteThinkBlocks = helpers.quoteThinkBlocks;
+ pub const extractReasoningTextFromDetails = helpers.extractReasoningTextFromDetails;
+ pub const normalizeOpenAiReasoningEffort = helpers.normalizeOpenAiReasoningEffort;
+ pub const appendOpenAiBodyExtraParams = helpers.appendOpenAiBodyExtraParams;
+diff --git a/src/session.zig b/src/session.zig
+index 00621c0f..d5290dc5 100644
+--- a/src/session.zig
++++ b/src/session.zig
+@@ -2026,6 +2026,17 @@ pub const SessionManager = struct {
+         return session.turn_running.load(.acquire);
+     }
+ 
++    /// True when the session's agent streams reasoning to the caller
++    /// (`/reasoning stream`), which is what lets a channel draft show the
++    /// thinking live. Unknown sessions report false: a new session starts in
++    /// the default mode, which does not stream reasoning.
++    pub fn streamsReasoning(self: *SessionManager, session_key: []const u8) bool {
++        self.mutex.lock();
++        defer self.mutex.unlock();
++        const session = self.sessions.get(session_key) orelse return false;
++        return session.agent.reasoning_mode == .stream;
++    }
++
+     pub const InboundRouteAction = enum {
+         process,
+         skip,
+diff --git a/src/streaming.zig b/src/streaming.zig
+index 0f33338a..314cae91 100644
+--- a/src/streaming.zig
++++ b/src/streaming.zig
+@@ -51,8 +51,20 @@ pub fn forwardProviderChunk(sink: Sink, chunk: providers.StreamChunk) void {
+ // chunks before forwarding to an inner Sink.
+ // ---------------------------------------------------------------------------
+ 
++/// What `TagFilter` does with `<think>…</think>` blocks.
++pub const ThinkMode = enum {
++    /// Drop the block and its tags, so reasoning never leaves the agent.
++    strip,
++    /// Forward the tags and the body untouched so a channel draft can render
++    /// the reasoning live. Used when `reasoning_mode == .stream` and the
++    /// outbound channel knows how to display it. Tool-call markup is still
++    /// stripped in both modes.
++    passthrough,
++};
++
+ pub const TagFilter = struct {
+     inner: Sink,
++    think: ThinkMode = .strip,
+     state: State = .passthrough,
+     buf: [max_buf_len]u8 = undefined,
+     buf_len: u8 = 0,
+@@ -63,6 +75,7 @@ pub const TagFilter = struct {
+         skip_to_angle_close, // prefix matched, eating until '>'
+         inside_tag, // inside tag body, suppressing output
+         maybe_close, // buffering after '<', checking if close tag matches
++        inside_think, // passthrough mode: inside <think>, body flows verbatim
+     };
+ 
+     // Opening tag prefixes. After matching, skip until '>'.
+@@ -88,6 +101,10 @@ pub const TagFilter = struct {
+         "</think>",
+     };
+ 
++    // Used by `ThinkMode.passthrough`, which forwards the reasoning close tag
++    // instead of swallowing it.
++    const close_tag_think = "</think>";
++
+     // Standalone control tokens that should be stripped, but do not wrap body text.
+     const standalone_tags = [_][]const u8{
+         "<tool_calls_section_begin>",
+@@ -116,6 +133,12 @@ pub const TagFilter = struct {
+         return .{ .inner = inner };
+     }
+ 
++    /// Like `init`, but forwards `<think>` blocks to the inner sink instead of
++    /// dropping them.
++    pub fn initWithThinkMode(inner: Sink, think: ThinkMode) TagFilter {
++        return .{ .inner = inner, .think = think };
++    }
++
+     /// Return a Sink whose callback routes through this filter.
+     pub fn sink(self: *TagFilter) Sink {
+         return .{
+@@ -164,8 +187,13 @@ pub const TagFilter = struct {
+                     if (self.buf_len > 1 and (b == '>' or b == ' ') and
+                         matchesAnyPrefix(prefix[0 .. self.buf_len - 1], &open_prefixes))
+                     {
++                        const forward_think = self.think == .passthrough and b == '>' and
++                            std.mem.eql(u8, prefix, "<think>");
+                         self.buf_len = 0;
+-                        if (b == '>') {
++                        if (forward_think) {
++                            self.inner.emitChunk("<think>");
++                            self.state = .inside_think;
++                        } else if (b == '>') {
+                             self.state = .inside_tag;
+                         } else {
+                             self.state = .skip_to_angle_close;
+@@ -218,10 +246,31 @@ pub const TagFilter = struct {
+                     }
+                     // Still a valid prefix of a close tag — keep buffering.
+                 },
++                .inside_think => {
++                    // Passthrough mode: the body is user-visible reasoning, so
++                    // forward it verbatim. The close tag is matched against the
++                    // caller's slice, which keeps the emitted bytes valid for
++                    // the whole call and needs no replay buffer.
++                    if (b != '<') continue;
++                    if (std.mem.startsWith(u8, text[i..], close_tag_think)) {
++                        if (i > clean_start) self.inner.emitChunk(text[clean_start..i]);
++                        self.inner.emitChunk(close_tag_think);
++                        self.state = .passthrough;
++                        // Skip the rest of the tag: none of its bytes is '<'.
++                        clean_start = i + close_tag_think.len;
++                    } else {
++                        // Not a close tag here (either ordinary '<' text or the
++                        // start of one split across chunks). Emitting it as
++                        // literal text yields the same bytes either way.
++                        if (i > clean_start) self.inner.emitChunk(text[clean_start..i]);
++                        self.inner.emitChunk(text[i .. i + 1]);
++                        clean_start = i + 1;
++                    }
++                },
+             }
+         }
+         // Flush remaining clean text in passthrough mode.
+-        if (self.state == .passthrough and clean_start < text.len)
++        if ((self.state == .passthrough or self.state == .inside_think) and clean_start < text.len)
+             self.inner.emitChunk(text[clean_start..]);
+     }
+ 
+@@ -455,6 +504,58 @@ test "TagFilter passthrough without tags" {
+     try std.testing.expect(col.got_final);
+ }
+ 
++test "TagFilter strips think blocks by default" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.init(col.sink());
++    const s = filter.sink();
++    s.emitChunk("<think>private</think>Visible");
++    s.emitFinal();
++    var buf: [64]u8 = undefined;
++    try std.testing.expectEqualStrings("Visible", col.joined(&buf));
++}
++
++test "TagFilter think passthrough forwards reasoning to the inner sink" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
++    const s = filter.sink();
++    s.emitChunk("<think>private</think>Visible");
++    s.emitFinal();
++    var buf: [128]u8 = undefined;
++    try std.testing.expectEqualStrings("<think>private</think>Visible", col.joined(&buf));
++}
++
++test "TagFilter think passthrough survives a split tag" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
++    const s = filter.sink();
++    s.emitChunk("<thi");
++    s.emitChunk("nk>hi</thi");
++    s.emitChunk("nk>done");
++    s.emitFinal();
++    var buf: [64]u8 = undefined;
++    try std.testing.expectEqualStrings("<think>hi</think>done", col.joined(&buf));
++}
++
++test "TagFilter think passthrough keeps angle brackets inside reasoning" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
++    const s = filter.sink();
++    s.emitChunk("<think>a < b and c > d</think>ok");
++    s.emitFinal();
++    var buf: [128]u8 = undefined;
++    try std.testing.expectEqualStrings("<think>a < b and c > d</think>ok", col.joined(&buf));
++}
++
++test "TagFilter think passthrough still strips tool call markup" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
++    const s = filter.sink();
++    s.emitChunk("<think>thinking</think>A<tool_call>{\"name\":\"x\"}</tool_call>B");
++    s.emitFinal();
++    var buf: [128]u8 = undefined;
++    try std.testing.expectEqualStrings("<think>thinking</think>AB", col.joined(&buf));
++}
++
+ test "TagFilter strips complete tool_call in single chunk" {
+     var col = collectChunks(16){};
+     var filter = TagFilter.init(col.sink());
+-- 
+2.56.0
+
+
+From 75c08d8278895605f1971a4888663f79016edeea Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Thu, 15 Oct 2026 07:01:11 +0900
+Subject: [PATCH 2/2] fix(channels): actually show live reasoning, and strip
+ provider tool markup
+
+The live-reasoning path added with the Slack outbound stream only worked
+for channels served by `daemon.processInboundMessage`, and the delivered
+text still leaked a model's own text tool protocol. Three gaps:
+
+- Telegram is served by `channel_loop.processTelegramMessage`, which
+  built its `TagFilter` in the default strip mode and never consulted
+  `streamsReasoning`, so the draft never showed the thinking even with
+  `draft_previews` on. The loop now selects the passthrough the same way
+  the daemon does, via a `think_mode` on `StreamCtx`.
+
+- `SessionManager.streamsReasoning` returned false for a session that did
+  not exist yet. Slack appends the thread ts to the session key, so a
+  channel turn routinely looks up a session created by that very turn and
+  every Slack message was stripped. An unknown key now reports the
+  configured default.
+
+- `TagFilter` only knew `<tool_call>`. A model that falls back to its own
+  text tool protocol (DeepSeek DSML: a `<|DSML| calls>` block wrapping
+  `<|DSML| invoke ...>` and its parameter values) had those bytes
+  delivered to the channel. The filter now drops marker regions in both
+  think modes, and `providers.helpers` - which produces the delivered
+  text - drops them too, so the final message is clean on every channel
+  even when nothing was streamed.
+
+Validation: `zig build test --summary all` (7581 passed, 14 skipped, 0
+leaked) and `zig fmt --check` on the changed files, both in the Zig
+0.16.0 container.
+---
+ src/channel_loop.zig      |   5 ++
+ src/channels/telegram.zig |  28 ++++++++-
+ src/providers/helpers.zig | 109 ++++++++++++++++++++++++++++++++-
+ src/session.zig           |  13 +++-
+ src/streaming.zig         | 125 ++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 274 insertions(+), 6 deletions(-)
+
+diff --git a/src/channel_loop.zig b/src/channel_loop.zig
+index 612d70e2..4727a3b6 100644
+--- a/src/channel_loop.zig
++++ b/src/channel_loop.zig
+@@ -980,6 +980,11 @@ fn processTelegramMessage(
+         .tg_ptr = tg_ptr,
+         .chat_id = sender,
+         .draft_id = draft_turn_id,
++        // Telegram is served by this loop rather than daemon.processInboundMessage,
++        // so the reasoning passthrough that the daemon selects has to be selected
++        // here too. The draft shows the thinking as a quoted block; the delivered
++        // reply still goes through stripThinkBlocks and stays clean.
++        .think_mode = if (runtime.session_mgr.streamsReasoning(session_key)) .passthrough else .strip,
+     };
+     const sink = tg_ptr.makeSink(&stream_ctx);
+ 
+diff --git a/src/channels/telegram.zig b/src/channels/telegram.zig
+index 0c103c27..6f3e3447 100644
+--- a/src/channels/telegram.zig
++++ b/src/channels/telegram.zig
+@@ -3362,6 +3362,10 @@ pub const TelegramChannel = struct {
+         tg_ptr: *TelegramChannel,
+         chat_id: []const u8,
+         draft_id: u64 = 0,
++        /// `.passthrough` when the session streams reasoning, so the draft shows
++        /// the thinking as a quoted block instead of dropping it. The delivered
++        /// reply still goes through `stripThinkBlocks`.
++        think_mode: streaming.ThinkMode = .strip,
+         filter: streaming.TagFilter = undefined,
+     };
+ 
+@@ -3380,7 +3384,7 @@ pub const TelegramChannel = struct {
+             .callback = streamCallback,
+             .ctx = @ptrCast(ctx),
+         };
+-        ctx.filter = streaming.TagFilter.init(raw);
++        ctx.filter = streaming.TagFilter.initWithThinkMode(raw, ctx.think_mode);
+         return ctx.filter.sink();
+     }
+ };
+@@ -5917,6 +5921,28 @@ test "supportsDraftPreviewTarget disables draft preview for topic targets" {
+     try std.testing.expect(!supportsDraftPreviewTarget("-100123#topic:77"));
+ }
+ 
++test "makeSink follows the ctx think mode" {
++    var ch = TelegramChannel.init(std.testing.allocator, "test-token", &.{}, &.{}, "allowlist");
++    ch.streaming_enabled = true;
++
++    var ctx = TelegramChannel.StreamCtx{
++        .tg_ptr = &ch,
++        .chat_id = "12345",
++        .draft_id = 1,
++        .think_mode = .passthrough,
++    };
++    try std.testing.expect(ch.makeSink(&ctx) != null);
++    try std.testing.expectEqual(streaming.ThinkMode.passthrough, ctx.filter.think);
++
++    var plain = TelegramChannel.StreamCtx{
++        .tg_ptr = &ch,
++        .chat_id = "12345",
++        .draft_id = 2,
++    };
++    try std.testing.expect(ch.makeSink(&plain) != null);
++    try std.testing.expectEqual(streaming.ThinkMode.strip, plain.filter.think);
++}
++
+ test "makeSink returns null for topic targets" {
+     var ch = TelegramChannel.init(std.testing.allocator, "test-token", &.{}, &.{}, "allowlist");
+     ch.streaming_enabled = true;
+diff --git a/src/providers/helpers.zig b/src/providers/helpers.zig
+index 944d2334..5faaca8c 100644
+--- a/src/providers/helpers.zig
++++ b/src/providers/helpers.zig
+@@ -10,6 +10,48 @@ const ToolSpec = root.ToolSpec;
+ const think_open_tag = "<think>";
+ const think_close_tag = "</think>";
+ 
++// Provider tool-protocol markers, neither `<tool_call>` nor user text. A model
++// that falls back to its own text tool protocol (DeepSeek emits
++// `<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>` wrapping
++// `<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke ...>` and its parameter values) can
++// have those bytes land in the response text. They are stripped from every
++// user-visible string this module produces.
++const opaque_marker_open = "<\u{FF5C}";
++const opaque_marker_close = "</\u{FF5C}";
++
++fn hasOpaqueMarker(text: []const u8) bool {
++    return std.mem.indexOf(u8, text, opaque_marker_open) != null or
++        std.mem.indexOf(u8, text, opaque_marker_close) != null;
++}
++
++/// Byte offset just past the provider tool marker region starting at `start`,
++/// or null when the bytes there are not such a marker. The markers nest, so the
++/// region runs from the opener to the matching closer; a stray closer ends the
++/// region by itself. An unterminated region consumes the rest of `text`.
++fn skipOpaqueMarkers(text: []const u8, start: usize) ?usize {
++    if (!std.mem.startsWith(u8, text[start..], opaque_marker_open) and
++        !std.mem.startsWith(u8, text[start..], opaque_marker_close)) return null;
++    var i = start;
++    var depth: usize = 0;
++    while (i < text.len) {
++        const is_close = std.mem.startsWith(u8, text[i..], opaque_marker_close);
++        const is_open = !is_close and std.mem.startsWith(u8, text[i..], opaque_marker_open);
++        if (!is_close and !is_open) {
++            i += 1;
++            continue;
++        }
++        const gt = std.mem.indexOfScalarPos(u8, text, i, '>') orelse return text.len;
++        if (is_close) {
++            if (depth > 0) depth -= 1;
++        } else {
++            depth += 1;
++        }
++        i = gt + 1;
++        if (depth == 0) return i;
++    }
++    return text.len;
++}
++
+ /// Result of splitting a response text at <think>…</think> blocks.
+ pub const SplitThinkContent = struct {
+     /// Text outside think blocks (the user-visible answer).
+@@ -37,6 +79,12 @@ fn scanThinkContent(
+             i += think_close_tag.len;
+             continue;
+         }
++        if (text[i] == '<') {
++            if (skipOpaqueMarkers(text, i)) |end| {
++                i = end;
++                continue;
++            }
++        }
+         if (depth == 0) {
+             try visible_out.append(allocator, text[i]);
+         } else if (reasoning_out) |reasoning_buf| {
+@@ -49,7 +97,9 @@ fn scanThinkContent(
+ /// Split `text` into visible content and reasoning extracted from <think>…</think> blocks.
+ /// Both returned slices are caller-owned (allocated with `allocator`).
+ pub fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitThinkContent {
+-    if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
++    if (std.mem.indexOf(u8, text, think_open_tag) == null and
++        std.mem.indexOf(u8, text, think_close_tag) == null and !hasOpaqueMarker(text))
++    {
+         return .{
+             .visible = try allocator.dupe(u8, text),
+             .reasoning = null,
+@@ -75,7 +125,9 @@ pub fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitT
+ 
+ /// Strip all <think>…</think> blocks from `text`. Returns caller-owned slice.
+ pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+-    if (std.mem.indexOf(u8, text, think_open_tag) == null and std.mem.indexOf(u8, text, think_close_tag) == null) {
++    if (std.mem.indexOf(u8, text, think_open_tag) == null and
++        std.mem.indexOf(u8, text, think_close_tag) == null and !hasOpaqueMarker(text))
++    {
+         return allocator.dupe(u8, text);
+     }
+ 
+@@ -124,6 +176,12 @@ pub fn quoteThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
+             }
+             continue;
+         }
++        if (text[i] == '<') {
++            if (skipOpaqueMarkers(text, i)) |end| {
++                i = end;
++                continue;
++            }
++        }
+         const byte = text[i];
+         if (depth > 0) {
+             if (at_line_start) try out.appendSlice(allocator, "> ");
+@@ -916,6 +974,53 @@ test "appendVertexThinkingConfig uses uppercase thinkingLevel for gemini-3 flash
+     try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
+ }
+ 
++test "stripThinkBlocks drops provider tool markup" {
++    const alloc = std.testing.allocator;
++    const out = try stripThinkBlocks(
++        alloc,
++        "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
++            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"shell\">" ++
++            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter name=\"command\">ls -la" ++
++            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter>" ++
++            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>" ++
++            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>The answer",
++    );
++    defer alloc.free(out);
++    try std.testing.expectEqualStrings("The answer", out);
++}
++
++test "stripThinkBlocks drops a stray closing marker and keeps the answer" {
++    const alloc = std.testing.allocator;
++    const out = try stripThinkBlocks(alloc, "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>The answer");
++    defer alloc.free(out);
++    try std.testing.expectEqualStrings("The answer", out);
++}
++
++test "quoteThinkBlocks drops provider tool markup around reasoning" {
++    const alloc = std.testing.allocator;
++    const out = try quoteThinkBlocks(
++        alloc,
++        "<think>step one</think>" ++
++            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
++            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>The answer",
++    );
++    defer alloc.free(out);
++    try std.testing.expectEqualStrings("> step one\n\nThe answer", out);
++}
++
++test "splitThinkContent drops provider tool markup" {
++    const alloc = std.testing.allocator;
++    const split = try splitThinkContent(
++        alloc,
++        "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
++            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Answer",
++    );
++    defer alloc.free(split.visible);
++    if (split.reasoning) |r| alloc.free(r);
++    try std.testing.expectEqualStrings("Answer", split.visible);
++    try std.testing.expect(split.reasoning == null);
++}
++
+ test "quoteThinkBlocks renders reasoning as a quote and keeps the answer" {
+     const alloc = std.testing.allocator;
+     const out = try quoteThinkBlocks(alloc, "<think>step one\nstep two</think>The answer");
+diff --git a/src/session.zig b/src/session.zig
+index d5290dc5..b68de568 100644
+--- a/src/session.zig
++++ b/src/session.zig
+@@ -2028,12 +2028,19 @@ pub const SessionManager = struct {
+ 
+     /// True when the session's agent streams reasoning to the caller
+     /// (`/reasoning stream`), which is what lets a channel draft show the
+-    /// thinking live. Unknown sessions report false: a new session starts in
+-    /// the default mode, which does not stream reasoning.
++    /// thinking live.
++    ///
++    /// An unknown key reports the configured default instead of false. A session
++    /// only exists once its first turn has run, and Slack appends the thread ts
++    /// to the key, so a channel turn routinely looks up a session that does not
++    /// exist yet. Returning false there silently stripped the live reasoning
++    /// from every Slack message.
+     pub fn streamsReasoning(self: *SessionManager, session_key: []const u8) bool {
+         self.mutex.lock();
+         defer self.mutex.unlock();
+-        const session = self.sessions.get(session_key) orelse return false;
++        const session = self.sessions.get(session_key) orelse {
++            return self.config.agent.reasoning_mode == .stream;
++        };
+         return session.agent.reasoning_mode == .stream;
+     }
+ 
+diff --git a/src/streaming.zig b/src/streaming.zig
+index 314cae91..096469d3 100644
+--- a/src/streaming.zig
++++ b/src/streaming.zig
+@@ -66,6 +66,10 @@ pub const TagFilter = struct {
+     inner: Sink,
+     think: ThinkMode = .strip,
+     state: State = .passthrough,
++    /// Nesting depth of the provider tool marker currently being suppressed.
++    opaque_depth: u8 = 0,
++    /// True when the marker being eaten is a closer (`</\u{FF5C}...`).
++    opaque_closer: bool = false,
+     buf: [max_buf_len]u8 = undefined,
+     buf_len: u8 = 0,
+ 
+@@ -76,6 +80,9 @@ pub const TagFilter = struct {
+         inside_tag, // inside tag body, suppressing output
+         maybe_close, // buffering after '<', checking if close tag matches
+         inside_think, // passthrough mode: inside <think>, body flows verbatim
++        opaque_marker, // provider tool marker: eat bytes up to its closing '>'
++        opaque_body, // inside a suppressed marker body
++        opaque_body_maybe_open, // inside a suppressed body, buffering after '<'
+     };
+ 
+     // Opening tag prefixes. After matching, skip until '>'.
+@@ -105,6 +112,19 @@ pub const TagFilter = struct {
+     // instead of swallowing it.
+     const close_tag_think = "</think>";
+ 
++    // Provider tool-protocol markers that are neither `<tool_call>` nor user
++    // text. When a model falls back to its own text tool protocol the gateway
++    // can surface those bytes in the content stream - DeepSeek emits
++    // `<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>` /
++    // `<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke ...>` - and they must
++    // never reach a channel. The markers nest (`calls` wraps `invoke` wraps
++    // `parameter`), so the body is suppressed until the matching closer, in
++    // both think modes: it is tool markup, not reasoning and not an answer.
++    const opaque_marker_prefixes = [_][]const u8{
++        "<\u{FF5C}",
++        "</\u{FF5C}",
++    };
++
+     // Standalone control tokens that should be stripped, but do not wrap body text.
+     const standalone_tags = [_][]const u8{
+         "<tool_calls_section_begin>",
+@@ -206,6 +226,18 @@ pub const TagFilter = struct {
+                         clean_start = i + 1;
+                         continue;
+                     }
++                    // Provider tool marker (`<\u{FF5C}...` / `</\u{FF5C}...`): buffer
++                    // the opening bytes, then eat the marker and, for an opener,
++                    // suppress its body too.
++                    if (prefixOfAny(prefix, &opaque_marker_prefixes)) {
++                        if (matchesAnyPrefix(prefix, &opaque_marker_prefixes)) {
++                            self.opaque_closer = prefix.len > 1 and prefix[1] == '/';
++                            self.buf_len = 0;
++                            self.state = .opaque_marker;
++                        }
++                        clean_start = i + 1;
++                        continue;
++                    }
+                     // Not a prefix of any tag — flush buffer and resume passthrough.
+                     self.inner.emitChunk(self.buf[0..self.buf_len]);
+                     self.buf_len = 0;
+@@ -246,6 +278,42 @@ pub const TagFilter = struct {
+                     }
+                     // Still a valid prefix of a close tag — keep buffering.
+                 },
++                .opaque_marker => {
++                    // Drop the marker itself; the body is handled by the state
++                    // the closing '>' selects.
++                    clean_start = i + 1;
++                    if (b != '>') continue;
++                    if (self.opaque_closer) {
++                        if (self.opaque_depth > 0) self.opaque_depth -= 1;
++                    } else {
++                        self.opaque_depth +|= 1;
++                    }
++                    self.state = if (self.opaque_depth > 0) .opaque_body else .passthrough;
++                },
++                .opaque_body => {
++                    clean_start = i + 1;
++                    if (b == '<') {
++                        self.buf[0] = b;
++                        self.buf_len = 1;
++                        self.state = .opaque_body_maybe_open;
++                    }
++                },
++                .opaque_body_maybe_open => {
++                    clean_start = i + 1;
++                    self.buf[self.buf_len] = b;
++                    self.buf_len += 1;
++                    const prefix = self.buf[0..self.buf_len];
++                    if (matchesAnyPrefix(prefix, &opaque_marker_prefixes)) {
++                        self.opaque_closer = prefix[1] == '/';
++                        self.buf_len = 0;
++                        self.state = .opaque_marker;
++                        continue;
++                    }
++                    if (prefixOfAny(prefix, &opaque_marker_prefixes)) continue;
++                    // Ordinary text inside the suppressed body — keep dropping.
++                    self.buf_len = 0;
++                    self.state = .opaque_body;
++                },
+                 .inside_think => {
+                     // Passthrough mode: the body is user-visible reasoning, so
+                     // forward it verbatim. The close tag is matched against the
+@@ -280,6 +348,8 @@ pub const TagFilter = struct {
+             self.inner.emitChunk(self.buf[0..self.buf_len]);
+         }
+         self.buf_len = 0;
++        self.opaque_depth = 0;
++        self.opaque_closer = false;
+         self.state = .passthrough;
+     }
+ 
+@@ -556,6 +626,61 @@ test "TagFilter think passthrough still strips tool call markup" {
+     try std.testing.expectEqualStrings("<think>thinking</think>AB", col.joined(&buf));
+ }
+ 
++test "TagFilter strips DeepSeek DSML tool markup" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.init(col.sink());
++    const s = filter.sink();
++    s.emitChunk(
++        "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
++            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"shell\">" ++
++            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter name=\"command\">ls -la" ++
++            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter>" ++
++            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>" ++
++            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Answer",
++    );
++    s.emitFinal();
++    var buf: [64]u8 = undefined;
++    try std.testing.expectEqualStrings("Answer", col.joined(&buf));
++}
++
++test "TagFilter strips DSML markup in think passthrough mode" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
++    const s = filter.sink();
++    s.emitChunk(
++        "<think>plan</think><\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
++            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"shell\">" ++
++            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>" ++
++            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Done",
++    );
++    s.emitFinal();
++    var buf: [128]u8 = undefined;
++    try std.testing.expectEqualStrings("<think>plan</think>Done", col.joined(&buf));
++}
++
++test "TagFilter strips a DSML marker split across chunks" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.init(col.sink());
++    const s = filter.sink();
++    s.emitChunk("A<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} ca");
++    s.emitChunk("lls>secret</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>B");
++    s.emitFinal();
++    var buf: [64]u8 = undefined;
++    try std.testing.expectEqualStrings("AB", col.joined(&buf));
++}
++
++test "TagFilter drops a stray DSML closer but keeps the answer" {
++    // Regression: a draft that only caught the tail of a marker still showed
++    // the raw `</|DSML| calls>` text ahead of the answer.
++    var col = collectChunks(16){};
++    var filter = TagFilter.init(col.sink());
++    const s = filter.sink();
++    s.emitChunk("</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Answer");
++    s.emitFinal();
++    var buf: [64]u8 = undefined;
++    try std.testing.expectEqualStrings("Answer", col.joined(&buf));
++}
++
+ test "TagFilter strips complete tool_call in single chunk" {
+     var col = collectChunks(16){};
+     var filter = TagFilter.init(col.sink());
+-- 
+2.56.0
+

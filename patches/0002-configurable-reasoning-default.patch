@@ -1,6 +1,6 @@
-From aeda0f195096ad4fc67df74810a537ee1ceaa17c Mon Sep 17 00:00:00 2001
+From 014685b44e8b711ccf55e9961df00ab08f784b7a Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
-Date: Thu, 15 Oct 2026 05:37:58 +0900
+Date: Thu, 15 Oct 2026 06:20:43 +0900
 Subject: [PATCH] feat(config): add agent.reasoning_mode default
 
 The reasoning display mode always started at `off` and `/restart` and
@@ -19,12 +19,12 @@ Docs updated in docs/en/configuration.md and docs/zh/configuration.md.
  docs/en/configuration.md | 18 ++++++++++
  docs/zh/configuration.md | 18 ++++++++++
  src/agent/commands.zig   |  2 +-
- src/agent/root.zig       | 50 ++++++++++++++++++++--------
+ src/agent/root.zig       | 49 +++++++++++++++++++--------
  src/config.zig           | 72 ++++++++++++++++++++++++++++++++++++++++
  src/config_mutator.zig   |  1 +
  src/config_parse.zig     |  5 +++
  src/config_types.zig     | 31 +++++++++++++++++
- 8 files changed, 183 insertions(+), 14 deletions(-)
+ 8 files changed, 182 insertions(+), 14 deletions(-)
 
 diff --git a/docs/en/configuration.md b/docs/en/configuration.md
 index 72bb6c4a..bb486295 100644
@@ -98,7 +98,7 @@ index 7ec79cb7..2c054e94 100644
      self.exec_host = .gateway;
      self.exec_security = self.default_exec_security;
 diff --git a/src/agent/root.zig b/src/agent/root.zig
-index cb2ba7c9..27fcf6e1 100644
+index f481c2c1..9dd8ef1e 100644
 --- a/src/agent/root.zig
 +++ b/src/agent/root.zig
 @@ -107,19 +107,9 @@ pub const Agent = struct {
@@ -142,7 +142,7 @@ index cb2ba7c9..27fcf6e1 100644
              .status_show_emojis = cfg.agent.status_show_emojis,
              .message_timeout_secs = cfg.agent.message_timeout_secs,
              .log_tool_calls = cfg.diagnostics.log_tool_calls,
-@@ -5353,6 +5347,36 @@ test "Agent.fromConfig applies default_queue_mode" {
+@@ -5353,6 +5347,35 @@ test "Agent.fromConfig applies default_queue_mode" {
      try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
  }
  
@@ -175,10 +175,9 @@ index cb2ba7c9..27fcf6e1 100644
 +    defer allocator.free(reset);
 +    try std.testing.expectEqual(Agent.ReasoningMode.stream, agent.reasoning_mode);
 +}
-+
+ 
  test "slash /new clears history" {
      const allocator = std.testing.allocator;
-     var agent = try makeTestAgent(allocator);
 diff --git a/src/config.zig b/src/config.zig
 index 0c3cbaeb..352898ae 100644
 --- a/src/config.zig

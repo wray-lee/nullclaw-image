@@ -1,6 +1,6 @@
-From 6a716c96b1853dec3835359de92d4e8a82e6cc50 Mon Sep 17 00:00:00 2001
+From 138d179db4593a5953c277f290afb49233fbb200 Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
-Date: Thu, 15 Oct 2026 05:36:52 +0900
+Date: Thu, 15 Oct 2026 06:20:43 +0900
 Subject: [PATCH] feat(providers): support native tool calls while streaming
 
 OpenAI-compatible streaming requests now carry `tools`/`tool_choice` when
@@ -11,7 +11,7 @@ executes them exactly like the non-streaming path (history gets the
 assistant tool_calls message plus the tool results) instead of rendering
 the provider markup as plain text.
 
-- providers/root.zig: `StreamChatResult.tool_calls`, a
+- providers/root.zig: `StreamChatResult.tool_calls`, a model-aware
   `supports_streaming_native_tools` vtable capability (default false), and
   `emitChatResponseAsStream` now hands tool calls to the caller so blocking
   fallbacks keep working.
@@ -20,19 +20,24 @@ the provider markup as plain text.
   carry content, tool-call fragments, and usage together.
 - providers/compatible.zig: advertise streaming native tools when
   `native_tools` is on and streaming is not disabled.
+- providers/reliable.zig and providers/router.zig: forward the capability
+  to the provider that actually serves the request, so wrapping a capable
+  provider in a failover chain or a router no longer hides it.
 - agent/root.zig: keep native tools enabled on streaming turns for such
   providers and forward the accumulated tool calls into the turn loop.
 
 Other providers keep the text tool protocol while streaming.
 ---
- src/agent/root.zig           | 164 +++++++++++-
+ src/agent/root.zig           | 165 +++++++++++-
  src/providers/compatible.zig |  50 ++++
- src/providers/root.zig       |  34 ++-
+ src/providers/reliable.zig   | 121 +++++++++
+ src/providers/root.zig       |  35 ++-
+ src/providers/router.zig     |  41 +++
  src/providers/sse.zig        | 470 ++++++++++++++++++++++++++++-------
- 4 files changed, 626 insertions(+), 92 deletions(-)
+ 6 files changed, 790 insertions(+), 92 deletions(-)
 
 diff --git a/src/agent/root.zig b/src/agent/root.zig
-index f4dc6b40..cb2ba7c9 100644
+index f4dc6b40..f481c2c1 100644
 --- a/src/agent/root.zig
 +++ b/src/agent/root.zig
 @@ -2011,7 +2011,10 @@ pub const Agent = struct {
@@ -41,7 +46,7 @@ index f4dc6b40..cb2ba7c9 100644
              const prompt_is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
 -            const prompt_native_tools_enabled = !prompt_is_streaming and self.provider.supportsNativeTools();
 +            const prompt_native_tools_enabled = if (prompt_is_streaming)
-+                self.provider.supportsStreamingNativeTools()
++                self.provider.supportsStreamingNativeTools(turn_model_name)
 +            else
 +                self.provider.supportsNativeTools();
  
@@ -56,7 +61,7 @@ index f4dc6b40..cb2ba7c9 100644
 +            // emit tool-call deltas (OpenAI-compatible chat completions); every
 +            // other provider keeps the text tool protocol while streaming.
 +            const native_tools_enabled = if (is_streaming)
-+                self.provider.supportsStreamingNativeTools()
++                self.provider.supportsStreamingNativeTools(turn_model_name)
 +            else
 +                self.provider.supportsNativeTools();
              const include_reasoning = self.reasoning_mode != .off;
@@ -98,7 +103,15 @@ index f4dc6b40..cb2ba7c9 100644
                      .usage = stream_result.usage,
                      .model = stream_result.model,
                  };
-@@ -11009,6 +11018,149 @@ test "Agent system prompt keeps parameters when streaming disables native tool s
+@@ -5344,6 +5353,7 @@ test "Agent.fromConfig applies default_queue_mode" {
+     try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
+ }
+ 
++
+ test "slash /new clears history" {
+     const allocator = std.testing.allocator;
+     var agent = try makeTestAgent(allocator);
+@@ -11009,6 +11019,149 @@ test "Agent system prompt keeps parameters when streaming disables native tool s
      try std.testing.expect(std.mem.indexOf(u8, captured, "mcp_secret_lookup") == null);
  }
  
@@ -144,7 +157,7 @@ index f4dc6b40..cb2ba7c9 100644
 +            return true;
 +        }
 +
-+        fn supportsStreamingNativeTools(_: *anyopaque) bool {
++        fn supportsStreamingNativeTools(_: *anyopaque, _: []const u8) bool {
 +            return true;
 +        }
 +
@@ -249,7 +262,7 @@ index f4dc6b40..cb2ba7c9 100644
      // Regression: priority hints must not be persisted as user text in history/memory/cache.
      const allocator = std.testing.allocator;
 diff --git a/src/providers/compatible.zig b/src/providers/compatible.zig
-index dd7a134b..9cabd440 100644
+index dd7a134b..d06e270a 100644
 --- a/src/providers/compatible.zig
 +++ b/src/providers/compatible.zig
 @@ -1144,6 +1144,7 @@ pub const OpenAiCompatibleProvider = struct {
@@ -266,7 +279,7 @@ index dd7a134b..9cabd440 100644
  
 +    /// OpenAI-compatible chat-completions streams carry `delta.tool_calls`
 +    /// fragments, so native tools can stay enabled while streaming.
-+    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque) bool {
++    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque, _: []const u8) bool {
 +        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
 +        return self.native_tools and supportsStreamingImpl(ptr);
 +    }
@@ -309,22 +322,168 @@ index dd7a134b..9cabd440 100644
 +
 +test "supportsStreamingNativeTools follows native_tools and streaming support" {
 +    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
-+    try std.testing.expect(p.provider().supportsStreamingNativeTools());
++    try std.testing.expect(p.provider().supportsStreamingNativeTools("test-model"));
 +
 +    var no_native = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
 +    no_native.native_tools = false;
-+    try std.testing.expect(!no_native.provider().supportsStreamingNativeTools());
++    try std.testing.expect(!no_native.provider().supportsStreamingNativeTools("test-model"));
 +
 +    var no_stream = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
 +    no_stream.disable_streaming = true;
-+    try std.testing.expect(!no_stream.provider().supportsStreamingNativeTools());
++    try std.testing.expect(!no_stream.provider().supportsStreamingNativeTools("test-model"));
 +}
 +
  test "buildStreamingChatRequestBody sends thinking disabled when reasoning_effort unset" {
      const allocator = std.testing.allocator;
      const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+diff --git a/src/providers/reliable.zig b/src/providers/reliable.zig
+index be2bb56e..08808e85 100644
+--- a/src/providers/reliable.zig
++++ b/src/providers/reliable.zig
+@@ -369,6 +369,7 @@ pub const ReliableProvider = struct {
+         .supports_vision = supportsVisionImpl,
+         .supports_vision_for_model = supportsVisionForModelImpl,
+         .supports_streaming = supportsStreamingImpl,
++        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
+         .stream_chat = streamChatImpl,
+         .getName = getNameImpl,
+         .deinit = deinitImpl,
+@@ -653,6 +654,20 @@ pub const ReliableProvider = struct {
+         return false;
+     }
+ 
++    /// Mirrors `supportsVisionForModelImpl`: an explicit `provider/model` ref is
++    /// answered by the provider that will actually serve it, so a wrapper that
++    /// is not itself capable still reports true when its target is.
++    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque, model: []const u8) bool {
++        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
++        const target = self.resolveProviderTarget(model);
++        if (target.explicit) return target.provider.supportsStreamingNativeTools(target.model);
++        if (self.inner.supportsStreamingNativeTools(model)) return true;
++        for (self.extras) |entry| {
++            if (entry.provider.supportsStreamingNativeTools(model)) return true;
++        }
++        return false;
++    }
++
+     fn supportsVisionImpl(ptr: *anyopaque) bool {
+         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+         if (self.inner.supportsVision()) return true;
+@@ -1347,6 +1362,112 @@ test "warmup calls inner and extras" {
+     try std.testing.expect(extra_mock.warmed_up);
+ }
+ 
++/// Mock provider with a name, a fail switch, and the streaming
++/// native-tools capability, used by the routing/capability tests below.
++const StreamingToolsMock = struct {
++    name: []const u8,
++    streaming_native_tools: bool,
++    fail: bool = false,
++    calls: u32 = 0,
++    last_model_buf: [64]u8 = undefined,
++    last_model_len: usize = 0,
++
++    const vtable = Provider.VTable{
++        .chatWithSystem = chatWithSystem,
++        .chat = chat,
++        .supportsNativeTools = supportsNativeTools,
++        .supports_streaming = supportsStreaming,
++        .supports_streaming_native_tools = supportsStreamingNativeTools,
++        .getName = getName,
++        .deinit = deinit,
++    };
++
++    fn toProvider(self: *StreamingToolsMock) Provider {
++        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
++    }
++
++    fn lastModel(self: *const StreamingToolsMock) []const u8 {
++        return self.last_model_buf[0..self.last_model_len];
++    }
++
++    fn chatWithSystem(
++        _: *anyopaque,
++        _: std.mem.Allocator,
++        _: ?[]const u8,
++        _: []const u8,
++        _: []const u8,
++        _: f64,
++    ) anyerror![]const u8 {
++        return error.ShouldNotUseChatWithSystem;
++    }
++
++    fn chat(
++        ptr: *anyopaque,
++        allocator: std.mem.Allocator,
++        _: ChatRequest,
++        model: []const u8,
++        _: f64,
++    ) anyerror!ChatResponse {
++        const self: *StreamingToolsMock = @ptrCast(@alignCast(ptr));
++        self.calls += 1;
++        const copy_len = @min(model.len, self.last_model_buf.len);
++        @memcpy(self.last_model_buf[0..copy_len], model[0..copy_len]);
++        self.last_model_len = copy_len;
++        if (self.fail) return error.ProviderError;
++        return ChatResponse{ .content = try allocator.dupe(u8, "routed") };
++    }
++
++    fn supportsNativeTools(_: *anyopaque) bool {
++        return false;
++    }
++
++    fn supportsStreaming(_: *anyopaque) bool {
++        return true;
++    }
++
++    fn supportsStreamingNativeTools(ptr: *anyopaque, _: []const u8) bool {
++        const self: *StreamingToolsMock = @ptrCast(@alignCast(ptr));
++        return self.streaming_native_tools;
++    }
++
++    fn getName(ptr: *anyopaque) []const u8 {
++        const self: *StreamingToolsMock = @ptrCast(@alignCast(ptr));
++        return self.name;
++    }
++
++    fn deinit(_: *anyopaque) void {}
++};
++
++test "ReliableProvider delegates supportsStreamingNativeTools to a capable inner" {
++    var capable = StreamingToolsMock{ .name = "capable", .streaming_native_tools = true };
++    var reliable = ReliableProvider.initWithProvider(capable.toProvider(), 0, 50);
++    try std.testing.expect(reliable.provider().supportsStreamingNativeTools("gpt-4o"));
++
++    var plain = StreamingToolsMock{ .name = "plain", .streaming_native_tools = false };
++    var reliable_plain = ReliableProvider.initWithProvider(plain.toProvider(), 0, 50);
++    try std.testing.expect(!reliable_plain.provider().supportsStreamingNativeTools("gpt-4o"));
++}
++
++test "ReliableProvider resolves supportsStreamingNativeTools through an explicit prefix" {
++    // Regression: a wrapper must report the capability of the provider that
++    // actually serves the request, not of the primary one.
++    var primary = StreamingToolsMock{ .name = "primary", .streaming_native_tools = true };
++    var newapi = StreamingToolsMock{ .name = "newapi", .streaming_native_tools = false };
++
++    const extras = [_]ProviderEntry{
++        .{ .name = "newapi", .provider = newapi.toProvider() },
++    };
++    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withExtras(&extras);
++    const prov = reliable.provider();
++
++    // The prefix wins over the (capable) primary provider.
++    try std.testing.expect(!prov.supportsStreamingNativeTools("newapi/dpsk"));
++    // A bare model still resolves to the primary provider.
++    try std.testing.expect(prov.supportsStreamingNativeTools("dpsk"));
++}
++
++
++
+ test "multi-provider fallback: primary fails, extra succeeds" {
+     var primary = MockInnerProvider{ .call_count = 0, .fail_until = 100, .supports_tools = false };
+     var fallback = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
 diff --git a/src/providers/root.zig b/src/providers/root.zig
-index 6386ac9a..fc04ae18 100644
+index 6386ac9a..2e9d0924 100644
 --- a/src/providers/root.zig
 +++ b/src/providers/root.zig
 @@ -274,6 +274,10 @@ pub const StreamChatResult = struct {
@@ -362,28 +521,29 @@ index 6386ac9a..fc04ae18 100644
          chat_with_tools: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, req: ChatRequest) anyerror!ChatResponse = null,
          /// Optional: returns true if provider supports streaming. Default: false.
          supports_streaming: ?*const fn (ptr: *anyopaque) bool = null,
-+        /// Optional: returns true if provider can emit native tool calls while
-+        /// streaming. Default: false (the agent then falls back to the text
-+        /// tool protocol for streaming turns).
-+        supports_streaming_native_tools: ?*const fn (ptr: *anyopaque) bool = null,
++        /// Optional: returns true if the provider that will serve `model` can
++        /// emit native tool calls while streaming. Default: false (the agent
++        /// then falls back to the text tool protocol for streaming turns).
++        supports_streaming_native_tools: ?*const fn (ptr: *anyopaque, model: []const u8) bool = null,
          /// Optional: returns true if provider supports vision/image input. Default: false.
          supports_vision: ?*const fn (ptr: *anyopaque) bool = null,
          /// Optional: returns true if provider supports vision for a specific model.
-@@ -470,6 +484,13 @@ pub const Provider = struct {
+@@ -470,6 +484,14 @@ pub const Provider = struct {
          return false;
      }
  
-+    /// Returns true if provider supports native tool calls while streaming.
-+    /// Defaults to false so providers keep the text tool protocol on streams.
-+    pub fn supportsStreamingNativeTools(self: Provider) bool {
-+        if (self.vtable.supports_streaming_native_tools) |f| return f(self.ptr);
++    /// Returns true if the provider serving `model` supports native tool calls
++    /// while streaming. Defaults to false so providers keep the text tool
++    /// protocol on streams.
++    pub fn supportsStreamingNativeTools(self: Provider, model: []const u8) bool {
++        if (self.vtable.supports_streaming_native_tools) |f| return f(self.ptr, model);
 +        return false;
 +    }
 +
      /// Returns true if provider supports vision/image input.
      pub fn supportsVision(self: Provider) bool {
          if (self.vtable.supports_vision) |f| return f(self.ptr);
-@@ -855,7 +876,7 @@ test "ChatResponse deinit resets owned fields" {
+@@ -855,7 +877,7 @@ test "ChatResponse deinit resets owned fields" {
      try std.testing.expectEqualStrings("", response.model);
  }
  
@@ -392,7 +552,7 @@ index 6386ac9a..fc04ae18 100644
      const allocator = std.testing.allocator;
  
      var tool_calls = try allocator.alloc(ToolCall, 1);
-@@ -893,6 +914,15 @@ test "emitChatResponseAsStream frees unused chat response fields" {
+@@ -893,6 +915,15 @@ test "emitChatResponseAsStream frees unused chat response fields" {
      defer if (result.content) |content| allocator.free(content);
      defer if (result.reasoning_content) |reasoning| allocator.free(reasoning);
      defer if (result.model.len > 0) allocator.free(result.model);
@@ -408,7 +568,7 @@ index 6386ac9a..fc04ae18 100644
  
      try std.testing.expectEqual(@as(usize, 1), ctx.text_count);
      try std.testing.expect(ctx.saw_final);
-@@ -902,6 +932,8 @@ test "emitChatResponseAsStream frees unused chat response fields" {
+@@ -902,6 +933,8 @@ test "emitChatResponseAsStream frees unused chat response fields" {
      try std.testing.expectEqualStrings("hello", result.content.?);
      try std.testing.expectEqualStrings("private reasoning", result.reasoning_content.?);
      try std.testing.expectEqualStrings("test-model", result.model);
@@ -417,6 +577,93 @@ index 6386ac9a..fc04ae18 100644
  }
  
  test "Provider.streamChat fallback emits single chunk and final" {
+diff --git a/src/providers/router.zig b/src/providers/router.zig
+index 4f4da376..f24f03f7 100644
+--- a/src/providers/router.zig
++++ b/src/providers/router.zig
+@@ -158,6 +158,7 @@ pub const RouterProvider = struct {
+         .supports_vision = supportsVisionImpl,
+         .supports_vision_for_model = supportsVisionForModelImpl,
+         .supports_streaming = supportsStreamingImpl,
++        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
+         .stream_chat = streamChatImpl,
+         .getName = getNameImpl,
+         .deinit = deinitImpl,
+@@ -246,6 +247,17 @@ pub const RouterProvider = struct {
+         return self.providers[provider_idx].supportsStreaming();
+     }
+ 
++    /// Resolve `model` the same way `streamChatImpl` does, so the answer
++    /// describes the provider that will actually serve the stream.
++    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque, model: []const u8) bool {
++        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
++        const resolved = self.resolve(model);
++        const provider_idx = resolved[0];
++        const resolved_model = resolved[1];
++        if (provider_idx >= self.providers.len) return false;
++        return self.providers[provider_idx].supportsStreamingNativeTools(resolved_model);
++    }
++
+     fn streamChatImpl(
+         ptr: *anyopaque,
+         allocator: std.mem.Allocator,
+@@ -291,6 +303,7 @@ const MockProvider = struct {
+     native_tools: bool,
+     supports_vision: bool = true,
+     supports_streaming: bool = false,
++    streaming_native_tools: bool = false,
+     warmup_count: u32 = 0,
+     last_tool_model: []const u8 = "",
+     last_stream_model: []const u8 = "",
+@@ -327,6 +340,7 @@ const MockProvider = struct {
+         .supportsNativeTools = mockSupportsNativeTools,
+         .warmup = mockWarmup,
+         .supports_streaming = mockSupportsStreaming,
++        .supports_streaming_native_tools = mockSupportsStreamingNativeTools,
+         .stream_chat = mockStreamChat,
+         .supports_vision = mockSupportsVision,
+         .getName = mockGetName,
+@@ -383,6 +397,11 @@ const MockProvider = struct {
+         return self.supports_streaming;
+     }
+ 
++    fn mockSupportsStreamingNativeTools(ptr: *anyopaque, _: []const u8) bool {
++        const self: *MockProvider = @ptrCast(@alignCast(ptr));
++        return self.streaming_native_tools;
++    }
++
+     fn mockStreamChat(
+         ptr: *anyopaque,
+         allocator: std.mem.Allocator,
+@@ -796,6 +815,28 @@ test "vtable supportsNativeTools false when no providers" {
+     try std.testing.expect(!prov.supportsNativeTools());
+ }
+ 
++test "vtable supportsStreamingNativeTools follows the resolved provider" {
++    const provider_names = [_][]const u8{ "default", "newapi" };
++    var mock_default = MockProvider.init("ok", false);
++    var mock_newapi = MockProvider.init("ok", true);
++    mock_newapi.streaming_native_tools = true;
++    const providers = [_]Provider{ mock_default.provider(), mock_newapi.provider() };
++    var router = try RouterProvider.init(
++        std.testing.allocator,
++        &provider_names,
++        &providers,
++        &.{},
++        "default-model",
++    );
++    const prov = router.provider();
++    defer prov.deinit();
++
++    // An explicit provider ref resolves to the capable provider.
++    try std.testing.expect(prov.supportsStreamingNativeTools("newapi/dpsk"));
++    // A bare model resolves to the default provider, which is not capable.
++    try std.testing.expect(!prov.supportsStreamingNativeTools("default-model"));
++}
++
+ test "vtable supportsNativeTools follows default model route" {
+     const provider_names = [_][]const u8{ "default", "tools" };
+     var mock_default = MockProvider.init("ok", false);
 diff --git a/src/providers/sse.zig b/src/providers/sse.zig
 index 87e4cd1c..451ebdc0 100644
 --- a/src/providers/sse.zig
