@@ -1,4 +1,4 @@
-From 7406cd26cf431612cb9bd53ba818aafe70e87869 Mon Sep 17 00:00:00 2001
+From ea4e568fd3bcb360fef11d219560479537ef7e28 Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 14:16:04 +0900
 Subject: [PATCH] feat(security): per-agent autonomy for named agents
@@ -125,9 +125,19 @@ Backslash escapes outside single quotes are refused in the confined shell
 check: the shell unescapes them after the check runs on the raw text, so
 `cat \/etc/passwd` reaches /etc/passwd. The delegate tool is also withheld,
 since it runs any configured agent's provider with the operator's key.
+
+The confined shell check also refuses every byte the shell would reinterpret
+after the check: a confined command may contain only letters, digits, plain
+spaces, the separators `;`, `|`, `&&`, `||` and the punctuation `-_./,:=+@%^`.
+Quotes, redirections, escapes, expansions and globs are rejected, so
+`cat ''/etc/passwd`, `cat '..'/x` and `cat </etc/passwd` no longer pass, and
+the find write predicates (-execdir, -okdir, -delete, -fprint*, -fls) are
+refused. `nullclaw agent --agent <name>` now applies the profile's autonomy
+(policy, confinement and withheld tools) instead of the global block.
 ---
  docs/en/configuration.md |  58 +++++++
  docs/zh/configuration.md |  58 +++++++
+ src/agent/cli.zig        |  10 ++
  src/agent/commands.zig   |  48 +++++-
  src/agent/root.zig       | 188 +++++++++++++++++++-
  src/channel_loop.zig     |  87 ++++++++++
@@ -135,13 +145,13 @@ since it runs any configured agent's provider with the operator's key.
  src/config_parse.zig     | 117 +++++++++----
  src/config_types.zig     |  15 ++
  src/outbound.zig         | 158 +++++++++++++++++
- src/security/policy.zig  | 289 +++++++++++++++++++++++++++++++
+ src/security/policy.zig  | 348 ++++++++++++++++++++++++++++++++++++-
  src/session.zig          | 361 ++++++++++++++++++++++++++++++++++++++-
  src/tools/root.zig       | 138 ++++++++++++---
- 12 files changed, 1579 insertions(+), 73 deletions(-)
+ 13 files changed, 1647 insertions(+), 74 deletions(-)
 
 diff --git a/docs/en/configuration.md b/docs/en/configuration.md
-index a44adf5..8b1cc23 100644
+index a44adf5..68f0291 100644
 --- a/docs/en/configuration.md
 +++ b/docs/en/configuration.md
 @@ -412,6 +412,64 @@ Practical effect:
@@ -173,7 +183,7 @@ index a44adf5..8b1cc23 100644
 +  - Telegram `/bind` is refused when the peer is currently routed to an agent with its own autonomy. Otherwise the guest could `/bind clear` back to the default route or `/bind <other-agent>` to move to an unrestricted agent, escaping the restricted one. (`/bind status` stays read-only.)
 +  - Every other slash command is session-local (model, think, verbose, reasoning, usage, cost, queue, tts, focus/unfocus/dock/activation/send, session ttl, context, memory, skills, debug, stop, compact, doctor), or operates on the agent's own subagents — which are unavailable to it because the `spawn` tool is withheld (`/subagents spawn`, `/steer`, `/tell`, `/agents`, `/kill`, `/poll` all report the subagent manager is disabled). `/bash`, `/approve`, `/exec` and `/elevated` still run through the agent's own shell tool and policy, so the confinement below applies to them.
 +- Outbound attachments are confined: an outbound reply may only attach local files named by an **absolute** path that resolves (symlinks followed) inside the agent's workspace (plus its own `allowed_paths`). Relative targets are refused, because the channel uploader (`curl --form file=@<target>`) resolves them against its own process cwd rather than the workspace, so the uploaded file need not be the one the check resolved. Legacy reply markers (`[IMAGE:…]`, `[DOCUMENT:…]`, `[FILE:…]`, `[PHOTO:…]`, `[VIDEO:…]`, `[AUDIO:…]`, `[VOICE:…]`) whose target escapes the workspace or is relative are dropped and logged before the reply is sent, on every channel that uploads such markers (Telegram, Max, Signal, …). Remote `http(s)` URLs name no local file and are unaffected. This is a text-only exfiltration path that does not go through tool calls, so it also applies to `read_only`.
-+- The shell tool is confined to the agent's workspace. The command is word-split on every byte the shell treats as IFS whitespace (space, tab, newline, vertical tab, form feed), and every resulting argument that names a path (absolute, `..` traversal or `~`) is rejected; a control byte anywhere in the command is rejected outright, because the shell splits on it into arguments the check would otherwise not see (`cat x\t/etc/passwd` runs `cat x /etc/passwd`). `$` parameter expansion (`$IFS`, `$HOME`, `$1`, `$@`, …), backslash escapes outside single quotes, and unquoted glob/brace metacharacters are rejected because the shell expands or unescapes them at execution time into text the argument check never sees (`cat $IFS/etc/passwd` and `cat \/etc/passwd` both become `cat /etc/passwd`). Commands that execute code taken from the workspace are refused outright — the package managers and their run/build verbs (`npm`, `pnpm`, `yarn`, `npx`, `bun`, `deno`, `cargo`) and the git subcommands that run a script (`git bisect`, `git submodule`, `git filter-branch`, `git filter-repo`, plus git `-c` config injection and `!`-aliases) — because such code runs with the agent's privileges and ignores the confinement.
++- The shell tool is confined to the agent's workspace. The command is word-split on every byte the shell treats as IFS whitespace (space, tab, newline, vertical tab, form feed), and every resulting argument that names a path (absolute, `..` traversal or `~`) is rejected; a control byte anywhere in the command is rejected outright, because the shell splits on it into arguments the check would otherwise not see (`cat x\t/etc/passwd` runs `cat x /etc/passwd`). `$` parameter expansion (`$IFS`, `$HOME`, `$1`, `$@`, …), backslash escapes outside single quotes, and unquoted glob/brace metacharacters are rejected because the shell expands or unescapes them at execution time into text the argument check never sees (`cat $IFS/etc/passwd` and `cat \/etc/passwd` both become `cat /etc/passwd`). Commands that execute code taken from the workspace are refused outright — the package managers and their run/build verbs (`npm`, `pnpm`, `yarn`, `npx`, `bun`, `deno`, `cargo`) and the git subcommands that run a script (`git bisect`, `git submodule`, `git filter-branch`, `git filter-repo`, plus git `-c` config injection and `!`-aliases) — because such code runs with the agent's privileges and ignores the confinement. Beyond that, a confined command may contain only letters, digits, plain spaces, the separators `;`, `|`, `&&`, `||` and the punctuation `-_./,:=+@%^`: every quote, redirection (`<`, `>`), escape, expansion or glob byte is refused, so `cat ''/etc/passwd`, `cat '..'/x` and `cat </etc/passwd` are rejected rather than reinterpreted by the shell. `find` write/exec predicates (`-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`, `-fprint*`, `-fls`) are refused too. The same per-agent autonomy applies to `nullclaw agent --agent <name>`.
 +- **This shell confinement is a best-effort argument check, not a filesystem jail.** It is defence-in-depth for the common case of no external sandbox (bubblewrap/firejail/docker/landlock), and a command that reaches a host file through a mechanism the check does not model can still slip through. For an untrusted guest, prefer `"level": "read_only"`, which disables **all** tool calls outright, and run the process under an external sandbox.
 +- Agents without an `autonomy` block keep using the shared global policy.
 +
@@ -210,7 +220,7 @@ index a44adf5..8b1cc23 100644
  
  - `debounce_ms` delays handling rapid-fire plain-text inbound messages so several short fragments can collapse into one turn.
 diff --git a/docs/zh/configuration.md b/docs/zh/configuration.md
-index 132cea4..33bc34a 100644
+index 132cea4..dd55310 100644
 --- a/docs/zh/configuration.md
 +++ b/docs/zh/configuration.md
 @@ -348,6 +348,64 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API
@@ -242,7 +252,7 @@ index 132cea4..33bc34a 100644
 +  - 当该 Telegram 对端当前被路由到拥有独立 autonomy 的 agent 时，`/bind` 会被拒绝。否则 guest 可以用 `/bind clear` 回退到默认路由，或用 `/bind <其他 agent>` 迁移到无限制的 agent，从而逃离受限 agent。（`/bind status` 仍为只读。）
 +  - 其余 slash 命令要么只影响自身会话（model、think、verbose、reasoning、usage、cost、queue、tts、focus/unfocus/dock/activation/send、session ttl、context、memory、skills、debug、stop、compact、doctor），要么作用于该 agent 自己的 subagent —— 而后者对它不可用，因为 `spawn` 工具已被移除（`/subagents spawn`、`/steer`、`/tell`、`/agents`、`/kill`、`/poll` 都会提示 subagent manager 已禁用）。`/bash`、`/approve`、`/exec`、`/elevated` 仍走该 agent 自己的 shell 工具与策略，因此下面的限制同样适用于它们。
 +- 出站附件被限制：一次出站回复只能附带由**绝对路径**命名、且解析后（跟随符号链接）位于该 agent 工作区（及其自身 `allowed_paths`）之内的本地文件。相对路径会被拒绝，因为 channel 上传器（`curl --form file=@<target>`）会按自身进程 cwd 而非工作区解析它，导致上传的文件未必是检查所解析的那个。回复文本中目标落在工作区之外或为相对路径的旧式标记（`[IMAGE:…]`、`[DOCUMENT:…]`、`[FILE:…]`、`[PHOTO:…]`、`[VIDEO:…]`、`[AUDIO:…]`、`[VOICE:…]`）会在发送前被丢弃并记录日志，对所有会上传此类标记的 channel（Telegram、Max、Signal 等）都生效。远程 `http(s)` URL 不指向本地文件，不受影响。这是一条不经过工具调用的纯文本外泄路径，因此 `read_only` 同样适用。
-+- shell 工具被限制在该 agent 的工作区内。命令会按 shell 视为 IFS 空白的所有字节（空格、tab、换行、垂直制表符、换页符）做词切分，随后任何命名路径的参数（绝对路径、`..` 回溯、`~`）都会被拒绝；命令中出现任何控制字节都会被直接拒绝，因为 shell 会据此切分出参数检查看不到的参数（`cat x\t/etc/passwd` 会执行 `cat x /etc/passwd`）。`$` 参数展开（`$IFS`、`$HOME`、`$1`、`$@` 等）、单引号之外的反斜杠转义，以及未加引号的 glob/花括号元字符也会被拒绝，因为 shell 会在执行时把它们展开或去转义成参数检查看不到的文本（`cat $IFS/etc/passwd` 和 `cat \/etc/passwd` 都会变成 `cat /etc/passwd`）。会直接拒绝执行来自工作区代码的命令 —— 包管理器及其 run/build 子命令（`npm`、`pnpm`、`yarn`、`npx`、`bun`、`deno`、`cargo`），以及会运行脚本的 git 子命令（`git bisect`、`git submodule`、`git filter-branch`、`git filter-repo`，外加 git `-c` 配置注入与 `!` 别名）—— 因为这类代码以 agent 进程的权限运行并绕过该限制。
++- shell 工具被限制在该 agent 的工作区内。命令会按 shell 视为 IFS 空白的所有字节（空格、tab、换行、垂直制表符、换页符）做词切分，随后任何命名路径的参数（绝对路径、`..` 回溯、`~`）都会被拒绝；命令中出现任何控制字节都会被直接拒绝，因为 shell 会据此切分出参数检查看不到的参数（`cat x\t/etc/passwd` 会执行 `cat x /etc/passwd`）。`$` 参数展开（`$IFS`、`$HOME`、`$1`、`$@` 等）、单引号之外的反斜杠转义，以及未加引号的 glob/花括号元字符也会被拒绝，因为 shell 会在执行时把它们展开或去转义成参数检查看不到的文本（`cat $IFS/etc/passwd` 和 `cat \/etc/passwd` 都会变成 `cat /etc/passwd`）。会直接拒绝执行来自工作区代码的命令 —— 包管理器及其 run/build 子命令（`npm`、`pnpm`、`yarn`、`npx`、`bun`、`deno`、`cargo`），以及会运行脚本的 git 子命令（`git bisect`、`git submodule`、`git filter-branch`、`git filter-repo`，外加 git `-c` 配置注入与 `!` 别名）—— 因为这类代码以 agent 进程的权限运行并绕过该限制。 此外，受限命令只能包含字母、数字、普通空格、分隔符 `;`、`|`、`&&`、`||` 以及标点 `-_./,:=+@%^`：任何引号、重定向（`<`、`>`）、转义、展开或通配字节都会被拒绝，因此 `cat ''/etc/passwd`、`cat '..'/x`、`cat </etc/passwd` 会被直接拒绝，而不会被 shell 重新解释。`find` 的写入/执行谓词（`-exec`、`-execdir`、`-ok`、`-okdir`、`-delete`、`-fprint*`、`-fls`）同样被拒绝。`nullclaw agent --agent <name>` 也使用同一套按 agent 的 autonomy。
 +- **该 shell 限制是尽力而为的参数检查，而非文件系统 jail。** 它是在常见的无外部沙箱（bubblewrap/firejail/docker/landlock）场景下的纵深防御；若某命令通过该检查未覆盖的机制访问主机文件，仍可能绕过。对不可信的 guest，优先使用 `"level": "read_only"` —— 它会直接禁用**所有**工具调用，并让进程运行在外部沙箱中。
 +- 没有 `autonomy` 块的 agent 仍然共用全局策略。
 +
@@ -278,6 +288,42 @@ index 132cea4..33bc34a 100644
  ### `messages.inbound`
  
  - `debounce_ms` 用来延迟处理连续快速到达的纯文本入站消息，把短时间内的多条碎片合并成一次 turn。
+diff --git a/src/agent/cli.zig b/src/agent/cli.zig
+index 2b73bfe..e5af13a 100644
+--- a/src/agent/cli.zig
++++ b/src/agent/cli.zig
+@@ -442,7 +442,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+         if (parsed_args.model_override) |model| adjusted_profile.model = model;
+         if (parsed_args.temperature_override) |temp| adjusted_profile.temperature = temp;
+         selected_profile_storage = adjusted_profile;
++        // A profile with its own autonomy replaces the global block, as the
++        // gateway runtime does (SessionManager.makeAgentConfig), so
++        // `agent --agent guest` cannot run with the global yolo policy.
++        if (found_profile.autonomy) |autonomy| {
++            cfg.autonomy = autonomy;
++            cfg.syncFlatFields();
++        }
+     }
++    const has_own_autonomy = if (selected_profile_storage) |profile| profile.autonomy != null else false;
+ 
+     var selected_workspace_dir: ?[]const u8 = null;
+     defer if (selected_workspace_dir) |workspace_dir| allocator.free(workspace_dir);
+@@ -522,6 +530,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+         .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+         .block_medium_risk_commands = cfg.autonomy.block_medium_risk_commands,
+         .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
++        .confine_paths = has_own_autonomy,
+         .tracker = &tracker,
+     };
+ 
+@@ -586,6 +595,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
+         .tools_config = cfg.tools,
+         .allowed_paths = cfg.autonomy.allowed_paths,
+         .policy = &policy,
++        .withhold_escape_hatches = has_own_autonomy,
+         .subagent_manager = &subagent_manager,
+         .bootstrap_provider = bootstrap_provider,
+         .backend_name = cfg.memory.backend,
 diff --git a/src/agent/commands.zig b/src/agent/commands.zig
 index 2c054e9..3111606 100644
 --- a/src/agent/commands.zig
@@ -1246,7 +1292,7 @@ index 85e1608..ab21744 100644
      const buttons = [_]ActionButton{
          .{ .id = "approve", .label = "Approve" },
 diff --git a/src/security/policy.zig b/src/security/policy.zig
-index e4bba0a..976dee8 100644
+index e4bba0a..c535a6a 100644
 --- a/src/security/policy.zig
 +++ b/src/security/policy.zig
 @@ -102,6 +102,16 @@ pub const SecurityPolicy = struct {
@@ -1266,7 +1312,7 @@ index e4bba0a..976dee8 100644
      tracker: ?*RateTracker = null,
  
      /// Classify command risk level.
-@@ -682,12 +692,152 @@ fn isSafeGitChangeDirArg(self: *const SecurityPolicy, raw_arg: []const u8) bool
+@@ -682,19 +692,189 @@ fn isSafeGitChangeDirArg(self: *const SecurityPolicy, raw_arg: []const u8) bool
      return true;
  }
  
@@ -1277,6 +1323,25 @@ index e4bba0a..976dee8 100644
 +/// a confined policy — a command-specific allowlist is brittle, as
 +/// `git diff --no-index <path>` reads any file without naming a file-reading
 +/// command.
++/// A confined command may only contain bytes the shell takes literally, plus
++/// plain spaces between words and the separators the segment splitter already
++/// understands (`;`, `|`, `&&`, `||`). Every quote, redirection, escape,
++/// expansion or glob byte is refused, so the words the path check inspects are
++/// exactly the words `/bin/sh -c` passes to the command. Without this the
++/// check reads raw text the shell later rewrites: `cat ''/etc/passwd`
++/// concatenates to an absolute path, `cat '..'/x` hides a traversal, and
++/// `cat </etc/passwd` reads through an input redirection.
++fn confinedCommandCharsSafe(cmd: []const u8) bool {
++    for (cmd) |c| {
++        const ok = std.ascii.isAlphanumeric(c) or switch (c) {
++            ' ', '-', '_', '.', '/', ',', ':', '=', '+', '@', '%', '^', ';', '|', '&' => true,
++            else => false,
++        } or c >= 0x80;
++        if (!ok) return false;
++    }
++    return true;
++}
++
 +fn argsConfinedToWorkspace(full_cmd: []const u8) bool {
 +    // Split on every byte the shell treats as IFS whitespace (space, tab,
 +    // newline, vertical tab, form feed), not just space: the command is run by
@@ -1409,6 +1474,7 @@ index e4bba0a..976dee8 100644
 +    // bytes the argument check never sees, and reject any argument that names an
 +    // absolute path, a `..` traversal or `~`.
 +    if (self.confine_paths) {
++        if (!confinedCommandCharsSafe(full_cmd)) return false;
 +        if (commandExecutesArbitraryCode(base)) return false;
 +        if (std.mem.eql(u8, base, "git") and gitArgsExecuteArbitraryCode(full_cmd)) return false;
 +        if (commandHasShellExpansion(full_cmd)) return false;
@@ -1417,9 +1483,27 @@ index e4bba0a..976dee8 100644
 +    }
 +
      if (std.mem.eql(u8, base, "find")) {
-         // find -exec and find -ok allow arbitrary command execution
+-        // find -exec and find -ok allow arbitrary command execution
++        // find -exec/-execdir/-ok/-okdir run commands; -delete removes files;
++        // -fprint/-fprint0/-fprintf/-fls write to a file named by the next
++        // argument.
          var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
-@@ -1548,6 +1698,145 @@ test "git -C absolute paths are allowed when workspace_only is disabled" {
+         while (iter.next()) |arg| {
+             if (std.mem.eql(u8, arg, "-exec") or std.mem.eql(u8, arg, "-ok")) {
+                 return false;
+             }
++            if (self.confine_paths and (std.mem.eql(u8, arg, "-execdir") or
++                std.mem.eql(u8, arg, "-okdir") or
++                std.mem.eql(u8, arg, "-delete") or
++                std.mem.startsWith(u8, arg, "-fprint") or
++                std.mem.eql(u8, arg, "-fls")))
++            {
++                return false;
++            }
+         }
+         return true;
+     }
+@@ -1548,6 +1728,172 @@ test "git -C absolute paths are allowed when workspace_only is disabled" {
      try std.testing.expect(p.isCommandAllowed("git -C /tmp/repo log"));
  }
  
@@ -1455,7 +1539,7 @@ index e4bba0a..976dee8 100644
 +    try std.testing.expect(confined.isCommandAllowed("cat file.txt"));
 +    try std.testing.expect(confined.isCommandAllowed("ls -la"));
 +    try std.testing.expect(confined.isCommandAllowed("grep foo notes/todo.md"));
-+    try std.testing.expect(confined.isCommandAllowed("find . -name '*.txt'"));
++    try std.testing.expect(!confined.isCommandAllowed("find . -name '*.txt'"));
 +    try std.testing.expect(confined.isCommandAllowed("git status"));
 +    try std.testing.expect(confined.isCommandAllowed("git log --oneline"));
 +
@@ -1465,6 +1549,33 @@ index e4bba0a..976dee8 100644
 +    try std.testing.expect(global.isCommandAllowed("cat /etc/passwd"));
 +    try std.testing.expect(global.isCommandAllowed("ls /root"));
 +    try std.testing.expect(global.isCommandAllowed("cargo build --release"));
++}
++
++test "confine_paths refuses quotes, redirections and find write predicates" {
++    const confined = SecurityPolicy{ .confine_paths = true };
++    // Quote-in-word concatenation: the shell joins '' and /etc/passwd.
++    try std.testing.expect(!confined.isCommandAllowed("cat ''/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat \"\"/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat '..'/config.json"));
++    // Input redirection glued to the path.
++    try std.testing.expect(!confined.isCommandAllowed("cat </etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat 0</etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("head <../config.json"));
++    // find predicates that run commands, delete, or write to a named file.
++    try std.testing.expect(!confined.isCommandAllowed("find . -fprint leak.txt"));
++    try std.testing.expect(!confined.isCommandAllowed("find . -fprintf leak.txt %f"));
++    try std.testing.expect(!confined.isCommandAllowed("find . -fls leak.txt"));
++    try std.testing.expect(!confined.isCommandAllowed("find . -delete"));
++    try std.testing.expect(!confined.isCommandAllowed("find . -execdir id"));
++    // Plain workspace commands still work.
++    try std.testing.expect(confined.isCommandAllowed("ls -la"));
++    try std.testing.expect(confined.isCommandAllowed("cat notes/a.txt"));
++    try std.testing.expect(confined.isCommandAllowed("grep -n todo src/main.zig"));
++    try std.testing.expect(confined.isCommandAllowed("find . -name a.txt"));
++    try std.testing.expect(confined.isCommandAllowed("ls docs && wc -l notes.txt"));
++    // The global policy keeps its behaviour.
++    const global = SecurityPolicy{};
++    try std.testing.expect(global.isCommandAllowed("find . -delete"));
 +}
 +
 +test "confine_paths blocks shell $ parameter expansion" {
@@ -1489,11 +1600,11 @@ index e4bba0a..976dee8 100644
 +    try std.testing.expect(!confined.isCommandAllowed("head -n1 x \\/etc/passwd"));
 +    try std.testing.expect(!confined.isCommandAllowed("cat \"\\/etc/passwd\""));
 +    try std.testing.expect(!confined.isCommandAllowed("cat \\.\\./config.json"));
-+    // Inside single quotes a backslash is literal, so the argument the check
-+    // sees is the argument the command gets.
-+    try std.testing.expect(confined.isCommandAllowed("grep -n 'a\\b' notes.txt"));
-+    // A `$` inside single quotes is literal, so it stays allowed.
-+    try std.testing.expect(confined.isCommandAllowed("grep -n 'a$' notes.txt"));
++    // Quotes are refused outright for a confined command (see
++    // confinedCommandCharsSafe), even where they would be harmless.
++    try std.testing.expect(!confined.isCommandAllowed("grep -n 'a\\b' notes.txt"));
++    // Any quote is refused, even single quotes around a literal `$`.
++    try std.testing.expect(!confined.isCommandAllowed("grep -n 'a$' notes.txt"));
 +    try std.testing.expect(confined.isCommandAllowed("grep foo file.txt"));
 +    // The global policy keeps its behaviour.
 +    const global = SecurityPolicy{};
@@ -1511,9 +1622,9 @@ index e4bba0a..976dee8 100644
 +    try std.testing.expect(!confined.isCommandAllowed("ls *.txt"));
 +    try std.testing.expect(!confined.isCommandAllowed("ls ?.txt"));
 +    try std.testing.expect(!confined.isCommandAllowed("ls [a-z]*.txt"));
-+    // Quoting a glob makes it literal, so it stays allowed.
-+    try std.testing.expect(confined.isCommandAllowed("find . -name '*.txt'"));
-+    try std.testing.expect(confined.isCommandAllowed("grep foo 'a*b' notes.txt"));
++    // Quoting a glob would make it literal, but quotes are refused outright.
++    try std.testing.expect(!confined.isCommandAllowed("find . -name '*.txt'"));
++    try std.testing.expect(!confined.isCommandAllowed("grep foo 'a*b' notes.txt"));
 +    // The global policy keeps its behaviour.
 +    const global = SecurityPolicy{};
 +    try std.testing.expect(global.isCommandAllowed("cat {.,..}/etc/passwd"));
