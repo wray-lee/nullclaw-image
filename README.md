@@ -14,6 +14,7 @@ Applied in filename order; they are a stack (each is diffed against the previous
 | `0003-slack-streaming-outbound.patch` | Two commits. (1) Slack outbound streaming: `chat.startStream`/`appendStream`/`stopStream` in threads, `chat.postMessage` + throttled `chat.update` elsewhere and wherever Slack rejects the native methods, at most one API call per second, and a permanent error disables the native path for the account. (2) Channel-agnostic live reasoning for Telegram and Slack drafts (Telegram is served by `channel_loop`, so the daemon-only passthrough never reached it), plus the first-turn-of-a-thread session-key miss that stripped reasoning. |
 | `0004-slack-status-reactions.patch` | Slack task lifecycle reactions (`reactions.add`/`reactions.remove`) driven from the bus path, since `status_reactions` previously existed only on Telegram's polling loop. |
 | `0005-route-configured-providers-by-prefix.patch` | A `provider/model` reference routes to any provider configured under `models.providers`, not just `reliability.fallback_providers`. Routing and failover stay separate: a bare model keeps its existing failover chain. |
+| `0006-telegram-draft-html.patch` | Telegram live drafts are rendered with HTML parse mode like the final message, so reasoning quotes and formatting show while streaming; falls back to plain text if Telegram rejects the entities. |
 
 ## Builds
 
