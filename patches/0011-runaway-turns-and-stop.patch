@@ -1,0 +1,2160 @@
+From c55671b1af9d6d4275b337b83709cb17fcfe2655 Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Thu, 15 Oct 2026 22:28:47 +0900
+Subject: [PATCH 12/12] fix(agent): stop runaway turns, honor /stop, and bound
+ tool batches
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+K2 intermittently returns tool calls as text in `content` instead of native
+tool_calls. On a cut or max_tokens-truncated stream the XML fallback parsed
+that partial text into 73/366 tool calls and executed them, and the user
+could not stop the turn: "/stop" was dropped by the queue_mode=off busy gate
+and the provider stream was uninterruptible.
+
+- Route stop-like commands centrally in SessionManager.routeInbound: when a
+  turn is running, requestTurnInterrupt instead of dropping, so /stop works
+  on every channel path (daemon/Slack, channel_loop, callbacks, sync Telegram).
+- Handle stop-like commands at enqueue time in the daemon inbound dispatcher:
+  each session maps to one sharded FIFO worker, so a Slack /stop for a busy
+  session used to sit behind the very turn it had to interrupt and routeInbound
+  was never reached. Signal the interrupt before sharding and drop the message;
+  FIFO is preserved for everything else (mirrors the Telegram worker fast-path).
+- Make gateway logging non-blocking: a custom std_options.logFn formats into a
+  bounded ring drained by one thread, so a wedged stderr write (full docker
+  json-file log pipe) can no longer park a turn on the process-global stderr
+  lock. Producers never block; they drop and count. Verified: a blocked pipe
+  write leaves 1 thread in anon_pipe_write and the rest in futex_do_wait.
+- Return a distinct error.Interrupted from curlStream when the cancel watcher
+  fired (even before any bytes arrived) or when a /stop killed curl mid-upload
+  (the stdin write then fails), and propagate it through the compatible
+  streaming fallback and the retry loops without retrying — including the
+  post-vision-error retry stream, which must not surface a raw error or degrade
+  the route for a user-initiated stop. The agent ends the turn with the normal
+  interrupt reply.
+- Stop the cancel watcher before killing/reaping curl (PID-reuse window),
+  following the established http_util.abortCurlChild ordering.
+- Propagate a `truncated` flag from the providers to the agent and refuse to
+  execute tool calls parsed from a truncated response. Set it on cut recovery
+  paths, on `finish_reason=="length"`, and on the non-streaming parsers that
+  were previously unflagged: Anthropic `stop_reason=="max_tokens"`, Gemini/
+  Vertex `finishReason=="MAX_TOKENS"`, and the Responses API `status=="incomplete"`
+  (or `incomplete_details.reason=="max_output_tokens"`).
+- Detect finish_reason=="length" with a textual scan instead of a size-limited
+  JSON parse, so a >16 KB data line no longer hides a max_tokens cut.
+- Cap tool calls per batch (24) and reject an oversized batch wholesale.
+- Make the provider stream interruptible: thread the agent interrupt flag
+  into curlStream and kill the curl child when it is raised.
+- Keep the per-call tool logs off the hot path (debug) so a large batch
+  cannot hammer the process-global log lock inside the session turn.
+
+Regression tests cover each change.
+---
+ src/agent/root.zig           | 530 ++++++++++++++++++++++++++++++++++-
+ src/daemon.zig               | 147 +++++++++-
+ src/http_util.zig            |   6 +-
+ src/logging.zig              | 189 +++++++++++++
+ src/main.zig                 |   7 +
+ src/providers/anthropic.zig  |  43 +++
+ src/providers/compatible.zig |  93 ++++++
+ src/providers/gemini.zig     |  57 +++-
+ src/providers/openai.zig     |  28 ++
+ src/providers/openrouter.zig |  32 +++
+ src/providers/root.zig       |  46 +++
+ src/providers/sse.zig        | 247 +++++++++++++++-
+ src/root.zig                 |   1 +
+ src/session.zig              |  55 ++++
+ 14 files changed, 1447 insertions(+), 34 deletions(-)
+ create mode 100644 src/logging.zig
+
+diff --git a/src/agent/root.zig b/src/agent/root.zig
+index bcabe4f..5eed4b5 100644
+--- a/src/agent/root.zig
++++ b/src/agent/root.zig
+@@ -52,6 +52,15 @@ const ToolExecutionResult = dispatcher.ToolExecutionResult;
+ const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
+ const MAX_MID_TURN_INJECTION_FOLLOWUPS: u32 = 8;
+ 
++/// Upper bound on tool calls executed from a single model response. A larger
++/// batch is a degenerate/runaway generation (the incident saw 73 and 366 text
++/// calls from one truncated response), not a real request: reject it instead of
++/// executing every call and hammering the process-global log lock.
++const MAX_TOOL_CALLS_PER_BATCH: usize = 24;
++
++const TRUNCATED_RESPONSE_NOTICE =
++    "The model's response was cut off before it finished, so the tool calls it contained were discarded. Please retry your request.";
++
+ /// Maximum non-system messages before trimming.
+ const DEFAULT_MAX_HISTORY: u32 = 50;
+ 
+@@ -2219,6 +2228,11 @@ pub const Agent = struct {
+             var response_attempt: u32 = 1;
+             providers.clearLastApiErrorDetail();
+             if (is_streaming) {
++                // Expose the agent interrupt flag to the provider stream so /stop
++                // can abort an in-flight generation (curlStream kills the curl
++                // child, which unblocks the read loop).
++                @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
++                defer @import("../http_util.zig").setThreadInterruptFlag(null);
+                 self.recordLlmRequestEvent(turn_model_name, messages);
+                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
+                 const stream_result = self.provider.streamChat(
+@@ -2239,6 +2253,14 @@ pub const Agent = struct {
+                     self.stream_callback.?,
+                     self.stream_ctx.?,
+                 ) catch |err| retry_stream: {
++                    // /stop aborted the in-flight stream before it produced any
++                    // output (curlStream returns error.Interrupted when the
++                    // cancel watcher fired). This is a user stop, not a provider
++                    // failure: end the turn with the normal interrupt reply
++                    // rather than recording a failure, retrying, or surfacing a
++                    // generic provider error to the channel.
++                    if (err == error.Interrupted) return self.interruptedReply();
++
+                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
+                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
+ 
+@@ -2276,6 +2298,11 @@ pub const Agent = struct {
+                             self.stream_callback.?,
+                             self.stream_ctx.?,
+                         ) catch |retry_err| {
++                            // /stop can also land while this post-vision-error
++                            // retry stream is running. End the turn with the
++                            // interrupt reply instead of surfacing the raw error
++                            // and degrading the route for a user-initiated stop.
++                            if (retry_err == error.Interrupted) return self.interruptedReply();
+                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                             self.emitUsageFailure(turn_model_name);
+                             return retry_err;
+@@ -2292,6 +2319,7 @@ pub const Agent = struct {
+                     .tool_calls = stream_result.tool_calls,
+                     .usage = stream_result.usage,
+                     .model = stream_result.model,
++                    .truncated = stream_result.truncated,
+                 };
+             } else {
+                 self.recordLlmRequestEvent(turn_model_name, messages);
+@@ -2463,6 +2491,14 @@ pub const Agent = struct {
+             }
+             self.logLlmResponse(iteration + 1, response_attempt, &response);
+ 
++            // /stop may have aborted the in-flight stream. Honor it before the
++            // response is used at all, otherwise a partial reply would be
++            // returned as if the turn had completed.
++            if (self.isInterruptRequested()) {
++                self.freeResponseFields(&response);
++                return self.interruptedReply();
++            }
++
+             const duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
+ 
+             const response_text = response.contentOrEmpty();
+@@ -2552,6 +2588,45 @@ pub const Agent = struct {
+                 free_assistant_history = true;
+             }
+ 
++            // A response that was cut (abnormal stream termination) or truncated
++            // by max_tokens (finish_reason == "length") must never drive tool
++            // execution: the XML fallback salvages <tool_call> markup from
++            // whatever partial text arrived, so a degenerate repetition or a
++            // mid-call cut would otherwise run invented calls. Surface it as a
++            // plain reply instead.
++            if (response.truncated and parsed_calls.len > 0) {
++                log.warn("discarding {d} tool call(s) from truncated provider response", .{parsed_calls.len});
++                self.freeResponseFields(&response);
++                const notice = try self.allocator.dupe(u8, TRUNCATED_RESPONSE_NOTICE);
++                errdefer self.allocator.free(notice);
++                try self.history.append(self.allocator, .{
++                    .role = .assistant,
++                    .content = try self.dupeForHistory(notice),
++                });
++                return notice;
++            }
++
++            // A batch larger than the cap is a runaway generation, not a real
++            // request. Reject it wholesale rather than executing every call.
++            if (parsed_calls.len > MAX_TOOL_CALLS_PER_BATCH) {
++                log.warn(
++                    "rejecting oversized tool-call batch count={d} limit={d}",
++                    .{ parsed_calls.len, MAX_TOOL_CALLS_PER_BATCH },
++                );
++                self.freeResponseFields(&response);
++                const notice = try std.fmt.allocPrint(
++                    self.allocator,
++                    "Rejected a tool-call batch of {d} calls (limit {d}); nothing was executed. Please retry with fewer calls.",
++                    .{ parsed_calls.len, MAX_TOOL_CALLS_PER_BATCH },
++                );
++                errdefer self.allocator.free(notice);
++                try self.history.append(self.allocator, .{
++                    .role = .assistant,
++                    .content = try self.dupeForHistory(notice),
++                });
++                return notice;
++            }
++
+             // Determine display text.
+             // When tool calls are present, only show parsed plain text (if any).
+             // Never fall back to raw response_text here, otherwise markup like
+@@ -2731,8 +2806,12 @@ pub const Agent = struct {
+                     return self.interruptedReply();
+                 }
+ 
++                // Per-call logging stays at debug: on the turn's hot path an
++                // info-level write holds the process-global stderr lock, and a
++                // large batch (or a blocked log sink) then parks the whole
++                // session in futex_do_wait.
+                 if (self.log_tool_calls) {
+-                    log.info(
++                    log.debug(
+                         "tool-call start session=0x{x} index={d} name={s} id={s}",
+                         .{ session_hash, idx + 1, call.name, call.tool_call_id orelse "-" },
+                     );
+@@ -2769,7 +2848,7 @@ pub const Agent = struct {
+                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
+ 
+                 if (self.log_tool_calls) {
+-                    log.info(
++                    log.debug(
+                         "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
+                         .{ session_hash, idx + 1, call.name, result.success, tool_duration },
+                     );
+@@ -11450,6 +11529,453 @@ test "Agent executes native tool calls returned from streaming provider" {
+     try std.testing.expectEqualStrings("done", response);
+ }
+ 
++test "Agent discards tool calls from a truncated provider response" {
++    const TruncatedProvider = struct {
++        calls: usize = 0,
++
++        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return allocator_.dupe(u8, "ok");
++        }
++
++        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++            return error.ShouldNotUseBlockingChat;
++        }
++
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++        fn supportsStreaming(_: *anyopaque) bool {
++            return true;
++        }
++        fn supportsStreamingNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++
++        fn streamChat(
++            ptr: *anyopaque,
++            allocator_: std.mem.Allocator,
++            _: providers.ChatRequest,
++            model: []const u8,
++            _: f64,
++            callback: providers.StreamCallback,
++            callback_ctx: *anyopaque,
++        ) anyerror!providers.StreamChatResult {
++            const self: *@This() = @ptrCast(@alignCast(ptr));
++            self.calls += 1;
++            const text = "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"echo leak\"}}\n</tool_call>";
++            callback(callback_ctx, providers.StreamChunk.textDelta(text));
++            callback(callback_ctx, providers.StreamChunk.finalChunk());
++            return .{
++                .content = try allocator_.dupe(u8, text),
++                .model = try allocator_.dupe(u8, model),
++                .truncated = true,
++            };
++        }
++
++        fn getName(_: *anyopaque) []const u8 {
++            return "truncated-provider";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++
++    const allocator = std.testing.allocator;
++    var provider_state = TruncatedProvider{};
++    const provider_vtable = Provider.VTable{
++        .chatWithSystem = TruncatedProvider.chatWithSystem,
++        .chat = TruncatedProvider.chat,
++        .supportsNativeTools = TruncatedProvider.supportsNativeTools,
++        .getName = TruncatedProvider.getName,
++        .deinit = TruncatedProvider.deinitFn,
++        .supports_streaming = TruncatedProvider.supportsStreaming,
++        .supports_streaming_native_tools = TruncatedProvider.supportsStreamingNativeTools,
++        .stream_chat = TruncatedProvider.streamChat,
++    };
++    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    const runtime_tools = [_]Tool{
++        try makeMockFilterTool(allocator, "shell"),
++    };
++    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
++
++    var cfg = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "openai/gpt-4.1-mini",
++        .allocator = allocator,
++    };
++    cfg.agent.max_tool_iterations = 2;
++    var noop = observability.NoopObserver{};
++    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
++    defer agent.deinit();
++
++    const StreamSink = struct {
++        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
++    };
++    var stream_ctx: u8 = 0;
++    agent.stream_callback = StreamSink.onChunk;
++    agent.stream_ctx = @ptrCast(&stream_ctx);
++
++    const response = try agent.turn("call shell");
++    defer allocator.free(response);
++
++    // The tool call was discarded, so the loop never ran a second iteration.
++    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
++    try std.testing.expectEqualStrings(TRUNCATED_RESPONSE_NOTICE, response);
++}
++
++test "Agent ends the turn with the interrupt reply when the stream is interrupted" {
++    const InterruptProvider = struct {
++        calls: usize = 0,
++
++        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return allocator_.dupe(u8, "ok");
++        }
++
++        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++            return error.ShouldNotUseBlockingChat;
++        }
++
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++        fn supportsStreaming(_: *anyopaque) bool {
++            return true;
++        }
++        fn supportsStreamingNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++
++        fn streamChat(
++            ptr: *anyopaque,
++            _: std.mem.Allocator,
++            _: providers.ChatRequest,
++            _: []const u8,
++            _: f64,
++            _: providers.StreamCallback,
++            _: *anyopaque,
++        ) anyerror!providers.StreamChatResult {
++            const self: *@This() = @ptrCast(@alignCast(ptr));
++            self.calls += 1;
++            // /stop aborted the stream before any output: curlStream returns
++            // error.Interrupted, which must end the turn (no retry, no generic
++            // provider error surfaced to the channel).
++            return error.Interrupted;
++        }
++
++        fn getName(_: *anyopaque) []const u8 {
++            return "interrupt-provider";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++
++    const allocator = std.testing.allocator;
++    var provider_state = InterruptProvider{};
++    const provider_vtable = Provider.VTable{
++        .chatWithSystem = InterruptProvider.chatWithSystem,
++        .chat = InterruptProvider.chat,
++        .supportsNativeTools = InterruptProvider.supportsNativeTools,
++        .getName = InterruptProvider.getName,
++        .deinit = InterruptProvider.deinitFn,
++        .supports_streaming = InterruptProvider.supportsStreaming,
++        .supports_streaming_native_tools = InterruptProvider.supportsStreamingNativeTools,
++        .stream_chat = InterruptProvider.streamChat,
++    };
++    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    const runtime_tools = [_]Tool{
++        try makeMockFilterTool(allocator, "shell"),
++    };
++    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
++
++    var cfg = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "openai/gpt-4.1-mini",
++        .allocator = allocator,
++    };
++    cfg.agent.max_tool_iterations = 3;
++    var noop = observability.NoopObserver{};
++    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
++    defer agent.deinit();
++
++    const StreamSink = struct {
++        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
++    };
++    var stream_ctx: u8 = 0;
++    agent.stream_callback = StreamSink.onChunk;
++    agent.stream_ctx = @ptrCast(&stream_ctx);
++
++    const response = try agent.turn("hello");
++    defer allocator.free(response);
++
++    // One attempt: the interrupt is terminal, not retried.
++    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
++    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
++}
++
++test "Agent ends the turn with the interrupt reply when /stop lands during the vision retry" {
++    const VisionRetryInterruptProvider = struct {
++        calls: usize = 0,
++
++        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return allocator_.dupe(u8, "ok");
++        }
++
++        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++            return error.ShouldNotUseBlockingChat;
++        }
++
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++        fn supportsStreaming(_: *anyopaque) bool {
++            return true;
++        }
++        fn supportsStreamingNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++
++        fn streamChat(
++            ptr: *anyopaque,
++            _: std.mem.Allocator,
++            _: providers.ChatRequest,
++            _: []const u8,
++            _: f64,
++            _: providers.StreamCallback,
++            _: *anyopaque,
++        ) anyerror!providers.StreamChatResult {
++            const self: *@This() = @ptrCast(@alignCast(ptr));
++            self.calls += 1;
++            // First attempt trips the vision auto-disable retry; /stop then lands
++            // while that retry stream runs and curlStream returns Interrupted.
++            if (self.calls == 1) return error.ProviderDoesNotSupportVision;
++            return error.Interrupted;
++        }
++
++        fn getName(_: *anyopaque) []const u8 {
++            return "vision-retry-interrupt-provider";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++
++    const allocator = std.testing.allocator;
++    var provider_state = VisionRetryInterruptProvider{};
++    const provider_vtable = Provider.VTable{
++        .chatWithSystem = VisionRetryInterruptProvider.chatWithSystem,
++        .chat = VisionRetryInterruptProvider.chat,
++        .supportsNativeTools = VisionRetryInterruptProvider.supportsNativeTools,
++        .getName = VisionRetryInterruptProvider.getName,
++        .deinit = VisionRetryInterruptProvider.deinitFn,
++        .supports_streaming = VisionRetryInterruptProvider.supportsStreaming,
++        .supports_streaming_native_tools = VisionRetryInterruptProvider.supportsStreamingNativeTools,
++        .stream_chat = VisionRetryInterruptProvider.streamChat,
++    };
++    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    const runtime_tools = [_]Tool{
++        try makeMockFilterTool(allocator, "shell"),
++    };
++    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
++
++    var cfg = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "openai/gpt-4.1-mini",
++        .allocator = allocator,
++    };
++    cfg.agent.max_tool_iterations = 3;
++    var noop = observability.NoopObserver{};
++    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
++    defer agent.deinit();
++
++    const StreamSink = struct {
++        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
++    };
++    var stream_ctx: u8 = 0;
++    agent.stream_callback = StreamSink.onChunk;
++    agent.stream_ctx = @ptrCast(&stream_ctx);
++
++    const response = try agent.turn("hello");
++    defer allocator.free(response);
++
++    // The vision retry ran (2 calls), and the /stop during it ended the turn
++    // with the interrupt reply instead of the raw error being surfaced.
++    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
++    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
++}
++
++test "Agent rejects an oversized tool-call batch" {
++    const BigBatchProvider = struct {
++        calls: usize = 0,
++
++        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return allocator_.dupe(u8, "ok");
++        }
++
++        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++            const self: *@This() = @ptrCast(@alignCast(ptr));
++            self.calls += 1;
++            var buf: std.ArrayListUnmanaged(u8) = .empty;
++            errdefer buf.deinit(allocator_);
++            var i: usize = 0;
++            while (i < MAX_TOOL_CALLS_PER_BATCH + 6) : (i += 1) {
++                try buf.appendSlice(allocator_, "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"echo x\"}}</tool_call>\n");
++            }
++            return .{
++                .content = try buf.toOwnedSlice(allocator_),
++                .model = try allocator_.dupe(u8, "test-model"),
++            };
++        }
++
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++        fn getName(_: *anyopaque) []const u8 {
++            return "big-batch-provider";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++
++    const allocator = std.testing.allocator;
++    var provider_state = BigBatchProvider{};
++    const provider_vtable = Provider.VTable{
++        .chatWithSystem = BigBatchProvider.chatWithSystem,
++        .chat = BigBatchProvider.chat,
++        .supportsNativeTools = BigBatchProvider.supportsNativeTools,
++        .getName = BigBatchProvider.getName,
++        .deinit = BigBatchProvider.deinitFn,
++    };
++    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    const runtime_tools = [_]Tool{
++        try makeMockFilterTool(allocator, "shell"),
++    };
++    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
++
++    var cfg = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "openai/gpt-4.1-mini",
++        .allocator = allocator,
++    };
++    cfg.agent.max_tool_iterations = 3;
++    var noop = observability.NoopObserver{};
++    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("many calls");
++    defer allocator.free(response);
++
++    // The whole batch was rejected without executing anything and without a
++    // second provider iteration.
++    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
++    try std.testing.expect(std.mem.indexOf(u8, response, "Rejected a tool-call batch") != null);
++}
++
++test "Agent executes a repeated text tool call once per batch" {
++    const CountingTool = struct {
++        const Self = @This();
++        pub const tool_name = "dup_tool";
++        pub const tool_description = "counts executions";
++        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
++        pub const vtable = tools_mod.ToolVTable(Self);
++
++        runs: *usize,
++
++        fn tool(self: *Self) Tool {
++            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
++        }
++
++        pub fn execute(self: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
++            self.runs.* += 1;
++            return .{ .success = true, .output = try allocator.dupe(u8, "ran") };
++        }
++    };
++
++    const DupProvider = struct {
++        calls: usize = 0,
++
++        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return allocator_.dupe(u8, "ok");
++        }
++
++        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++            const self: *@This() = @ptrCast(@alignCast(ptr));
++            self.calls += 1;
++            if (self.calls == 1) {
++                return .{
++                    .content = try allocator_.dupe(u8, "<tool_call>{\"name\":\"dup_tool\",\"arguments\":{}}</tool_call>" ++
++                        "<tool_call>{\"name\":\"dup_tool\",\"arguments\":{}}</tool_call>" ++
++                        "<tool_call>{\"name\":\"dup_tool\",\"arguments\":{}}</tool_call>"),
++                    .model = try allocator_.dupe(u8, "test-model"),
++                };
++            }
++            return .{
++                .content = try allocator_.dupe(u8, "done"),
++                .model = try allocator_.dupe(u8, "test-model"),
++            };
++        }
++
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++        fn getName(_: *anyopaque) []const u8 {
++            return "dup-provider";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++
++    const allocator = std.testing.allocator;
++    var provider_state = DupProvider{};
++    const provider_vtable = Provider.VTable{
++        .chatWithSystem = DupProvider.chatWithSystem,
++        .chat = DupProvider.chat,
++        .supportsNativeTools = DupProvider.supportsNativeTools,
++        .getName = DupProvider.getName,
++        .deinit = DupProvider.deinitFn,
++    };
++    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    var runs: usize = 0;
++    var counting_tool = CountingTool{ .runs = &runs };
++    const tool_list = [_]Tool{counting_tool.tool()};
++    var specs = try allocator.alloc(ToolSpec, tool_list.len);
++    for (tool_list, 0..) |t, i| {
++        specs[i] = .{
++            .name = t.name(),
++            .description = t.description(),
++            .parameters_json = t.parametersJson(),
++        };
++    }
++
++    var noop = observability.NoopObserver{};
++    var agent = Agent{
++        .allocator = allocator,
++        .provider = provider,
++        .tools = &tool_list,
++        .tool_specs = specs,
++        .mem = null,
++        .observer = noop.observer(),
++        .model_name = "test-model",
++        .temperature = 0.7,
++        .workspace_dir = "/tmp",
++        .max_tool_iterations = 3,
++        .max_history_messages = 50,
++        .auto_save = false,
++        .history = .empty,
++        .total_tokens = 0,
++        .has_system_prompt = false,
++    };
++    defer agent.deinit();
++
++    const response = try agent.turn("dup");
++    defer allocator.free(response);
++
++    // The three identical calls share a dedup fingerprint, so the tool ran once.
++    try std.testing.expectEqual(@as(usize, 1), runs);
++    try std.testing.expectEqualStrings("done", response);
++}
++
+ test "buildProviderMessagesForTurn adds priority hint without mutating history" {
+     // Regression: priority hints must not be persisted as user text in history/memory/cache.
+     const allocator = std.testing.allocator;
+diff --git a/src/daemon.zig b/src/daemon.zig
+index b87e69d..7bcdd4e 100644
+--- a/src/daemon.zig
++++ b/src/daemon.zig
+@@ -37,6 +37,7 @@ const thread_stacks = @import("thread_stacks.zig");
+ const tunnel_mod = @import("tunnel.zig");
+ const Atomic = @import("portable_atomic.zig").Atomic;
+ const observability = @import("observability.zig");
++const control_plane = @import("control_plane.zig");
+ 
+ const log = std.log.scoped(.daemon);
+ 
+@@ -1240,6 +1241,20 @@ fn shouldRunInboundIdleEviction(dispatch_count: u32) bool {
+     return dispatch_count != 0 and (dispatch_count % EVICT_IDLE_DISPATCH_INTERVAL) == 0;
+ }
+ 
++/// Resolve the session key a queued inbound message will run under. Mirrors
++/// `buildInboundRoutingPlan` so the dispatcher shards a message onto the same
++/// FIFO worker as every other message for its session, and so the enqueue-time
++/// stop fast-path targets the session the running turn actually holds.
++fn resolveInboundDispatchSessionKey(
++    allocator: std.mem.Allocator,
++    config: *const Config,
++    msg: *const bus_mod.InboundMessage,
++    meta: channel_adapters.InboundMetadata,
++) ?[]const u8 {
++    return resolveInboundMainSessionKeyWithMetadata(allocator, config, msg, meta) orelse
++        resolveInboundRouteSessionKeyWithMetadata(allocator, config, msg, meta);
++}
++
+ fn inboundDispatchShardIndex(
+     allocator: std.mem.Allocator,
+     config: *const Config,
+@@ -1251,17 +1266,7 @@ fn inboundDispatchShardIndex(
+     var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+     defer parsed_meta.deinit();
+ 
+-    const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
+-        allocator,
+-        config,
+-        msg,
+-        parsed_meta.fields,
+-    ) orelse resolveInboundRouteSessionKeyWithMetadata(
+-        allocator,
+-        config,
+-        msg,
+-        parsed_meta.fields,
+-    );
++    const routed_session_key = resolveInboundDispatchSessionKey(allocator, config, msg, parsed_meta.fields);
+     defer if (routed_session_key) |key| allocator.free(key);
+ 
+     const session_key = routed_session_key orelse msg.session_key;
+@@ -1269,6 +1274,40 @@ fn inboundDispatchShardIndex(
+     return @intCast(std.hash.Wyhash.hash(0, session_key) % shard_count);
+ }
+ 
++/// A `/stop` (or `/abort`) command must not wait behind the very turn it is
++/// meant to interrupt. Each session maps to one worker queue, so a stop for a
++/// busy session lands on that worker's FIFO behind the running turn and its
++/// `routeInbound` is never reached until the turn finishes. The Telegram loop
++/// already fast-paths stop commands at enqueue time; do the same for the
++/// sharded dispatcher (Slack and every channel routed through the inbound bus).
++///
++/// Signal the interrupt now and drop the message; the running turn's interrupt
++/// reply is the user-visible response. Returns true when the message was
++/// consumed as a stop for a running turn. FIFO is preserved for everything else.
++fn tryHandleStopCommandBeforeEnqueue(
++    allocator: std.mem.Allocator,
++    config: *const Config,
++    session_mgr: *@import("session.zig").SessionManager,
++    msg: *const bus_mod.InboundMessage,
++) bool {
++    if (!control_plane.isStopLikeCommand(msg.content)) return false;
++
++    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
++    defer parsed_meta.deinit();
++    const routed_session_key = resolveInboundDispatchSessionKey(allocator, config, msg, parsed_meta.fields);
++    defer if (routed_session_key) |key| allocator.free(key);
++    const session_key = routed_session_key orelse msg.session_key;
++
++    var interrupt = session_mgr.requestTurnInterrupt(session_key);
++    defer interrupt.deinit(allocator);
++    if (!interrupt.requested) return false;
++
++    log.info("stop command interrupting running turn before enqueue session=0x{x}", .{
++        std.hash.Wyhash.hash(0, session_key),
++    });
++    return true;
++}
++
+ fn publishInboundToWorkerQueue(
+     allocator: std.mem.Allocator,
+     config: *const Config,
+@@ -1576,6 +1615,10 @@ fn inboundDispatcherThread(
+ 
+         while (ready_messages.items.len > 0) {
+             var msg = ready_messages.orderedRemove(0);
++            if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, &runtime.session_mgr, &msg)) {
++                msg.deinit(allocator);
++                continue;
++            }
+             if (worker_count > 0) {
+                 publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch |err| {
+                     msg.deinit(allocator);
+@@ -1592,6 +1635,10 @@ fn inboundDispatcherThread(
+     debouncer.flushAll(&ready_messages) catch {};
+     while (ready_messages.items.len > 0) {
+         var msg = ready_messages.orderedRemove(0);
++        if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, &runtime.session_mgr, &msg)) {
++            msg.deinit(allocator);
++            continue;
++        }
+         if (worker_count > 0) {
+             publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch {
+                 msg.deinit(allocator);
+@@ -1648,6 +1695,12 @@ fn startConfiguredTunnel(
+ /// shutdown is requested (Ctrl+C signal or explicit request).
+ /// `host` and `port` are CLI-parsed values that override `config.gateway`.
+ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
++    // Make logging non-blocking before any channel/turn thread starts: a turn
++    // holds its Session.mutex for the whole turn, so a wedged stderr write
++    // (full docker json-file log pipe, stalled log driver) must not be able to
++    // park every logging thread on the process-global log lock. See logging.zig.
++    @import("logging.zig").start();
++
+     // Ensure lifecycle parity: workspace bootstrap files must exist
+     // even when users skip onboard and start runtime directly.
+     try onboard.scaffoldWorkspaceForConfig(allocator, config, &onboard.ProjectContext{});
+@@ -2144,6 +2197,78 @@ test "inboundDispatchShardIndex keeps routed session on same worker" {
+     try std.testing.expectEqual(expected_shard, inboundDispatchShardIndex(allocator, &config, &second, worker_count));
+ }
+ 
++test "dispatcher interrupts a busy session for /stop before enqueue" {
++    const allocator = std.testing.allocator;
++    const providers_mod = @import("providers/root.zig");
++    const session_mod = @import("session.zig");
++
++    const StopMockProvider = struct {
++        fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return a.dupe(u8, "ok");
++        }
++        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers_mod.ChatRequest, _: []const u8, _: f64) anyerror!providers_mod.ChatResponse {
++            return error.ShouldNotChat;
++        }
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return false;
++        }
++        fn getName(_: *anyopaque) []const u8 {
++            return "stop-mock";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++    var provider_state: u8 = 0;
++    const provider_vtable = providers_mod.Provider.VTable{
++        .chatWithSystem = StopMockProvider.chatWithSystem,
++        .chat = StopMockProvider.chat,
++        .supportsNativeTools = StopMockProvider.supportsNativeTools,
++        .getName = StopMockProvider.getName,
++        .deinit = StopMockProvider.deinitFn,
++    };
++    const provider = providers_mod.Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    var noop = observability.NoopObserver{};
++    const config = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "test/mock-model",
++        .allocator = allocator,
++    };
++    var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
++    defer sm.deinit();
++
++    const session_key = "daemon:stop-before-enqueue";
++    const session = try sm.getOrCreate(session_key);
++    defer session.turn_running.store(false, .release);
++    session.agent.clearInterruptRequest();
++    session.turn_running.store(true, .release);
++
++    // Slack /stop for a busy session must reach requestTurnInterrupt at enqueue
++    // time, not sit on the same FIFO worker behind the running turn.
++    var stop_msg = bus_mod.InboundMessage{
++        .channel = "test-channel",
++        .sender_id = "user-1",
++        .chat_id = "chat-1",
++        .content = "/stop",
++        .session_key = session_key,
++    };
++    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &stop_msg));
++    try std.testing.expect(session.agent.interrupt_requested.load(.acquire));
++
++    // A non-stop message is left for the queue and does not raise the flag.
++    session.agent.clearInterruptRequest();
++    var normal_msg = stop_msg;
++    normal_msg.content = "just a message";
++    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &normal_msg));
++    try std.testing.expect(!session.agent.interrupt_requested.load(.acquire));
++
++    // /stop with no running turn is not consumed: normal routing replies.
++    session.turn_running.store(false, .release);
++    session.agent.clearInterruptRequest();
++    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &stop_msg));
++    try std.testing.expect(!session.agent.interrupt_requested.load(.acquire));
++}
++
+ test "hasSupervisedChannels false for defaults" {
+     const config = Config{
+         .workspace_dir = "/tmp",
+diff --git a/src/http_util.zig b/src/http_util.zig
+index 3fe3a1e..a44b90d 100644
+--- a/src/http_util.zig
++++ b/src/http_util.zig
+@@ -136,13 +136,13 @@ pub fn currentThreadInterruptFlag() ?*const AtomicBool {
+     return thread_interrupt_flag;
+ }
+ 
+-const CancelWatcherCtx = struct {
++pub const CancelWatcherCtx = struct {
+     child: *std_compat.process.Child,
+     cancel_flag: *const AtomicBool,
+     done: *AtomicBool,
+ };
+ 
+-fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
++pub fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
+     while (!ctx.done.load(.acquire)) {
+         if (ctx.cancel_flag.load(.acquire)) {
+             if (comptime @import("builtin").os.tag == .windows) {
+@@ -156,7 +156,7 @@ fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
+     }
+ }
+ 
+-fn stopCancelWatcher(done: *AtomicBool, watcher: *?std.Thread) void {
++pub fn stopCancelWatcher(done: *AtomicBool, watcher: *?std.Thread) void {
+     done.store(true, .release);
+     if (watcher.*) |thread| {
+         thread.join();
+diff --git a/src/logging.zig b/src/logging.zig
+new file mode 100644
+index 0000000..9b4d370
+--- /dev/null
++++ b/src/logging.zig
+@@ -0,0 +1,189 @@
++//! Non-blocking logging for the gateway.
++//!
++//! Zig's default `std.log` implementation formats straight to stderr while
++//! holding a process-global lock (`std.debug.lockStderr`). In the gateway every
++//! session turn holds its `Session.mutex` for the whole turn, and a turn that
++//! logs while a *different* thread is blocked inside a stderr write parks on
++//! that global lock: one wedged stderr write (a full docker json-file log pipe,
++//! a stalled log driver) then parks every logging thread in `futex_do_wait`
++//! with the CPU idle — the incident signature.
++//!
++//! `logFn` instead formats into a fixed record and hands it to a bounded ring
++//! drained by one dedicated thread. Producers never block: if the ring lock is
++//! busy or the ring is full the line is dropped and counted. Only the drain
++//! thread can block on stderr, so a stuck log sink can no longer wedge a turn.
++//!
++//! Install with `pub const std_options: std.Options = .{ .logFn = logging.logFn };`
++//! in the executable root, and call `start()` from the gateway. Until `start()`
++//! runs (other CLI commands, tests) logging forwards to `std.log.defaultLog`.
++
++const std = @import("std");
++const std_compat = @import("compat");
++
++/// Longest line kept. Lines are truncated to this so a record is a single
++/// bounded write and the ring's memory is fixed regardless of message size.
++const MAX_LINE = 2048;
++
++/// Number of queued records. When full, producers drop rather than block.
++const RING_CAPACITY = 512;
++
++const Record = struct {
++    len: u16,
++    buf: [MAX_LINE]u8,
++};
++
++var mutex: std_compat.sync.Mutex = .{};
++var not_empty: std_compat.sync.Condition = .{};
++var ring: [RING_CAPACITY]Record = undefined;
++var head: usize = 0;
++var tail: usize = 0;
++var stop_requested: bool = false;
++var running = std.atomic.Value(bool).init(false);
++var drain_thread: ?std.Thread = null;
++
++/// Lines dropped because a producer could not take the ring lock or found the
++/// ring full. Kept for diagnostics and the regression test.
++var dropped = std.atomic.Value(usize).init(0);
++
++/// Spawn the drain thread and route logging through the ring. Idempotent.
++/// Call once from the gateway before serving traffic.
++pub fn start() void {
++    mutex.lock();
++    defer mutex.unlock();
++    if (running.load(.acquire)) return;
++
++    head = 0;
++    tail = 0;
++    stop_requested = false;
++    running.store(true, .release);
++    drain_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, drainMain, .{}) catch |err| {
++        // Without a drain thread the ring would never empty: fall back to the
++        // default (blocking) logger rather than dropping every line.
++        running.store(false, .release);
++        std.log.scoped(.logging).warn("non-blocking logger unavailable, using default: {}", .{err});
++        return;
++    };
++}
++
++/// std_options.logFn: format into a ring record without ever blocking.
++pub fn logFn(
++    comptime level: std.log.Level,
++    comptime scope: @EnumLiteral(),
++    comptime format: []const u8,
++    args: anytype,
++) void {
++    if (!running.load(.acquire)) {
++        std.log.defaultLog(level, scope, format, args);
++        return;
++    }
++
++    if (!mutex.tryLock()) {
++        // A drain (or another producer) holds the lock; do not wait.
++        _ = dropped.fetchAdd(1, .monotonic);
++        return;
++    }
++    defer mutex.unlock();
++
++    const next = (head + 1) % RING_CAPACITY;
++    if (next == tail) {
++        _ = dropped.fetchAdd(1, .monotonic);
++        return;
++    }
++
++    const rec = &ring[head];
++    rec.len = @intCast(writeLine(&rec.buf, level, scope, format, args));
++    head = next;
++    not_empty.signal();
++}
++
++fn writeLine(
++    buf: []u8,
++    comptime level: std.log.Level,
++    comptime scope: @EnumLiteral(),
++    comptime format: []const u8,
++    args: anytype,
++) usize {
++    var w = std.Io.Writer.fixed(buf);
++    w.print("{s}", .{level.asText()}) catch {};
++    if (scope != .default) w.print("({t})", .{scope}) catch {};
++    w.print(": " ++ format ++ "\n", args) catch {};
++    return w.end;
++}
++
++fn drainMain() void {
++    const stderr = std_compat.fs.File.stderr();
++    while (true) {
++        mutex.lock();
++        while (head == tail and !stop_requested) not_empty.wait(&mutex);
++        if (head == tail) {
++            mutex.unlock();
++            return;
++        }
++        const rec = ring[tail];
++        tail = (tail + 1) % RING_CAPACITY;
++        mutex.unlock();
++
++        // This is the only place that can block on the log sink. If it does,
++        // producers keep dropping into the ring and the gateway keeps running.
++        stderr.writeAll(rec.buf[0..rec.len]) catch {};
++    }
++}
++
++fn resetForTest() void {
++    mutex.lock();
++    defer mutex.unlock();
++    head = 0;
++    tail = 0;
++    stop_requested = false;
++    dropped.store(0, .monotonic);
++    running.store(false, .release);
++}
++
++test "logFn formats and enqueues a line into the ring" {
++    resetForTest();
++    defer resetForTest();
++    running.store(true, .release);
++
++    logFn(.warn, .test_scope, "value={d}", .{42});
++
++    mutex.lock();
++    const count = head;
++    const rec = ring[0];
++    mutex.unlock();
++
++    try std.testing.expectEqual(@as(usize, 1), count);
++    try std.testing.expect(std.mem.startsWith(u8, rec.buf[0..rec.len], "warning(test_scope): "));
++    try std.testing.expect(std.mem.indexOf(u8, rec.buf[0..rec.len], "value=42") != null);
++}
++
++test "logFn drops instead of blocking when the ring lock is held" {
++    resetForTest();
++    defer resetForTest();
++    running.store(true, .release);
++
++    // Simulate a drain thread parked on a wedged stderr write: it holds the
++    // lock, so a producer must return immediately and count the drop rather
++    // than waiting (which is what wedged the whole process in futex_do_wait).
++    mutex.lock();
++    logFn(.info, .test_scope, "while locked", .{});
++    mutex.unlock();
++
++    try std.testing.expectEqual(@as(usize, 1), dropped.load(.monotonic));
++    try std.testing.expectEqual(@as(usize, 0), head);
++}
++
++test "logFn drops when the ring is full" {
++    resetForTest();
++    defer resetForTest();
++    running.store(true, .release);
++
++    // Fill to capacity (one slot is reserved to distinguish full from empty).
++    var i: usize = 0;
++    while (i < RING_CAPACITY - 1) : (i += 1) {
++        logFn(.info, .test_scope, "line {d}", .{i});
++    }
++    try std.testing.expectEqual(@as(usize, 0), dropped.load(.monotonic));
++
++    logFn(.info, .test_scope, "overflow", .{});
++    try std.testing.expectEqual(@as(usize, 1), dropped.load(.monotonic));
++}
+diff --git a/src/main.zig b/src/main.zig
+index b227f7e..6211a1c 100644
+--- a/src/main.zig
++++ b/src/main.zig
+@@ -6,6 +6,13 @@ const yc = @import("nullclaw");
+ const control_plane = yc.control_plane;
+ const util = yc.util;
+ 
++/// Route logging through the gateway's non-blocking logger (see logging.zig).
++/// Until the gateway calls `logging.start()` this forwards to the default
++/// logger, so short-lived CLI commands and tests are unaffected.
++pub const std_options: std.Options = .{
++    .logFn = yc.logging.logFn,
++};
++
+ pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
+     _ = error_return_trace;
+     _ = ret_addr;
+diff --git a/src/providers/anthropic.zig b/src/providers/anthropic.zig
+index 90ade57..00bfb42 100644
+--- a/src/providers/anthropic.zig
++++ b/src/providers/anthropic.zig
+@@ -239,12 +239,21 @@ pub const AnthropicProvider = struct {
+ 
+         const model_str = if (root_obj.get("model")) |m| (if (m == .string) m.string else "") else "";
+ 
++        // A max_tokens stop means the response is a truncated prefix: any
++        // tool_use block (or <tool_call> text salvaged downstream) is partial and
++        // must not be executed, so the agent's truncated guard can fire.
++        const truncated = if (root_obj.get("stop_reason")) |sr|
++            (sr == .string and std.mem.eql(u8, sr.string, "max_tokens"))
++        else
++            false;
++
+         return .{
+             .content = if (text_parts.items.len > 0) try text_parts.toOwnedSlice(allocator) else null,
+             .reasoning_content = if (thinking_parts.items.len > 0) try thinking_parts.toOwnedSlice(allocator) else null,
+             .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
+             .usage = usage,
+             .model = try allocator.dupe(u8, model_str),
++            .truncated = truncated,
+         };
+     }
+ 
+@@ -810,6 +819,40 @@ test "parseNativeResponse with text and tool_use" {
+     try std.testing.expect(response.usage.total_tokens == 30);
+ }
+ 
++test "parseNativeResponse flags stop_reason=max_tokens as truncated" {
++    const body =
++        \\{"content":[{"type":"tool_use","id":"call_1","name":"shell","input":{"cmd":"ls"}}],"stop_reason":"max_tokens","model":"claude-3-opus"}
++    ;
++    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
++    defer {
++        if (response.content) |c| std.testing.allocator.free(c);
++        for (response.tool_calls) |tc| {
++            std.testing.allocator.free(tc.id);
++            std.testing.allocator.free(tc.name);
++            std.testing.allocator.free(tc.arguments);
++        }
++        std.testing.allocator.free(response.tool_calls);
++        std.testing.allocator.free(response.model);
++    }
++    // Regression: a non-streaming Anthropic max_tokens cut never set the flag,
++    // so partial tool_use calls reached the agent and executed.
++    try std.testing.expect(response.truncated);
++    try std.testing.expectEqual(@as(usize, 1), response.tool_calls.len);
++}
++
++test "parseNativeResponse leaves truncated false on end_turn" {
++    const body =
++        \\{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn","model":"claude-3-opus"}
++    ;
++    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
++    defer {
++        if (response.content) |c| std.testing.allocator.free(c);
++        std.testing.allocator.free(response.tool_calls);
++        std.testing.allocator.free(response.model);
++    }
++    try std.testing.expect(!response.truncated);
++}
++
+ test "supportsNativeTools returns true" {
+     var p = AnthropicProvider.init(std.testing.allocator, "key", null);
+     const prov = p.provider();
+diff --git a/src/providers/compatible.zig b/src/providers/compatible.zig
+index e5d3555..187eeea 100644
+--- a/src/providers/compatible.zig
++++ b/src/providers/compatible.zig
+@@ -749,6 +749,25 @@ pub const OpenAiCompatibleProvider = struct {
+         return usage;
+     }
+ 
++    /// True when the Responses API response was cut short. Unlike chat
++    /// completions there is no `finish_reason`; the API sets `status` to
++    /// "incomplete" (with `incomplete_details.reason` == "max_output_tokens" or
++    /// "content_filter"). Tool calls salvaged from such a response are partial
++    /// and must not be executed, so the agent's truncated guard can fire.
++    fn responsesReportsIncomplete(root_obj: std.json.ObjectMap) bool {
++        if (root_obj.get("status")) |status| {
++            if (status == .string and std.mem.eql(u8, status.string, "incomplete")) return true;
++        }
++        if (root_obj.get("incomplete_details")) |details| {
++            if (details == .object) {
++                if (details.object.get("reason")) |reason| {
++                    if (reason == .string and std.mem.eql(u8, reason.string, "max_output_tokens")) return true;
++                }
++            }
++        }
++        return false;
++    }
++
+     pub fn parseResponsesResponse(allocator: std.mem.Allocator, body: []const u8) !ChatResponse {
+         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+         defer parsed.deinit();
+@@ -797,6 +816,7 @@ pub const OpenAiCompatibleProvider = struct {
+             .usage = extractResponsesUsage(root_obj),
+             .model = model_str,
+             .reasoning_content = reasoning,
++            .truncated = responsesReportsIncomplete(root_obj),
+         };
+     }
+ 
+@@ -1033,6 +1053,7 @@ pub const OpenAiCompatibleProvider = struct {
+             if (choices == .array and choices.array.items.len > 0) {
+                 const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
+                 const msg_obj = msg.object;
++                const truncated = root.choiceReportsLengthFinish(choices.array.items[0]);
+ 
+                 var content: ?[]const u8 = null;
+                 errdefer if (content) |c| if (c.len > 0) allocator.free(c);
+@@ -1144,6 +1165,7 @@ pub const OpenAiCompatibleProvider = struct {
+                     .usage = usage,
+                     .model = model_str,
+                     .reasoning_content = reasoning_content,
++                    .truncated = truncated,
+                 };
+             }
+         }
+@@ -1323,6 +1345,8 @@ pub const OpenAiCompatibleProvider = struct {
+         var retries: u8 = 0;
+         while (true) : (retries += 1) {
+             return streamChatOnce(ptr, allocator, request, model, temperature, callback, callback_ctx) catch |err| {
++                // A user /stop is terminal: never retry it.
++                if (err == error.Interrupted) return err;
+                 if (retries < 3 and self.shouldRetry(allocator, err, self.normalizeProviderModel(model), request.reasoning_effort)) continue;
+                 return err;
+             };
+@@ -1412,6 +1436,9 @@ pub const OpenAiCompatibleProvider = struct {
+             callback,
+             callback_ctx,
+         ) catch |err| {
++            // /stop aborted the stream: propagate it so the agent ends the turn
++            // instead of masking the stop with a fresh non-streaming request.
++            if (err == error.Interrupted) return err;
+             if (err == error.CurlWaitError or err == error.CurlFailed) {
+                 log.warn("{s} streaming failed with {}; falling back to non-streaming response", .{ self.name, err });
+                 // Cap the fallback timeout to 90 s — if streaming stalled (e.g. speed-limit
+@@ -2131,6 +2158,37 @@ test "parseNativeResponse reads reasoning_details field" {
+     try std.testing.expectEqualStrings("plan\nstep by step", result.reasoning_content.?);
+ }
+ 
++test "parseNativeResponse flags finish_reason=length as truncated" {
++    const body =
++        \\{"choices":[{"finish_reason":"length","message":{"role":"assistant","content":"<tool_call>{\"name\":\"shell\"}</tool_call>"}}],"model":"k2"}
++    ;
++    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
++    defer {
++        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
++        for (result.tool_calls) |tc| {
++            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
++            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
++            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
++        }
++        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
++        if (result.model.len > 0) std.testing.allocator.free(result.model);
++        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
++    }
++    try std.testing.expect(result.truncated);
++}
++
++test "parseNativeResponse leaves truncated false on a natural stop" {
++    const body =
++        \\{"choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hello"}}],"model":"k2"}
++    ;
++    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
++    defer {
++        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
++        if (result.model.len > 0) std.testing.allocator.free(result.model);
++    }
++    try std.testing.expect(!result.truncated);
++}
++
+ test "parseNativeResponse supports content array text parts" {
+     const body =
+         \\{"choices":[{"message":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"from kimi-k2.5"}]}}],"model":"kimi-k2.5"}
+@@ -2921,6 +2979,41 @@ test "parseResponsesResponse extracts function call text and reasoning summary"
+     try std.testing.expectEqualStrings("thinking summary", result.reasoning_content.?);
+ }
+ 
++test "parseResponsesResponse flags status=incomplete as truncated" {
++    const body =
++        \\{"model":"gpt-5.4","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[{"type":"function_call","call_id":"call_1","name":"bash","arguments":"{}"}]}
++    ;
++    const result = try OpenAiCompatibleProvider.parseResponsesResponse(std.testing.allocator, body);
++    defer {
++        if (result.content) |text| std.testing.allocator.free(text);
++        for (result.tool_calls) |tc| {
++            std.testing.allocator.free(tc.id);
++            std.testing.allocator.free(tc.name);
++            std.testing.allocator.free(tc.arguments);
++        }
++        std.testing.allocator.free(result.tool_calls);
++        if (result.model.len > 0) std.testing.allocator.free(result.model);
++        if (result.reasoning_content) |text| std.testing.allocator.free(text);
++    }
++    // Regression: the Responses API path never inspected status/incomplete_details,
++    // so a max_output_tokens cut reached the agent as a complete response.
++    try std.testing.expect(result.truncated);
++}
++
++test "parseResponsesResponse leaves truncated false on a completed response" {
++    const body =
++        \\{"model":"gpt-5.4","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}
++    ;
++    const result = try OpenAiCompatibleProvider.parseResponsesResponse(std.testing.allocator, body);
++    defer {
++        if (result.content) |text| std.testing.allocator.free(text);
++        std.testing.allocator.free(result.tool_calls);
++        if (result.model.len > 0) std.testing.allocator.free(result.model);
++        if (result.reasoning_content) |text| std.testing.allocator.free(text);
++    }
++    try std.testing.expect(!result.truncated);
++}
++
+ test "parseResponsesResponse maps generic error envelope" {
+     const body =
+         \\{"error":{"message":"An error occurred while processing your request."}}
+diff --git a/src/providers/gemini.zig b/src/providers/gemini.zig
+index 557f1df..f0f08e6 100644
+--- a/src/providers/gemini.zig
++++ b/src/providers/gemini.zig
+@@ -77,6 +77,18 @@ fn finalizeGeminiStreamResult(
+     };
+ }
+ 
++/// Finalize a Gemini stream that was cut after partial output: keep the salvaged
++/// text, but flag it truncated so the agent refuses tool calls parsed from it.
++fn finalizeRecoveredGeminiStreamResult(
++    allocator: std.mem.Allocator,
++    accumulated: []const u8,
++    stream_usage: root.TokenUsage,
++) !root.StreamChatResult {
++    var result = try finalizeGeminiStreamResult(allocator, accumulated, stream_usage);
++    result.truncated = true;
++    return result;
++}
++
+ fn parseUsageMetadataValue(v: std.json.Value) ?root.TokenUsage {
+     if (v != .object) return null;
+     const usage_obj = v.object;
+@@ -650,6 +662,12 @@ pub const GeminiProvider = struct {
+         if (root_obj.get("candidates")) |candidates| {
+             if (candidates == .array and candidates.array.items.len > 0) {
+                 const candidate = candidates.array.items[0].object;
++                // A MAX_TOKENS finishReason means the candidate was cut off; a
++                // tool call parsed from the partial text must not be executed.
++                const truncated = if (candidate.get("finishReason")) |fr|
++                    (fr == .string and std.mem.eql(u8, fr.string, "MAX_TOKENS"))
++                else
++                    false;
+                 if (candidate.get("content")) |content| {
+                     if (content == .object) {
+                         if (content.object.get("parts")) |parts| {
+@@ -678,6 +696,7 @@ pub const GeminiProvider = struct {
+                                 .content = if (text_buf.items.len > 0) try text_buf.toOwnedSlice(allocator) else null,
+                                 .reasoning_content = if (thought_buf.items.len > 0) try thought_buf.toOwnedSlice(allocator) else null,
+                                 .usage = usage,
++                                .truncated = truncated,
+                             };
+                         }
+                     }
+@@ -937,7 +956,7 @@ pub const GeminiProvider = struct {
+             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                 log.warn("curlStreamGemini proceeding despite wait failure after partial stream output", .{});
+                 callback(ctx, root.StreamChunk.finalChunk());
+-                return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
++                return finalizeRecoveredGeminiStreamResult(allocator, accumulated.items, stream_usage);
+             }
+             return error.CurlWaitError;
+         };
+@@ -946,7 +965,7 @@ pub const GeminiProvider = struct {
+                 if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                     log.warn("curlStreamGemini exit code {d} after partial stream output; returning accumulated output", .{code});
+                     callback(ctx, root.StreamChunk.finalChunk());
+-                    return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
++                    return finalizeRecoveredGeminiStreamResult(allocator, accumulated.items, stream_usage);
+                 }
+                 return error.CurlFailed;
+             },
+@@ -954,7 +973,7 @@ pub const GeminiProvider = struct {
+                 if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                     log.warn("curlStreamGemini abnormal termination after partial stream output; returning accumulated output", .{});
+                     callback(ctx, root.StreamChunk.finalChunk());
+-                    return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
++                    return finalizeRecoveredGeminiStreamResult(allocator, accumulated.items, stream_usage);
+                 }
+                 return error.CurlFailed;
+             },
+@@ -1316,6 +1335,26 @@ test "parseChatResponse extracts usageMetadata token counts" {
+     try std.testing.expectEqual(@as(u32, 46), response.usage.total_tokens);
+ }
+ 
++test "parseChatResponse flags finishReason=MAX_TOKENS as truncated" {
++    const body =
++        \\{"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"partial"}]}}]}
++    ;
++    const response = try GeminiProvider.parseChatResponse(std.testing.allocator, body);
++    defer std.testing.allocator.free(response.content.?);
++    // Regression: Gemini/Vertex non-streaming responses never carried the
++    // truncated flag, so partial tool calls executed.
++    try std.testing.expect(response.truncated);
++}
++
++test "parseChatResponse leaves truncated false on a STOP finish" {
++    const body =
++        \\{"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":"done"}]}}]}
++    ;
++    const response = try GeminiProvider.parseChatResponse(std.testing.allocator, body);
++    defer std.testing.allocator.free(response.content.?);
++    try std.testing.expect(!response.truncated);
++}
++
+ test "extractGeminiUsageMetadata derives missing total from prompt and completion" {
+     const json =
+         \\{"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":5}}
+@@ -1527,6 +1566,18 @@ test "parseGeminiSseLine invalid json returns error" {
+     );
+ }
+ 
++test "finalizeRecoveredGeminiStreamResult flags a cut stream as truncated" {
++    const result = try finalizeRecoveredGeminiStreamResult(
++        std.testing.allocator,
++        "partial answer <tool_call>{\"name\":\"shell\"}</tool_call>",
++        .{},
++    );
++    defer if (result.content) |content| std.testing.allocator.free(content);
++
++    try std.testing.expect(result.truncated);
++    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "partial answer") != null);
++}
++
+ test "streamingFallbackTimeoutSecs caps stalled-stream fallback timeout" {
+     // Regression: Gemini/Vertex must not wait the full message_timeout_secs
+     // twice when both the streaming and fallback paths are slow.
+diff --git a/src/providers/openai.zig b/src/providers/openai.zig
+index 39c96ed..03ef02d 100644
+--- a/src/providers/openai.zig
++++ b/src/providers/openai.zig
+@@ -134,6 +134,7 @@ pub const OpenAiProvider = struct {
+             if (choices == .array and choices.array.items.len > 0) {
+                 const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
+                 const msg_obj = msg.object;
++                const truncated = root.choiceReportsLengthFinish(choices.array.items[0]);
+ 
+                 var content: ?[]const u8 = null;
+                 var reasoning_content: ?[]const u8 = null;
+@@ -193,6 +194,7 @@ pub const OpenAiProvider = struct {
+                     .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
+                     .usage = usage,
+                     .model = model_str,
++                    .truncated = truncated,
+                 };
+             }
+         }
+@@ -626,6 +628,32 @@ test "parseNativeResponse tool_calls null does not crash" {
+     try std.testing.expectEqualStrings("pong", response.content.?);
+ }
+ 
++test "parseNativeResponse flags finish_reason=length as truncated" {
++    const body =
++        \\{"choices":[{"finish_reason":"length","message":{"content":"<tool_call>{\"name\":\"shell\"}</tool_call>"}}],"model":"gpt-4o"}
++    ;
++    const response = try OpenAiProvider.parseNativeResponse(std.testing.allocator, body);
++    defer {
++        if (response.content) |c| std.testing.allocator.free(c);
++        std.testing.allocator.free(response.tool_calls);
++        std.testing.allocator.free(response.model);
++    }
++    try std.testing.expect(response.truncated);
++}
++
++test "parseNativeResponse leaves truncated false on a natural stop" {
++    const body =
++        \\{"choices":[{"finish_reason":"stop","message":{"content":"hello"}}],"model":"gpt-4o"}
++    ;
++    const response = try OpenAiProvider.parseNativeResponse(std.testing.allocator, body);
++    defer {
++        if (response.content) |c| std.testing.allocator.free(c);
++        std.testing.allocator.free(response.tool_calls);
++        std.testing.allocator.free(response.model);
++    }
++    try std.testing.expect(!response.truncated);
++}
++
+ test "buildRequestBody includes temperature zero" {
+     const body = try OpenAiProvider.buildRequestBody(std.testing.allocator, null, "hello", "gpt-4o", 0.0, null, null);
+     defer std.testing.allocator.free(body);
+diff --git a/src/providers/openrouter.zig b/src/providers/openrouter.zig
+index 6cdd770..1c0a87b 100644
+--- a/src/providers/openrouter.zig
++++ b/src/providers/openrouter.zig
+@@ -129,6 +129,7 @@ pub const OpenRouterProvider = struct {
+             if (choices == .array and choices.array.items.len > 0) {
+                 const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
+                 const msg_obj = msg.object;
++                const truncated = root.choiceReportsLengthFinish(choices.array.items[0]);
+ 
+                 var content: ?[]const u8 = null;
+                 var reasoning_content: ?[]const u8 = null;
+@@ -217,6 +218,7 @@ pub const OpenRouterProvider = struct {
+                     .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
+                     .usage = usage,
+                     .model = model_str,
++                    .truncated = truncated,
+                 };
+             }
+         }
+@@ -1078,3 +1080,33 @@ test "parseNativeResponse tool_calls null does not crash" {
+     try std.testing.expectEqualStrings("pong", response.content.?);
+     try std.testing.expectEqual(@as(usize, 0), response.tool_calls.len);
+ }
++
++test "parseNativeResponse flags finish_reason=length as truncated" {
++    const body =
++        \\{"choices":[{"finish_reason":"length","message":{"content":"<tool_call>{\"name\":\"shell\"}</tool_call>"}}],"model":"kimi-k2"}
++    ;
++    const alloc = std.testing.allocator;
++    const response = try OpenRouterProvider.parseNativeResponse(alloc, body);
++    defer {
++        if (response.content) |c| alloc.free(c);
++        if (response.reasoning_content) |rc| alloc.free(rc);
++        alloc.free(response.tool_calls);
++        alloc.free(response.model);
++    }
++    try std.testing.expect(response.truncated);
++}
++
++test "parseNativeResponse leaves truncated false on a natural stop" {
++    const body =
++        \\{"choices":[{"finish_reason":"stop","message":{"content":"hello"}}],"model":"kimi-k2"}
++    ;
++    const alloc = std.testing.allocator;
++    const response = try OpenRouterProvider.parseNativeResponse(alloc, body);
++    defer {
++        if (response.content) |c| alloc.free(c);
++        if (response.reasoning_content) |rc| alloc.free(rc);
++        alloc.free(response.tool_calls);
++        alloc.free(response.model);
++    }
++    try std.testing.expect(!response.truncated);
++}
+diff --git a/src/providers/root.zig b/src/providers/root.zig
+index f68156f..e5aea13 100644
+--- a/src/providers/root.zig
++++ b/src/providers/root.zig
+@@ -210,6 +210,11 @@ pub const ChatResponse = struct {
+     model: []const u8 = "",
+     /// Optional reasoning/thinking content from models that support it (e.g. Claude extended thinking).
+     reasoning_content: ?[]const u8 = null,
++    /// True when the provider response ended before a natural stop: a cut
++    /// stream (abnormal termination, timeout) or a max_tokens hit
++    /// (`finish_reason == "length"`). Tool calls salvaged from such a response
++    /// must never be executed.
++    truncated: bool = false,
+ 
+     /// True when the LLM wants to invoke at least one tool.
+     pub fn hasToolCalls(self: ChatResponse) bool {
+@@ -280,12 +285,25 @@ pub const StreamChatResult = struct {
+     tool_calls: []const ToolCall = &.{},
+     usage: TokenUsage = .{},
+     model: []const u8 = "",
++    /// See `ChatResponse.truncated`.
++    truncated: bool = false,
+ };
+ 
+ pub fn shouldRecoverPartialStream(accumulated_len: usize, saw_done: bool) bool {
+     return saw_done or accumulated_len > 0;
+ }
+ 
++/// True when an OpenAI-style `choices[]` entry ended because the model hit its
++/// token budget (`finish_reason == "length"`) rather than stopping naturally. A
++/// response that stopped this way is a truncated prefix, so any tool call
++/// salvaged from its text must not be executed. Shared by the OpenAI,
++/// OpenRouter, and OpenAI-compatible non-streaming parsers.
++pub fn choiceReportsLengthFinish(choice: std.json.Value) bool {
++    if (choice != .object) return false;
++    const finish_reason = choice.object.get("finish_reason") orelse return false;
++    return finish_reason == .string and std.mem.eql(u8, finish_reason.string, "length");
++}
++
+ /// Free every owned field of a `ChatResponse` and reset it. Use this when the
+ /// whole response is being discarded (capability probes, throw-away calls).
+ /// Contrast with `freeStreamUnusedChatResponseFields`, which deliberately
+@@ -347,6 +365,10 @@ pub fn emitChatResponseAsStream(
+         .tool_calls = tool_calls,
+         .usage = response.usage,
+         .model = response.model,
++        // Propagate the cut/max_tokens flag: every non-streaming fallback
++        // (api_mode == .responses, large-prompt skip, curl fallback) returns
++        // through here, and dropping it let truncated tool calls execute.
++        .truncated = response.truncated,
+     };
+ }
+ 
+@@ -1000,6 +1022,30 @@ test "emitChatResponseAsStream frees unused chat response fields" {
+     try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", result.tool_calls[0].arguments);
+ }
+ 
++test "emitChatResponseAsStream propagates the truncated flag" {
++    const allocator = std.testing.allocator;
++
++    var response = ChatResponse{
++        .content = try allocator.dupe(u8, "partial answer"),
++        .model = try allocator.dupe(u8, "test-model"),
++        .truncated = true,
++    };
++
++    const CallbackCtx = struct {
++        fn onChunk(_: *anyopaque, _: StreamChunk) void {}
++    };
++    var ctx: u8 = 0;
++    const result = emitChatResponseAsStream(allocator, &response, CallbackCtx.onChunk, @ptrCast(&ctx));
++    defer if (result.content) |content| allocator.free(content);
++    defer if (result.model.len > 0) allocator.free(result.model);
++
++    // Regression: every non-streaming fallback returns through this function;
++    // dropping the flag left the agent unable to tell the calls came from a cut
++    // response, so it executed them.
++    try std.testing.expect(result.truncated);
++    try std.testing.expectEqualStrings("partial answer", result.content.?);
++}
++
+ test "Provider.streamChat fallback emits single chunk and final" {
+     const TestCtx = struct {
+         chunks_count: usize = 0,
+diff --git a/src/providers/sse.zig b/src/providers/sse.zig
+index 074c152..bd8b216 100644
+--- a/src/providers/sse.zig
++++ b/src/providers/sse.zig
+@@ -41,6 +41,19 @@ fn finalizeStreamResult(
+     };
+ }
+ 
++/// Finalize a stream that was cut after partial output (wait failure, nonzero
++/// exit, abnormal termination): keep the salvaged text, but flag it truncated so
++/// the agent refuses tool calls parsed out of the partial response.
++fn finalizeRecoveredStreamResult(
++    allocator: std.mem.Allocator,
++    accumulated: []const u8,
++    stream_usage: ?root.TokenUsage,
++) !root.StreamChatResult {
++    var result = try finalizeStreamResult(allocator, accumulated, stream_usage);
++    result.truncated = true;
++    return result;
++}
++
+ const ToolCallSlot = struct {
+     index: usize,
+     id: ?[]u8 = null,
+@@ -225,6 +238,10 @@ fn finalizeStreamResultWithToolCalls(
+     /// timeout, nonzero exit, read error) pass false: the text they salvage is
+     /// worth keeping, but a tool call cut mid-flight must never be executed.
+     tool_calls_trusted: bool,
++    /// Whether the response is incomplete: a cut stream or a `finish_reason`
++    /// of "length". Propagated to the agent so it refuses to execute tool
++    /// calls parsed from the partial text.
++    truncated: bool,
+ ) !root.StreamChatResult {
+     var result = try finalizeStreamResult(allocator, accumulated, stream_usage);
+     errdefer {
+@@ -239,6 +256,7 @@ fn finalizeStreamResultWithToolCalls(
+         if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
+     }
+ 
++    result.truncated = truncated;
+     if (tool_calls_trusted) {
+         result.tool_calls = try tool_call_accumulator.toOwnedToolCalls(allocator);
+     }
+@@ -537,6 +555,76 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
+     return null;
+ }
+ 
++fn isJsonWhitespace(c: u8) bool {
++    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
++}
++
++/// True when an SSE line's choice carries `finish_reason: "length"`, i.e. the
++/// model stopped because it hit its token budget. The accumulated text is a
++/// truncated prefix, so any tool-call markup in it must not be executed.
++///
++/// Scans the payload textually instead of JSON-parsing it: a full parse needs
++/// an allocator, and the previous fixed 16 KB arena silently failed on a larger
++/// data line (a big final delta can carry the finish_reason), so a max_tokens
++/// cut was never flagged. The field is only matched at a JSON value position
++/// (after `{` or `,`) so a quoted mention inside a content string is ignored.
++fn sseLineReportsLengthFinish(line: []const u8) bool {
++    const data = extractSseDataPayload(line) orelse return false;
++    if (data.len == 0 or std.mem.eql(u8, data, "[DONE]")) return false;
++
++    const key = "\"finish_reason\"";
++    var search_from: usize = 0;
++    while (std.mem.indexOfPos(u8, data, search_from, key)) |key_start| {
++        search_from = key_start + 1;
++
++        // Reject a mention that is a value, not a key: the byte before the key
++        // must open an object (`{`) or separate a member (`,`).
++        var prev = key_start;
++        while (prev > 0 and isJsonWhitespace(data[prev - 1])) prev -= 1;
++        if (prev != 0 and data[prev - 1] != '{' and data[prev - 1] != ',') continue;
++
++        var i = key_start + key.len;
++        while (i < data.len and isJsonWhitespace(data[i])) i += 1;
++        if (i >= data.len or data[i] != ':') continue;
++        i += 1;
++        while (i < data.len and isJsonWhitespace(data[i])) i += 1;
++        if (i >= data.len or data[i] != '"') continue;
++        const value_start = i + 1;
++        const value_end = std.mem.indexOfScalarPos(u8, data, value_start, '"') orelse continue;
++        if (std.mem.eql(u8, data[value_start..value_end], "length")) return true;
++    }
++    return false;
++}
++
++/// Stop the cancel watcher, then kill and reap curl.
++///
++/// The watcher must be joined BEFORE `wait()` reaps the child: a still-running
++/// watcher otherwise calls `kill(child.id)` in the window after the kernel has
++/// returned that PID to the OS, and a freshly spawned process can reuse it, so
++/// the watcher would signal an unrelated process. This mirrors the established
++/// `http_util.abortCurlChild` ordering (stop watcher, then kill/wait).
++fn stopWatcherAndReap(
++    child: *std_compat.process.Child,
++    cancel_done: *std.atomic.Value(bool),
++    cancel_watcher: *?std.Thread,
++) void {
++    http_util.stopCancelWatcher(cancel_done, cancel_watcher);
++    _ = child.kill() catch {};
++    _ = child.wait() catch {};
++}
++
++/// True when a stdin write failure must be reported as a user interrupt.
++///
++/// A /stop raises the agent interrupt flag; the cancel watcher then kills curl
++/// mid-upload, so `writeAll(body)` fails with a broken pipe instead of reaching
++/// the read-loop interrupt check. Consulting the flag lets the caller end the
++/// turn with the interrupt reply rather than reporting the stop as a provider
++/// write failure.
++fn stdinWriteFailureIsInterrupt(cancel_flag: ?*const std.atomic.Value(bool)) bool {
++    if (cancel_flag) |flag| return flag.load(.acquire);
++    return false;
++}
++
+ /// Run curl in SSE streaming mode and parse output line by line.
+ ///
+ /// Spawns `curl -s --no-buffer` with the strongest supported fail-fast flag:
+@@ -650,19 +738,37 @@ pub fn curlStream(
+         debug_log.debug("curl process spawned, pid={d}", .{pid});
+     }
+ 
++    // Abort the stream when the agent interrupt flag is raised (e.g. /stop
++    // during a runaway generation). Killing curl closes the stdout pipe, so
++    // the blocking read below returns and this function returns
++    // error.Interrupted so the caller ends the turn instead of retrying.
++    const cancel_flag = http_util.currentThreadInterruptFlag();
++    var cancel_done = std.atomic.Value(bool).init(false);
++    var cancel_watcher: ?std.Thread = null;
++    var cancel_ctx: http_util.CancelWatcherCtx = undefined;
++    if (cancel_flag) |flag| {
++        cancel_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
++        cancel_watcher = std.Thread.spawn(.{}, http_util.cancelWatcherMain, .{&cancel_ctx}) catch null;
++    }
++    // Safety net only: every path below stops the watcher before reaping curl
++    // (see stopWatcherAndReap), because joining after wait() leaves a PID-reuse
++    // window. This defer is a no-op once that has happened.
++    defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
++
+     if (child.stdin) |stdin_file| {
+         stdin_file.writeAll(body) catch {
+             stdin_file.close();
+             child.stdin = null;
+-            _ = child.kill() catch {};
+-            _ = child.wait() catch {};
++            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++            // A /stop can kill curl before the body finishes uploading; the
++            // failed write would otherwise mask the interrupt as a provider error.
++            if (stdinWriteFailureIsInterrupt(cancel_flag)) return error.Interrupted;
+             return error.CurlWriteError;
+         };
+         stdin_file.close();
+         child.stdin = null;
+     } else {
+-        _ = child.kill() catch {};
+-        _ = child.wait() catch {};
++        stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+         return error.CurlWriteError;
+     }
+ 
+@@ -676,6 +782,7 @@ pub fn curlStream(
+     const stdout_file = child.stdout.?;
+     var read_buf: [4096]u8 = undefined;
+     var saw_done = false;
++    var saw_length_finish = false;
+     var total_stdout: usize = 0;
+     var stream_usage: ?root.TokenUsage = null;
+     var in_reasoning = false;
+@@ -715,7 +822,7 @@ pub fn curlStream(
+             if (parsed) |p| {
+                 defer p.deinit();
+                 if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
+-                    _ = child.wait() catch {};
++                    stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                     // Keep the provider's message: without it the channel can
+                     // only show a generic "An error occurred" for a 400.
+                     var summary_buf: [1024]u8 = undefined;
+@@ -729,7 +836,7 @@ pub fn curlStream(
+             }
+ 
+             // Return a meaningful error
+-            _ = child.wait() catch {};
++            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+             debug_log.err("Server returned JSON error payload: len={d}", .{json_response.len});
+             return error.ServerError;
+         }
+@@ -740,6 +847,7 @@ pub fn curlStream(
+                     debug_log.debug("parsing SSE line: len={d}", .{line_buf.items.len});
+                 }
+                 try accumulateToolCallsFromSseLine(&tool_call_accumulator, allocator, line_buf.items);
++                if (!saw_length_finish and sseLineReportsLengthFinish(line_buf.items)) saw_length_finish = true;
+                 const result = parseSseLine(allocator, line_buf.items) catch {
+                     line_buf.clearRetainingCapacity();
+                     continue;
+@@ -770,6 +878,22 @@ pub fn curlStream(
+         debug_log.debug("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
+     }
+ 
++    // A /stop raised the interrupt flag and the watcher killed curl, so the
++    // stream was cut. Return a distinct error rather than salvaging the partial
++    // text: this can happen before any byte arrives (accumulated_len == 0),
++    // where the old code returned error.CurlFailed and the compatible provider
++    // fell back to a fresh non-streaming request — silently ignoring the stop.
++    // The fallback/retry layers must propagate error.Interrupted and the agent
++    // must end the turn with the normal interrupt reply.
++    if (!saw_done) {
++        if (cancel_flag) |flag| {
++            if (flag.load(.acquire)) {
++                stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++                return error.Interrupted;
++            }
++        }
++    }
++
+     // Parse a trailing line when the stream ends without a final '\n'.
+     if (!saw_done and line_buf.items.len > 0) {
+         try accumulateToolCallsFromSseLine(&tool_call_accumulator, allocator, line_buf.items);
+@@ -800,13 +924,17 @@ pub fn curlStream(
+     if (log_enabled) {
+         debug_log.debug("waiting for curl process to exit...", .{});
+     }
++    // Join the watcher before reaping curl (PID-reuse window; see
++    // stopWatcherAndReap). The stdout stream is already at EOF, so the watcher
++    // has nothing left to unblock.
++    http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+     const term = child.wait() catch |err| {
+         log.err("curlStream child.wait failed: {}", .{err});
+         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
+             try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+             callback(ctx, root.StreamChunk.finalChunk());
+-            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
++            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
+         }
+         return error.CurlWaitError;
+     };
+@@ -819,7 +947,7 @@ pub fn curlStream(
+                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
+                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+                 callback(ctx, root.StreamChunk.finalChunk());
+-                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
++                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
+             }
+             return error.CurlFailed;
+         },
+@@ -828,7 +956,7 @@ pub fn curlStream(
+                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
+                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+                 callback(ctx, root.StreamChunk.finalChunk());
+-                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
++                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
+             }
+             return error.CurlFailed;
+         },
+@@ -837,7 +965,7 @@ pub fn curlStream(
+     // Signal stream completion only after curl exits successfully.
+     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+     callback(ctx, root.StreamChunk.finalChunk());
+-    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, true);
++    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, true, saw_length_finish);
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+@@ -1097,7 +1225,7 @@ pub fn curlStreamAnthropic(
+         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+             log.warn("curlStreamAnthropic proceeding despite wait failure after partial stream output", .{});
+             callback(ctx, root.StreamChunk.finalChunk());
+-            return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
++            return finalizeRecoveredStreamResult(allocator, accumulated.items, anthropic_usage);
+         }
+         return error.CurlWaitError;
+     };
+@@ -1106,7 +1234,7 @@ pub fn curlStreamAnthropic(
+             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                 log.warn("curlStreamAnthropic exit code {d} after partial stream output; returning accumulated output", .{code});
+                 callback(ctx, root.StreamChunk.finalChunk());
+-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
++                return finalizeRecoveredStreamResult(allocator, accumulated.items, anthropic_usage);
+             }
+             return error.CurlFailed;
+         },
+@@ -1114,7 +1242,7 @@ pub fn curlStreamAnthropic(
+             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                 log.warn("curlStreamAnthropic abnormal termination after partial stream output; returning accumulated output", .{});
+                 callback(ctx, root.StreamChunk.finalChunk());
+-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
++                return finalizeRecoveredStreamResult(allocator, accumulated.items, anthropic_usage);
+             }
+             return error.CurlFailed;
+         },
+@@ -1364,6 +1492,78 @@ test "accumulateToolCallsFromSseLine handles trailing data line without newline"
+     try std.testing.expectEqualStrings("shell", tool_calls[0].name);
+ }
+ 
++test "stdinWriteFailureIsInterrupt reports a stop, not a write error" {
++    var flag = std.atomic.Value(bool).init(false);
++    try std.testing.expect(!stdinWriteFailureIsInterrupt(&flag));
++    try std.testing.expect(!stdinWriteFailureIsInterrupt(null));
++    flag.store(true, .release);
++    // Regression: a /stop that kills curl mid-upload surfaces as a write error;
++    // the flag must win so the caller ends the turn with the interrupt reply.
++    try std.testing.expect(stdinWriteFailureIsInterrupt(&flag));
++}
++
++test "finalizeStreamResultWithToolCalls flags a cut stream as truncated" {
++    const allocator = std.testing.allocator;
++    var accumulator = ToolCallAccumulator{};
++    defer accumulator.deinit(allocator);
++
++    try accumulator.appendFromJsonPayload(allocator,
++        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
++    );
++
++    // Recovery path: the stream was cut, so tool_calls_trusted=false and
++    // truncated=true. The partial text is kept but no tool call is exposed.
++    const result = try finalizeStreamResultWithToolCalls(allocator, "partial answer", null, &accumulator, false, true);
++    defer {
++        if (result.content) |content| allocator.free(content);
++        if (result.reasoning_content) |reasoning| allocator.free(reasoning);
++        for (result.tool_calls) |tc| {
++            allocator.free(tc.id);
++            allocator.free(tc.name);
++            allocator.free(tc.arguments);
++        }
++        if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
++    }
++
++    try std.testing.expect(result.truncated);
++    try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
++    try std.testing.expectEqualStrings("partial answer", result.content.?);
++}
++
++test "sseLineReportsLengthFinish detects a max_tokens finish" {
++    try std.testing.expect(sseLineReportsLengthFinish(
++        \\data: {"choices":[{"delta":{},"finish_reason":"length"}]}
++    ));
++    try std.testing.expect(!sseLineReportsLengthFinish(
++        \\data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
++    ));
++    try std.testing.expect(!sseLineReportsLengthFinish("data: [DONE]"));
++    try std.testing.expect(!sseLineReportsLengthFinish(": keep-alive"));
++}
++
++test "sseLineReportsLengthFinish finds finish_reason past 16 KB" {
++    // Regression: the previous fixed 16 KB parse arena silently failed on a
++    // larger data line (a big final delta can carry the finish_reason), so a
++    // max_tokens cut was never flagged and truncated tool calls ran.
++    const prefix = "data: {\"choices\":[{\"delta\":{\"content\":\"";
++    const suffix = "\"},\"finish_reason\":\"length\"}]}";
++    const fill = 20 * 1024;
++    var buf: [prefix.len + fill + suffix.len]u8 = undefined;
++    @memcpy(buf[0..prefix.len], prefix);
++    @memset(buf[prefix.len .. prefix.len + fill], 'x');
++    @memcpy(buf[prefix.len + fill ..], suffix);
++    const line = buf[0 .. prefix.len + fill + suffix.len];
++
++    try std.testing.expect(line.len > 16 * 1024);
++    try std.testing.expect(sseLineReportsLengthFinish(line));
++
++    // A quoted mention of the field inside content must not be mistaken for the
++    // real finish_reason.
++    try std.testing.expect(!sseLineReportsLengthFinish(
++        \\data: {"choices":[{"delta":{"content":"say \"finish_reason\":\"length\" now"}}]}
++    ));
++}
++
+ test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
+     const allocator = std.testing.allocator;
+     var accumulator = ToolCallAccumulator{};
+@@ -1373,7 +1573,7 @@ test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
+         \\{"choices":[{"delta":{"content":"ignored","tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
+     );
+ 
+-    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator, true);
++    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator, true, false);
+     defer {
+         if (result.content) |content| allocator.free(content);
+         if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+@@ -1401,7 +1601,7 @@ test "finalizeStreamResultWithToolCalls supports tool-call-only response" {
+         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
+     );
+ 
+-    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator, true);
++    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator, true, false);
+     defer {
+         if (result.content) |content| allocator.free(content);
+         if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+@@ -1630,6 +1830,23 @@ test "extractStreamUsage returns null for invalid JSON" {
+     try std.testing.expect(extractStreamUsage("not-json{{{") == null);
+ }
+ 
++test "finalizeRecoveredStreamResult flags a cut stream as truncated" {
++    const result = try finalizeRecoveredStreamResult(
++        std.testing.allocator,
++        "partial answer <tool_call>{\"name\":\"shell\"}</tool_call>",
++        null,
++    );
++    defer {
++        if (result.content) |content| std.testing.allocator.free(content);
++        if (result.reasoning_content) |reasoning| std.testing.allocator.free(reasoning);
++    }
++
++    // The Anthropic recovery paths keep the salvaged text but must flag it
++    // truncated so the agent does not execute tool calls parsed from the cut.
++    try std.testing.expect(result.truncated);
++    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "partial answer") != null);
++}
++
+ test "finalizeStreamResult separates think blocks into reasoning content" {
+     const result = try finalizeStreamResult(
+         std.testing.allocator,
+diff --git a/src/root.zig b/src/root.zig
+index 15b6079..6a971bf 100644
+--- a/src/root.zig
++++ b/src/root.zig
+@@ -10,6 +10,7 @@ pub const json_util = @import("json_util.zig");
+ pub const admin_output = @import("admin_output.zig");
+ pub const fs_compat = @import("fs_compat.zig");
+ pub const http_util = @import("http_util.zig");
++pub const logging = @import("logging.zig");
+ pub const net_security = @import("net_security.zig");
+ pub const governance = @import("governance.zig");
+ pub const redaction = @import("redaction.zig");
+diff --git a/src/session.zig b/src/session.zig
+index 74bb593..6989c85 100644
+--- a/src/session.zig
++++ b/src/session.zig
+@@ -31,6 +31,7 @@ const onboard = @import("onboard.zig");
+ const bootstrap_mod = @import("bootstrap/root.zig");
+ const observability = @import("observability.zig");
+ const inbound_router = @import("inbound_router.zig");
++const control_plane = @import("control_plane.zig");
+ const Observer = observability.Observer;
+ const tools_mod = @import("tools/root.zig");
+ const cron_mod = @import("cron.zig");
+@@ -2182,6 +2183,22 @@ pub const SessionManager = struct {
+     /// Returns .skip when the caller should not start a new turn.
+     pub fn routeInbound(self: *SessionManager, session_key: []const u8, content: []const u8) InboundRouteAction {
+         const session_hash = std.hash.Wyhash.hash(0, session_key);
++
++        // A stop command must reach a busy session even when the queue policy
++        // would drop it: it is the only way to interrupt a running turn. The
++        // incident dropped "/stop" with "session busy queue_mode=off" and the
++        // user could not stop a runaway generation. Signal the interrupt here,
++        // centrally, so every channel path (daemon/Slack, all channel_loop
++        // variants, callback queries, the sync Telegram path) benefits.
++        if (control_plane.isStopLikeCommand(content)) {
++            var interrupt = self.requestTurnInterrupt(session_key);
++            defer interrupt.deinit(self.allocator);
++            if (interrupt.requested) {
++                log.info("stop command interrupting running turn session=0x{x}", .{session_hash});
++                return .skip;
++            }
++        }
++
+         return switch (inbound_router.route(self.routeInput(session_key))) {
+             .inject, .replace_injection => blk: {
+                 const injected = self.injectMidTurnIfRunning(session_key, content) catch |err| {
+@@ -4443,6 +4460,44 @@ test "routeInbound handles active session routing side effects" {
+     );
+ }
+ 
++test "routeInbound interrupts a busy session for /stop instead of dropping" {
++    var mock = MockProvider{ .response = "ok" };
++    const cfg = testConfig();
++    var sm = testSessionManager(testing.allocator, &mock, &cfg);
++    defer sm.deinit();
++
++    const session_key = "route:stop";
++    const session = try sm.getOrCreate(session_key);
++    session.agent.queue_mode = .off;
++    session.agent.clearInterruptRequest();
++    defer session.turn_running.store(false, .release);
++
++    session.turn_running.store(true, .release);
++
++    // /stop must reach the busy session and set the interrupt flag rather than
++    // being dropped by the queue_mode=off busy gate.
++    try testing.expectEqual(
++        SessionManager.InboundRouteAction.skip,
++        sm.routeInbound(session_key, "/stop"),
++    );
++    try testing.expect(session.agent.interrupt_requested.load(.acquire));
++
++    // A non-stop message in the same state is still dropped without interrupt.
++    session.agent.clearInterruptRequest();
++    try testing.expectEqual(
++        SessionManager.InboundRouteAction.skip,
++        sm.routeInbound(session_key, "just a message"),
++    );
++    try testing.expect(!session.agent.interrupt_requested.load(.acquire));
++
++    // /stop when no turn is running is routed normally (agent replies).
++    session.turn_running.store(false, .release);
++    try testing.expectEqual(
++        SessionManager.InboundRouteAction.process,
++        sm.routeInbound(session_key, "/stop"),
++    );
++}
++
+ test "requestTurnInterrupt signals only active sessions" {
+     var mock = MockProvider{ .response = "ok" };
+     const cfg = testConfig();
+-- 
+2.56.0
+
