@@ -1,4 +1,4 @@
-From 1a374c1a3b726938f59f1fa7944537362e3534eb Mon Sep 17 00:00:00 2001
+From 3943e269e4df1477f4db9909e173e8f0f07b1248 Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 06:20:43 +0900
 Subject: [PATCH] fix(providers): route configured providers by explicit prefix
@@ -17,12 +17,12 @@ provider prefix, while the failover chain still contains exactly the
 `reliability.fallback_providers` (plus rotated keys) in their configured
 order, so a bare model keeps its existing failover behavior.
 ---
- src/providers/reliable.zig       | 159 +++++++++++++++++++++++++------
- src/providers/runtime_bundle.zig | 147 +++++++++++++++++++++++++++-
- 2 files changed, 274 insertions(+), 32 deletions(-)
+ src/providers/reliable.zig       | 245 ++++++++++++++++++++++++++++---
+ src/providers/runtime_bundle.zig | 147 ++++++++++++++++++-
+ 2 files changed, 370 insertions(+), 22 deletions(-)
 
 diff --git a/src/providers/reliable.zig b/src/providers/reliable.zig
-index 08808e85..a038f9eb 100644
+index ed38bf9..962dd79 100644
 --- a/src/providers/reliable.zig
 +++ b/src/providers/reliable.zig
 @@ -133,6 +133,10 @@ pub const ReliableProvider = struct {
@@ -147,7 +147,7 @@ index 08808e85..a038f9eb 100644
              if (matchesProvider(self.inner.getName(), requested_provider)) {
                  return .{
                      .provider = self.inner,
-@@ -699,6 +737,9 @@ pub const ReliableProvider = struct {
+@@ -704,6 +742,9 @@ pub const ReliableProvider = struct {
          for (self.extras) |entry| {
              entry.provider.deinit();
          }
@@ -157,7 +157,7 @@ index 08808e85..a038f9eb 100644
      }
  
      fn warmupImpl(ptr: *anyopaque) void {
-@@ -707,6 +748,9 @@ pub const ReliableProvider = struct {
+@@ -712,6 +753,9 @@ pub const ReliableProvider = struct {
          for (self.extras) |entry| {
              entry.provider.warmup();
          }
@@ -167,50 +167,119 @@ index 08808e85..a038f9eb 100644
      }
  };
  
-@@ -1362,7 +1406,7 @@ test "warmup calls inner and extras" {
+@@ -1367,6 +1411,167 @@ test "warmup calls inner and extras" {
      try std.testing.expect(extra_mock.warmed_up);
  }
  
--/// Mock provider with a name, a fail switch, and the streaming
 +/// Mock provider with a routable name, a fail switch, and the streaming
- /// native-tools capability, used by the routing/capability tests below.
- const StreamingToolsMock = struct {
-     name: []const u8,
-@@ -1449,24 +1493,79 @@ test "ReliableProvider delegates supportsStreamingNativeTools to a capable inner
- }
- 
- test "ReliableProvider resolves supportsStreamingNativeTools through an explicit prefix" {
--    // Regression: a wrapper must report the capability of the provider that
--    // actually serves the request, not of the primary one.
--    var primary = StreamingToolsMock{ .name = "primary", .streaming_native_tools = true };
--    var newapi = StreamingToolsMock{ .name = "newapi", .streaming_native_tools = false };
++/// native-tools capability, used by the routing/capability tests below.
++const StreamingToolsMock = struct {
++    name: []const u8,
++    streaming_native_tools: bool,
++    fail: bool = false,
++    calls: u32 = 0,
++    last_model_buf: [64]u8 = undefined,
++    last_model_len: usize = 0,
++
++    const vtable = Provider.VTable{
++        .chatWithSystem = chatWithSystem,
++        .chat = chat,
++        .supportsNativeTools = supportsNativeTools,
++        .supports_streaming = supportsStreaming,
++        .supports_streaming_native_tools = supportsStreamingNativeTools,
++        .getName = getName,
++        .deinit = deinit,
++    };
++
++    fn toProvider(self: *StreamingToolsMock) Provider {
++        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
++    }
++
++    fn lastModel(self: *const StreamingToolsMock) []const u8 {
++        return self.last_model_buf[0..self.last_model_len];
++    }
++
++    fn chatWithSystem(
++        _: *anyopaque,
++        _: std.mem.Allocator,
++        _: ?[]const u8,
++        _: []const u8,
++        _: []const u8,
++        _: f64,
++    ) anyerror![]const u8 {
++        return error.ShouldNotUseChatWithSystem;
++    }
++
++    fn chat(
++        ptr: *anyopaque,
++        allocator: std.mem.Allocator,
++        _: ChatRequest,
++        model: []const u8,
++        _: f64,
++    ) anyerror!ChatResponse {
++        const self: *StreamingToolsMock = @ptrCast(@alignCast(ptr));
++        self.calls += 1;
++        const copy_len = @min(model.len, self.last_model_buf.len);
++        @memcpy(self.last_model_buf[0..copy_len], model[0..copy_len]);
++        self.last_model_len = copy_len;
++        if (self.fail) return error.ProviderError;
++        return ChatResponse{ .content = try allocator.dupe(u8, "routed") };
++    }
++
++    fn supportsNativeTools(_: *anyopaque) bool {
++        return false;
++    }
++
++    fn supportsStreaming(_: *anyopaque) bool {
++        return true;
++    }
++
++    fn supportsStreamingNativeTools(ptr: *anyopaque) bool {
++        const self: *StreamingToolsMock = @ptrCast(@alignCast(ptr));
++        return self.streaming_native_tools;
++    }
++
++    fn getName(ptr: *anyopaque) []const u8 {
++        const self: *StreamingToolsMock = @ptrCast(@alignCast(ptr));
++        return self.name;
++    }
++
++    fn deinit(_: *anyopaque) void {}
++};
++
++test "ReliableProvider delegates supportsStreamingNativeTools to a capable inner" {
++    var capable = StreamingToolsMock{ .name = "capable", .streaming_native_tools = true };
++    var reliable = ReliableProvider.initWithProvider(capable.toProvider(), 0, 50);
++    try std.testing.expect(reliable.provider().supportsStreamingNativeTools());
++
++    var plain = StreamingToolsMock{ .name = "plain", .streaming_native_tools = false };
++    var reliable_plain = ReliableProvider.initWithProvider(plain.toProvider(), 0, 50);
++    try std.testing.expect(!reliable_plain.provider().supportsStreamingNativeTools());
++}
++
++test "ReliableProvider resolves supportsStreamingNativeTools through an explicit prefix" {
 +    // Regression: a wrapper that is not itself capable must still report true
 +    // when the resolved target (here a routable, non-failover provider) is.
 +    var primary = StreamingToolsMock{ .name = "primary", .streaming_native_tools = false };
 +    var newapi = StreamingToolsMock{ .name = "newapi", .streaming_native_tools = true };
- 
--    const extras = [_]ProviderEntry{
++
 +    const routable = [_]ProviderEntry{
-         .{ .name = "newapi", .provider = newapi.toProvider() },
-     };
--    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withExtras(&extras);
++        .{ .name = "newapi", .provider = newapi.toProvider() },
++    };
 +    var reliable = ReliableProvider.initWithProvider(primary.toProvider(), 0, 50).withRoutable(&routable);
-     const prov = reliable.provider();
- 
--    // The prefix wins over the (capable) primary provider.
--    try std.testing.expect(!prov.supportsStreamingNativeTools("newapi/dpsk"));
-+    try std.testing.expect(prov.supportsStreamingNativeTools("newapi/dpsk"));
-     // A bare model still resolves to the primary provider.
--    try std.testing.expect(prov.supportsStreamingNativeTools("dpsk"));
-+    try std.testing.expect(!prov.supportsStreamingNativeTools("dpsk"));
- }
- 
++    const prov = reliable.provider();
++
++    try std.testing.expect(prov.supportsStreamingNativeToolsForModel("newapi/dpsk"));
++    // A bare model still resolves to the primary provider.
++    try std.testing.expect(!prov.supportsStreamingNativeToolsForModel("dpsk"));
++}
++
 +test "ReliableProvider routes an explicit prefix to a non-failover provider" {
 +    // Regression: `/model newapi/dpsk` used to strip the prefix and send `dpsk`
 +    // to the primary provider because only fallback providers were routable.
 +    var primary = StreamingToolsMock{ .name = "primary", .streaming_native_tools = false };
 +    var newapi = StreamingToolsMock{ .name = "newapi", .streaming_native_tools = true };
- 
++
 +    const routable = [_]ProviderEntry{
 +        .{ .name = "newapi", .provider = newapi.toProvider() },
 +    };
@@ -262,11 +331,12 @@ index 08808e85..a038f9eb 100644
 +    try std.testing.expectEqual(@as(u32, 1), fallback.calls);
 +    try std.testing.expectEqual(@as(u32, 0), newapi.calls);
 +}
- 
++
  test "multi-provider fallback: primary fails, extra succeeds" {
      var primary = MockInnerProvider{ .call_count = 0, .fail_until = 100, .supports_tools = false };
+     var fallback = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
 diff --git a/src/providers/runtime_bundle.zig b/src/providers/runtime_bundle.zig
-index 3a520e3c..258768c0 100644
+index 3a520e3..fe01c93 100644
 --- a/src/providers/runtime_bundle.zig
 +++ b/src/providers/runtime_bundle.zig
 @@ -75,6 +75,54 @@ fn appendHolderPlan(
@@ -416,9 +486,9 @@ index 3a520e3c..258768c0 100644
 +
 +    const prov = bundle.provider();
 +    // The explicit prefix resolves to the capable configured provider...
-+    try std.testing.expect(prov.supportsStreamingNativeTools("newapi/dpsk"));
++    try std.testing.expect(prov.supportsStreamingNativeToolsForModel("newapi/dpsk"));
 +    // ...while a bare model still resolves to the non-capable primary.
-+    try std.testing.expect(!prov.supportsStreamingNativeTools("dpsk"));
++    try std.testing.expect(!prov.supportsStreamingNativeToolsForModel("dpsk"));
 +}
 +
 +test "RuntimeProviderBundle keeps fallback providers in the failover chain" {

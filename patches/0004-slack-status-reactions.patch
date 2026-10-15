@@ -1,4 +1,4 @@
-From ec560c263345b2ffa7b52631afeb5c6bab9d33e7 Mon Sep 17 00:00:00 2001
+From 2af5b3e3424e386c270f985564e51de06d7b2c8e Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 07:09:35 +0900
 Subject: [PATCH] feat(slack): show the task lifecycle as reactions
@@ -49,7 +49,7 @@ leaked) and `zig fmt --check` on the changed files, both in the Zig
  8 files changed, 424 insertions(+), 7 deletions(-)
 
 diff --git a/docs/en/configuration.md b/docs/en/configuration.md
-index b5788dd1..a44adf52 100644
+index b5788dd..a44adf5 100644
 --- a/docs/en/configuration.md
 +++ b/docs/en/configuration.md
 @@ -1069,6 +1069,31 @@ Parameters:
@@ -85,7 +85,7 @@ index b5788dd1..a44adf52 100644
  #### Slack streaming replies
  
 diff --git a/docs/zh/configuration.md b/docs/zh/configuration.md
-index 9ff5d0f1..132cea4b 100644
+index 9ff5d0f..132cea4 100644
 --- a/docs/zh/configuration.md
 +++ b/docs/zh/configuration.md
 @@ -871,8 +871,28 @@ Slack 示例：
@@ -118,7 +118,7 @@ index 9ff5d0f1..132cea4b 100644
  
  开启 `streaming = true` 后，nullclaw 会边生成边推送，而不是等完整回复再发送。按回复目标选择两条通路：
 diff --git a/src/channels/root.zig b/src/channels/root.zig
-index 311037b0..e7ed44e4 100644
+index 311037b..e7ed44e 100644
 --- a/src/channels/root.zig
 +++ b/src/channels/root.zig
 @@ -124,6 +124,19 @@ pub const Channel = struct {
@@ -184,7 +184,7 @@ index 311037b0..e7ed44e4 100644
          .target = "chat-1",
          .message_id = "m-1",
 diff --git a/src/channels/slack.zig b/src/channels/slack.zig
-index f29dda19..b00f62c4 100644
+index f29dda1..b00f62c 100644
 --- a/src/channels/slack.zig
 +++ b/src/channels/slack.zig
 @@ -106,6 +106,98 @@ fn buildThreadStatusRequestBody(
@@ -481,7 +481,7 @@ index f29dda19..b00f62c4 100644
      try std.testing.expectEqualStrings("https://slack.com/api", SlackChannel.API_BASE);
  }
 diff --git a/src/channels/telegram.zig b/src/channels/telegram.zig
-index 6f3e3447..411af14d 100644
+index 6f3e344..411af14 100644
 --- a/src/channels/telegram.zig
 +++ b/src/channels/telegram.zig
 @@ -139,12 +139,10 @@ const ParsedTelegramTarget = struct {
@@ -502,7 +502,7 @@ index 6f3e3447..411af14d 100644
  fn parseTelegramTarget(target: []const u8) ParsedTelegramTarget {
      const separators = [_][]const u8{ THREAD_TARGET_SEPARATOR, TOPIC_TARGET_SEPARATOR };
 diff --git a/src/config.zig b/src/config.zig
-index 1422cfcb..fb382c55 100644
+index 1422cfc..fb382c5 100644
 --- a/src/config.zig
 +++ b/src/config.zig
 @@ -7194,6 +7194,49 @@ test "parse slack streaming from config" {
@@ -556,7 +556,7 @@ index 1422cfcb..fb382c55 100644
      const allocator = std.testing.allocator;
      const accounts = [_]SlackConfig{.{
 diff --git a/src/config_types.zig b/src/config_types.zig
-index 93089b67..1e0242af 100644
+index 93089b6..1e0242a 100644
 --- a/src/config_types.zig
 +++ b/src/config_types.zig
 @@ -692,6 +692,16 @@ pub const SlackReplyToMode = enum {
@@ -590,7 +590,7 @@ index 93089b67..1e0242af 100644
  
  pub const TeamsConfig = struct {
 diff --git a/src/daemon.zig b/src/daemon.zig
-index c2b73d9f..93320b08 100644
+index c2b73d9..93320b0 100644
 --- a/src/daemon.zig
 +++ b/src/daemon.zig
 @@ -1011,6 +1011,26 @@ fn markInboundMessageRead(

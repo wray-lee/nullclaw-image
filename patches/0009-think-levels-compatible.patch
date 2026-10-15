@@ -1,5 +1,5 @@
-From f4b6f91ee4dad844ea5d30b023768216996bab5d Mon Sep 17 00:00:00 2001
-From: wray-lee <i@wray7.top>
+From 3ffeb443f89f7175cb0e0b34baebcec61f1925bd Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 19:39:40 +0900
 Subject: [PATCH] fix(providers): send /think levels to OpenAI-compatible
  models and add max
@@ -64,7 +64,7 @@ index 8ed4bcf..4b09576 100644
              {
                  self.reasoning_effort = try self.allocator.dupe(u8, v.string);
 diff --git a/src/providers/compatible.zig b/src/providers/compatible.zig
-index ae07cb4..8c3dad2 100644
+index 4acde3a..e5d3555 100644
 --- a/src/providers/compatible.zig
 +++ b/src/providers/compatible.zig
 @@ -1,5 +1,6 @@
@@ -219,7 +219,7 @@ index ae07cb4..8c3dad2 100644
          const effective_model = self.normalizeProviderModel(model);
  
          if (self.api_mode == .responses) {
-@@ -1491,10 +1594,13 @@ pub const OpenAiCompatibleProvider = struct {
+@@ -1489,10 +1592,13 @@ pub const OpenAiCompatibleProvider = struct {
          temperature: f64,
      ) anyerror!ChatResponse {
          const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
@@ -237,7 +237,7 @@ index ae07cb4..8c3dad2 100644
      }
  
      fn chatOnce(
-@@ -1509,6 +1615,7 @@ pub const OpenAiCompatibleProvider = struct {
+@@ -1507,6 +1613,7 @@ pub const OpenAiCompatibleProvider = struct {
          defer if (reasoning_messages) |msgs| allocator.free(msgs);
          var request = original_request;
          if (reasoning_messages) |msgs| request.messages = msgs;
@@ -245,7 +245,7 @@ index ae07cb4..8c3dad2 100644
          const effective_model = self.normalizeProviderModel(model);
          const capped_request = self.capNonStreamingMaxTokens(request);
  
-@@ -1722,6 +1829,9 @@ fn buildChatRequestBody(
+@@ -1720,6 +1827,9 @@ fn buildChatRequestBody(
  
      try buf.append(allocator, ']');
      try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
@@ -255,7 +255,7 @@ index ae07cb4..8c3dad2 100644
      if (thinking_param) {
          if (reasoning_enabled) {
              try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
-@@ -1782,6 +1892,9 @@ fn buildStreamingChatRequestBody(
+@@ -1780,6 +1890,9 @@ fn buildStreamingChatRequestBody(
  
      try buf.append(allocator, ']');
      try root.appendGenerationFields(&buf, allocator, model, temperature, request.max_tokens, request.reasoning_effort);
@@ -265,7 +265,7 @@ index ae07cb4..8c3dad2 100644
      if (thinking_param) {
          if (reasoning_enabled) {
              try buf.appendSlice(allocator, ",\"thinking\":{\"type\":\"enabled\"}");
-@@ -1816,6 +1929,36 @@ fn buildStreamingChatRequestBody(
+@@ -1814,6 +1927,36 @@ fn buildStreamingChatRequestBody(
      return try buf.toOwnedSlice(allocator);
  }
  
@@ -302,7 +302,7 @@ index ae07cb4..8c3dad2 100644
  fn hasCompatReasoningEnabled(reasoning_effort: ?[]const u8) bool {
      const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse return false;
      return !std.mem.eql(u8, effort, "none");
-@@ -3452,3 +3595,75 @@ test "missing thinking field error switches assistant history to reasoning_conte
+@@ -3429,3 +3572,75 @@ test "missing thinking field error switches assistant history to reasoning_conte
      try std.testing.expectEqualStrings("", patched[1].reasoning_content.?);
      try std.testing.expect(patched[2].reasoning_content == null);
  }
@@ -424,5 +424,5 @@ index a62fcdb..58b7a9b 100644
      try buf.appendSlice(allocator, effort);
      try buf.appendSlice(allocator, "\",\"summary\":\"auto\"}");
 -- 
-2.55.0.windows.3
+2.56.0
 

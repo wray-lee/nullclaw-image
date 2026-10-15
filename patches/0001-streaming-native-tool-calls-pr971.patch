@@ -1,0 +1,1406 @@
+From acf83fa0a30f49fb01dd2d9c04d12b1ea3c4d48f Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Thu, 15 Oct 2026 20:56:19 +0900
+Subject: [PATCH] feat(providers): support native tool calls while streaming
+
+This is nullclaw PR #971 (vernonstinebaker), carried here until it is merged
+upstream. Drop this patch from the stack once #971 lands on main.
+
+Decouple native tool-call support from the streaming path. Previously the
+agent loop disabled native tools whenever a stream callback was attached,
+forcing tools into a prompt-injection format that some models could not
+reliably emit. The streaming protocol (StreamChunk / StreamChatResult) also
+had no field to carry tool calls, so even if a provider parsed them they were
+dropped at the agent boundary.
+
+- providers/root: `tool_calls` on StreamChatResult, a model-aware
+  `supports_streaming_native_tools` / `supports_streaming_native_tools_for_model`
+  vtable capability (default false), and `freeChatResponse`.
+- providers/sse: a ToolCallAccumulator that reassembles `delta.tool_calls`
+  across SSE chunks, tracks `saw_arguments`, and only executes a call when the
+  stream ended cleanly (`tool_calls_trusted`).
+- providers/{openai,compatible}: opt in to streaming native tools;
+  anthropic reports false (streaming tool-use has a different event shape).
+- providers/{router,reliable}: resolve the requested model before answering
+  the capability, mirroring the existing `supports_vision_for_model` precedent.
+- agent/root: gate native tools on the capability when streaming and propagate
+  `stream_result.tool_calls` into the agent loop.
+- session: release the full vision-probe response (fixes a startup leak).
+---
+ src/agent/root.zig           | 245 +++++++++++++++++-
+ src/providers/anthropic.zig  |   8 +
+ src/providers/compatible.zig |  27 ++
+ src/providers/openai.zig     |  13 +
+ src/providers/reliable.zig   |  20 ++
+ src/providers/root.zig       |  91 +++++++
+ src/providers/router.zig     |  20 ++
+ src/providers/sse.zig        | 477 ++++++++++++++++++++++++++++++++---
+ src/session.zig              |  39 ++-
+ 9 files changed, 899 insertions(+), 41 deletions(-)
+
+diff --git a/src/agent/root.zig b/src/agent/root.zig
+index f4dc6b4..c63f5a1 100644
+--- a/src/agent/root.zig
++++ b/src/agent/root.zig
+@@ -2011,7 +2011,13 @@ pub const Agent = struct {
+             defer prompt_tools_arena.deinit();
+             const prompt_tools = try self.filterToolsForPromptText(prompt_tools_arena.allocator());
+             const prompt_is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
+-            const prompt_native_tools_enabled = !prompt_is_streaming and self.provider.supportsNativeTools();
++            // Ask about the model this turn will actually use, not the
++            // configured default: a router or failover wrapper can route the
++            // request to a provider that cannot recover native tool calls.
++            const prompt_native_tools_enabled = if (prompt_is_streaming)
++                self.provider.supportsStreamingNativeToolsForModel(turn_model_name)
++            else
++                self.provider.supportsNativeTools();
+ 
+             const capabilities_section = capabilities_mod.buildPromptSection(
+                 self.allocator,
+@@ -2189,7 +2195,10 @@ pub const Agent = struct {
+ 
+             const timer_start = std_compat.time.milliTimestamp();
+             const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
+-            const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
++            const native_tools_enabled = if (is_streaming)
++                self.provider.supportsStreamingNativeToolsForModel(turn_model_name)
++            else
++                self.provider.supportsNativeTools();
+             const include_reasoning = self.reasoning_mode != .off;
+ 
+             // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
+@@ -2205,7 +2214,7 @@ pub const Agent = struct {
+                 turn_max_tokens,
+             );
+ 
+-            // Call provider: streaming (no retries, no native tools) or blocking with retry
++            // Call provider: streaming (native tools only when parser-supported) or blocking with retry
+             var response: ChatResponse = undefined;
+             var response_attempt: u32 = 1;
+             providers.clearLastApiErrorDetail();
+@@ -2220,7 +2229,7 @@ pub const Agent = struct {
+                         .model = turn_model_name,
+                         .temperature = self.temperature,
+                         .max_tokens = request_max_tokens,
+-                        .tools = null,
++                        .tools = if (native_tools_enabled) turn_tool_specs else null,
+                         .timeout_secs = self.message_timeout_secs,
+                         .reasoning_effort = self.reasoning_effort,
+                         .include_reasoning = include_reasoning,
+@@ -2257,7 +2266,7 @@ pub const Agent = struct {
+                                 .model = turn_model_name,
+                                 .temperature = self.temperature,
+                                 .max_tokens = retry_max_tokens,
+-                                .tools = null,
++                                .tools = if (native_tools_enabled) turn_tool_specs else null,
+                                 .timeout_secs = self.message_timeout_secs,
+                                 .reasoning_effort = self.reasoning_effort,
+                                 .include_reasoning = include_reasoning,
+@@ -2280,7 +2289,7 @@ pub const Agent = struct {
+                 response = ChatResponse{
+                     .content = stream_result.content,
+                     .reasoning_content = stream_result.reasoning_content,
+-                    .tool_calls = &.{},
++                    .tool_calls = stream_result.tool_calls,
+                     .usage = stream_result.usage,
+                     .model = stream_result.model,
+                 };
+@@ -11009,6 +11018,230 @@ test "Agent system prompt keeps parameters when streaming disables native tool s
+     try std.testing.expect(std.mem.indexOf(u8, captured, "mcp_secret_lookup") == null);
+ }
+ 
++test "Agent system prompt omits parameters when streaming native tools are supported" {
++    const StreamingNativeToolCapture = struct {
++        captured_system: ?[]u8 = null,
++        saw_tools: bool = false,
++        capture_alloc: std.mem.Allocator,
++
++        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return allocator_.dupe(u8, "ok");
++        }
++
++        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++            return error.ShouldNotUseBlockingChat;
++        }
++
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++
++        fn supportsStreaming(_: *anyopaque) bool {
++            return true;
++        }
++
++        fn supportsStreamingNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++
++        fn streamChat(
++            ptr: *anyopaque,
++            allocator_: std.mem.Allocator,
++            request: providers.ChatRequest,
++            model: []const u8,
++            _: f64,
++            callback: providers.StreamCallback,
++            callback_ctx: *anyopaque,
++        ) anyerror!providers.StreamChatResult {
++            try std.testing.expect(request.tools != null);
++            const self: *@This() = @ptrCast(@alignCast(ptr));
++            self.saw_tools = request.tools.?.len > 0;
++            for (request.messages) |msg| {
++                if (msg.role == .system) {
++                    if (self.captured_system) |old| self.capture_alloc.free(old);
++                    self.captured_system = try self.capture_alloc.dupe(u8, msg.content);
++                    break;
++                }
++            }
++            callback(callback_ctx, providers.StreamChunk.textDelta("ok"));
++            callback(callback_ctx, providers.StreamChunk.finalChunk());
++            return .{
++                .content = try allocator_.dupe(u8, "ok"),
++                .model = try allocator_.dupe(u8, model),
++            };
++        }
++
++        fn getName(_: *anyopaque) []const u8 {
++            return "streaming-native-tool-capture";
++        }
++
++        fn deinitFn(_: *anyopaque) void {}
++    };
++
++    const allocator = std.testing.allocator;
++    var provider_state = StreamingNativeToolCapture{ .capture_alloc = allocator };
++    defer if (provider_state.captured_system) |captured| allocator.free(captured);
++    const provider_vtable = Provider.VTable{
++        .chatWithSystem = StreamingNativeToolCapture.chatWithSystem,
++        .chat = StreamingNativeToolCapture.chat,
++        .supportsNativeTools = StreamingNativeToolCapture.supportsNativeTools,
++        .getName = StreamingNativeToolCapture.getName,
++        .deinit = StreamingNativeToolCapture.deinitFn,
++        .supports_streaming = StreamingNativeToolCapture.supportsStreaming,
++        .supports_streaming_native_tools = StreamingNativeToolCapture.supportsStreamingNativeTools,
++        .stream_chat = StreamingNativeToolCapture.streamChat,
++    };
++    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    const runtime_tools = [_]Tool{
++        try makeMockFilterTool(allocator, "shell"),
++        try makeMockFilterTool(allocator, "mcp_secret_lookup"),
++    };
++    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
++
++    var cfg = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "openai/gpt-4.1-mini",
++        .allocator = allocator,
++    };
++    var noop = observability.NoopObserver{};
++    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
++    defer agent.deinit();
++    agent.tool_filter_groups = &.{
++        .{ .mode = .dynamic, .tools = &.{"mcp_secret_*"}, .keywords = &.{"secret"} },
++    };
++
++    const StreamSink = struct {
++        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
++    };
++    var stream_ctx: u8 = 0;
++    agent.stream_callback = StreamSink.onChunk;
++    agent.stream_ctx = @ptrCast(&stream_ctx);
++
++    const response = try agent.turn("hello");
++    defer allocator.free(response);
++
++    try std.testing.expect(provider_state.saw_tools);
++    try std.testing.expect(provider_state.captured_system != null);
++    const captured = provider_state.captured_system.?;
++    try std.testing.expect(std.mem.indexOf(u8, captured, "**shell**: shell") != null);
++    try std.testing.expect(std.mem.indexOf(u8, captured, "Parameters: `{}`") == null);
++    try std.testing.expect(std.mem.indexOf(u8, captured, "mcp_secret_lookup") == null);
++}
++
++test "Agent executes native tool calls returned from streaming provider" {
++    const StreamingToolCallProvider = struct {
++        calls: usize = 0,
++
++        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return allocator_.dupe(u8, "ok");
++        }
++
++        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++            return error.ShouldNotUseBlockingChat;
++        }
++
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++
++        fn supportsStreaming(_: *anyopaque) bool {
++            return true;
++        }
++
++        fn supportsStreamingNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++
++        fn streamChat(
++            ptr: *anyopaque,
++            allocator_: std.mem.Allocator,
++            request: providers.ChatRequest,
++            model: []const u8,
++            _: f64,
++            callback: providers.StreamCallback,
++            callback_ctx: *anyopaque,
++        ) anyerror!providers.StreamChatResult {
++            try std.testing.expect(request.tools != null);
++            const self: *@This() = @ptrCast(@alignCast(ptr));
++            self.calls += 1;
++
++            if (self.calls == 1) {
++                const tool_calls = try allocator_.alloc(providers.ToolCall, 1);
++                tool_calls[0] = .{
++                    .id = try allocator_.dupe(u8, "call_stream_shell"),
++                    .name = try allocator_.dupe(u8, "shell"),
++                    .arguments = try allocator_.dupe(u8, "{}"),
++                };
++                callback(callback_ctx, providers.StreamChunk.textDelta("calling shell"));
++                callback(callback_ctx, providers.StreamChunk.finalChunk());
++                return .{
++                    .content = try allocator_.dupe(u8, "calling shell"),
++                    .tool_calls = tool_calls,
++                    .model = try allocator_.dupe(u8, model),
++                };
++            }
++
++            callback(callback_ctx, providers.StreamChunk.textDelta("done"));
++            callback(callback_ctx, providers.StreamChunk.finalChunk());
++            return .{
++                .content = try allocator_.dupe(u8, "done"),
++                .model = try allocator_.dupe(u8, model),
++            };
++        }
++
++        fn getName(_: *anyopaque) []const u8 {
++            return "streaming-tool-call-provider";
++        }
++
++        fn deinitFn(_: *anyopaque) void {}
++    };
++
++    const allocator = std.testing.allocator;
++    var provider_state = StreamingToolCallProvider{};
++    const provider_vtable = Provider.VTable{
++        .chatWithSystem = StreamingToolCallProvider.chatWithSystem,
++        .chat = StreamingToolCallProvider.chat,
++        .supportsNativeTools = StreamingToolCallProvider.supportsNativeTools,
++        .getName = StreamingToolCallProvider.getName,
++        .deinit = StreamingToolCallProvider.deinitFn,
++        .supports_streaming = StreamingToolCallProvider.supportsStreaming,
++        .supports_streaming_native_tools = StreamingToolCallProvider.supportsStreamingNativeTools,
++        .stream_chat = StreamingToolCallProvider.streamChat,
++    };
++    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    const runtime_tools = [_]Tool{
++        try makeMockFilterTool(allocator, "shell"),
++    };
++    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
++
++    var cfg = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "openai/gpt-4.1-mini",
++        .allocator = allocator,
++    };
++    cfg.agent.max_tool_iterations = 2;
++    var noop = observability.NoopObserver{};
++    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
++    defer agent.deinit();
++
++    const StreamSink = struct {
++        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
++    };
++    var stream_ctx: u8 = 0;
++    agent.stream_callback = StreamSink.onChunk;
++    agent.stream_ctx = @ptrCast(&stream_ctx);
++
++    const response = try agent.turn("call shell");
++    defer allocator.free(response);
++
++    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
++    try std.testing.expectEqualStrings("done", response);
++}
++
+ test "buildProviderMessagesForTurn adds priority hint without mutating history" {
+     // Regression: priority hints must not be persisted as user text in history/memory/cache.
+     const allocator = std.testing.allocator;
+diff --git a/src/providers/anthropic.zig b/src/providers/anthropic.zig
+index 8c15c59..90ade57 100644
+--- a/src/providers/anthropic.zig
++++ b/src/providers/anthropic.zig
+@@ -1174,6 +1174,14 @@ test "supportsStreamingImpl returns true" {
+     try std.testing.expect(prov.supportsStreaming());
+ }
+ 
++test "supportsStreamingNativeTools returns false until input_json_delta is parsed" {
++    var p = AnthropicProvider.init(std.testing.allocator, "key", null);
++    const prov = p.provider();
++    try std.testing.expect(prov.supportsNativeTools());
++    try std.testing.expect(prov.supportsStreaming());
++    try std.testing.expect(!prov.supportsStreamingNativeTools());
++}
++
+ test "vtable stream_chat is not null" {
+     try std.testing.expect(AnthropicProvider.vtable.stream_chat != null);
+ }
+diff --git a/src/providers/compatible.zig b/src/providers/compatible.zig
+index dd7a134..f3571c1 100644
+--- a/src/providers/compatible.zig
++++ b/src/providers/compatible.zig
+@@ -1144,6 +1144,7 @@ pub const OpenAiCompatibleProvider = struct {
+         .deinit = deinitImpl,
+         .stream_chat = streamChatImpl,
+         .supports_streaming = supportsStreamingImpl,
++        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
+     };
+ 
+     fn buildSingleTurnMessages(
+@@ -1303,6 +1304,11 @@ pub const OpenAiCompatibleProvider = struct {
+         return !self.disable_streaming and self.api_mode != .responses;
+     }
+ 
++    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque) bool {
++        const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
++        return self.native_tools and supportsStreamingImpl(ptr);
++    }
++
+     fn chatWithSystemImpl(
+         ptr: *anyopaque,
+         allocator: std.mem.Allocator,
+@@ -2281,6 +2287,27 @@ test "supportsNativeTools returns true for compatible" {
+     try std.testing.expect(prov.supportsNativeTools());
+ }
+ 
++test "supportsStreamingNativeTools follows native tools and streaming" {
++    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
++    var prov = p.provider();
++    try std.testing.expect(prov.supportsNativeTools());
++    try std.testing.expect(prov.supportsStreaming());
++    try std.testing.expect(prov.supportsStreamingNativeTools());
++
++    p.native_tools = false;
++    prov = p.provider();
++    try std.testing.expect(!prov.supportsNativeTools());
++    try std.testing.expect(prov.supportsStreaming());
++    try std.testing.expect(!prov.supportsStreamingNativeTools());
++
++    p.native_tools = true;
++    p.disable_streaming = true;
++    prov = p.provider();
++    try std.testing.expect(prov.supportsNativeTools());
++    try std.testing.expect(!prov.supportsStreaming());
++    try std.testing.expect(!prov.supportsStreamingNativeTools());
++}
++
+ test "capNonStreamingMaxTokens caps request max_tokens above provider limit" {
+     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+     const req = root.ChatRequest{ .messages = &msgs, .model = "test-model", .max_tokens = 8000 };
+diff --git a/src/providers/openai.zig b/src/providers/openai.zig
+index 2d995b4..39c96ed 100644
+--- a/src/providers/openai.zig
++++ b/src/providers/openai.zig
+@@ -217,6 +217,7 @@ pub const OpenAiProvider = struct {
+         .deinit = deinitImpl,
+         .stream_chat = streamChatImpl,
+         .supports_streaming = supportsStreamingImpl,
++        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
+     };
+ 
+     fn streamChatImpl(
+@@ -262,6 +263,10 @@ pub const OpenAiProvider = struct {
+         return true;
+     }
+ 
++    fn supportsStreamingNativeToolsImpl(_: *anyopaque) bool {
++        return true;
++    }
++
+     fn chatWithSystemImpl(
+         ptr: *anyopaque,
+         allocator: std.mem.Allocator,
+@@ -530,6 +535,14 @@ test "supportsNativeTools returns true" {
+     try std.testing.expect(prov.supportsNativeTools());
+ }
+ 
++test "supportsStreamingNativeTools returns true" {
++    var p = OpenAiProvider.init(std.testing.allocator, "key", null, null);
++    const prov = p.provider();
++    try std.testing.expect(prov.supportsStreaming());
++    try std.testing.expect(prov.supportsNativeTools());
++    try std.testing.expect(prov.supportsStreamingNativeTools());
++}
++
+ test "parseTextResponse multiple choices returns first" {
+     const body =
+         \\{"choices":[{"message":{"content":"A"}},{"message":{"content":"B"}}]}
+diff --git a/src/providers/reliable.zig b/src/providers/reliable.zig
+index be2bb56..ed38bf9 100644
+--- a/src/providers/reliable.zig
++++ b/src/providers/reliable.zig
+@@ -369,6 +369,8 @@ pub const ReliableProvider = struct {
+         .supports_vision = supportsVisionImpl,
+         .supports_vision_for_model = supportsVisionForModelImpl,
+         .supports_streaming = supportsStreamingImpl,
++        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
++        .supports_streaming_native_tools_for_model = supportsStreamingNativeToolsForModelImpl,
+         .stream_chat = streamChatImpl,
+         .getName = getNameImpl,
+         .deinit = deinitImpl,
+@@ -606,6 +608,24 @@ pub const ReliableProvider = struct {
+         return false;
+     }
+ 
++    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque) bool {
++        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
++        return self.inner.supportsStreamingNativeTools();
++    }
++
++    /// Mirrors the provider selection in streamChatImpl. An explicit target is
++    /// served by that provider, not by `inner`, so answering from `inner` alone
++    /// enabled native schemas for a call that would be routed elsewhere. For
++    /// the non-explicit case streamChatImpl uses `inner` (vision selection needs
++    /// the request, which is not available here), so `inner` is the right
++    /// answer.
++    fn supportsStreamingNativeToolsForModelImpl(ptr: *anyopaque, model: []const u8) bool {
++        const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
++        const target = self.resolveProviderTarget(model);
++        if (target.explicit) return target.provider.supportsStreamingNativeTools();
++        return self.inner.supportsStreamingNativeTools();
++    }
++
+     fn streamChatImpl(
+         ptr: *anyopaque,
+         allocator: std.mem.Allocator,
+diff --git a/src/providers/root.zig b/src/providers/root.zig
+index 6386ac9..9d6cd32 100644
+--- a/src/providers/root.zig
++++ b/src/providers/root.zig
+@@ -272,6 +272,7 @@ pub const StreamCallback = *const fn (ctx: *anyopaque, chunk: StreamChunk) void;
+ pub const StreamChatResult = struct {
+     content: ?[]const u8 = null,
+     reasoning_content: ?[]const u8 = null,
++    tool_calls: []const ToolCall = &.{},
+     usage: TokenUsage = .{},
+     model: []const u8 = "",
+ };
+@@ -280,6 +281,28 @@ pub fn shouldRecoverPartialStream(accumulated_len: usize, saw_done: bool) bool {
+     return saw_done or accumulated_len > 0;
+ }
+ 
++/// Free every owned field of a `ChatResponse` and reset it. Use this when the
++/// whole response is being discarded (capability probes, throw-away calls).
++/// Contrast with `freeStreamUnusedChatResponseFields`, which deliberately
++/// leaves `content` and `model` for the streaming caller to keep.
++pub fn freeChatResponse(allocator: std.mem.Allocator, response: *ChatResponse) void {
++    if (response.content) |content| {
++        if (content.len > 0) allocator.free(content);
++    }
++    for (response.tool_calls) |tc| {
++        if (tc.id.len > 0) allocator.free(tc.id);
++        if (tc.name.len > 0) allocator.free(tc.name);
++        if (tc.arguments.len > 0) allocator.free(tc.arguments);
++    }
++    if (response.tool_calls.len > 0) allocator.free(response.tool_calls);
++    if (response.provider.len > 0) allocator.free(response.provider);
++    if (response.model.len > 0) allocator.free(response.model);
++    if (response.reasoning_content) |rc| {
++        if (rc.len > 0) allocator.free(rc);
++    }
++    response.* = .{};
++}
++
+ pub fn freeStreamUnusedChatResponseFields(allocator: std.mem.Allocator, response: *ChatResponse) void {
+     for (response.tool_calls) |tc| {
+         if (tc.id.len > 0) allocator.free(tc.id);
+@@ -304,6 +327,8 @@ pub fn emitChatResponseAsStream(
+ ) StreamChatResult {
+     const reasoning_content = response.reasoning_content;
+     response.reasoning_content = null;
++    const tool_calls = response.tool_calls;
++    response.tool_calls = &.{};
+     if (response.content) |content| {
+         if (content.len > 0) {
+             callback(callback_ctx, StreamChunk.textDelta(content));
+@@ -314,6 +339,7 @@ pub fn emitChatResponseAsStream(
+     return .{
+         .content = response.content,
+         .reasoning_content = reasoning_content,
++        .tool_calls = tool_calls,
+         .usage = response.usage,
+         .model = response.model,
+     };
+@@ -409,6 +435,12 @@ pub const Provider = struct {
+         chat_with_tools: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, req: ChatRequest) anyerror!ChatResponse = null,
+         /// Optional: returns true if provider supports streaming. Default: false.
+         supports_streaming: ?*const fn (ptr: *anyopaque) bool = null,
++        /// Optional: returns true if streaming responses can return native tool calls.
++        supports_streaming_native_tools: ?*const fn (ptr: *anyopaque) bool = null,
++        /// Model-aware variant. A router or failover wrapper resolves the
++        /// request to a different provider than its default, so the boolean
++        /// answer is not the same as the one for the requested model.
++        supports_streaming_native_tools_for_model: ?*const fn (ptr: *anyopaque, model: []const u8) bool = null,
+         /// Optional: returns true if provider supports vision/image input. Default: false.
+         supports_vision: ?*const fn (ptr: *anyopaque) bool = null,
+         /// Optional: returns true if provider supports vision for a specific model.
+@@ -470,6 +502,12 @@ pub const Provider = struct {
+         return false;
+     }
+ 
++    /// Returns true if provider can parse native tool calls from streaming responses.
++    pub fn supportsStreamingNativeTools(self: Provider) bool {
++        if (self.vtable.supports_streaming_native_tools) |f| return f(self.ptr);
++        return false;
++    }
++
+     /// Returns true if provider supports vision/image input.
+     pub fn supportsVision(self: Provider) bool {
+         if (self.vtable.supports_vision) |f| return f(self.ptr);
+@@ -482,6 +520,15 @@ pub const Provider = struct {
+         return self.supportsVision();
+     }
+ 
++    /// Returns true if streaming native tools are supported for a specific model.
++    /// Falls back to the model-independent answer, mirroring
++    /// supportsVisionForModel.
++    pub fn supportsStreamingNativeToolsForModel(self: Provider, model: []const u8) bool {
++        if (self.vtable.supports_streaming_native_tools_for_model) |f| return f(self.ptr, model);
++        if (self.vtable.supports_streaming_native_tools) |f| return f(self.ptr);
++        return false;
++    }
++
+     /// Chat with native tool support. Falls back to regular chat() if not implemented.
+     pub fn chatWithTools(self: Provider, allocator: std.mem.Allocator, req: ChatRequest) !ChatResponse {
+         if (self.vtable.chat_with_tools) |f| return f(self.ptr, allocator, req);
+@@ -516,6 +563,8 @@ pub fn assertProviderInterface(comptime T: type) void {
+     _ = vt.chat;
+     _ = vt.supportsNativeTools;
+     _ = vt.supports_vision;
++    _ = vt.supports_streaming_native_tools;
++    _ = vt.supports_streaming_native_tools_for_model;
+     _ = vt.getName;
+     _ = vt.deinit;
+ }
+@@ -646,6 +695,35 @@ test "provider supportsStreaming returns false when vtable is null" {
+     try std.testing.expect(!provider.supportsStreaming());
+ }
+ 
++test "provider supportsStreamingNativeTools returns false when vtable is null" {
++    const DummyProvider = struct {
++        fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return "";
++        }
++        fn chat(_: *anyopaque, _: std.mem.Allocator, _: ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
++            return .{};
++        }
++        fn supNativeTools(_: *anyopaque) bool {
++            return true;
++        }
++        fn getName(_: *anyopaque) []const u8 {
++            return "dummy";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++    var dummy: u8 = 0;
++    const vtable = Provider.VTable{
++        .chatWithSystem = DummyProvider.chatWithSystem,
++        .chat = DummyProvider.chat,
++        .supportsNativeTools = DummyProvider.supNativeTools,
++        .getName = DummyProvider.getName,
++        .deinit = DummyProvider.deinitFn,
++    };
++    const provider = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
++    try std.testing.expect(provider.supportsNativeTools());
++    try std.testing.expect(!provider.supportsStreamingNativeTools());
++}
++
+ test "provider supportsVision returns false when vtable supports_vision is null" {
+     const DummyProvider = struct {
+         fn chatWithSystem(_: *anyopaque, _: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+@@ -820,6 +898,7 @@ test "ChatResponse reasoning_content can be set" {
+ test "StreamChatResult defaults" {
+     const result = StreamChatResult{};
+     try std.testing.expect(result.content == null);
++    try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
+     try std.testing.expect(result.usage.prompt_tokens == 0);
+     try std.testing.expect(result.usage.completion_tokens == 0);
+     try std.testing.expectEqualStrings("", result.model);
+@@ -893,6 +972,14 @@ test "emitChatResponseAsStream frees unused chat response fields" {
+     defer if (result.content) |content| allocator.free(content);
+     defer if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+     defer if (result.model.len > 0) allocator.free(result.model);
++    defer {
++        for (result.tool_calls) |tc| {
++            allocator.free(tc.id);
++            allocator.free(tc.name);
++            allocator.free(tc.arguments);
++        }
++        allocator.free(result.tool_calls);
++    }
+ 
+     try std.testing.expectEqual(@as(usize, 1), ctx.text_count);
+     try std.testing.expect(ctx.saw_final);
+@@ -902,6 +989,10 @@ test "emitChatResponseAsStream frees unused chat response fields" {
+     try std.testing.expectEqualStrings("hello", result.content.?);
+     try std.testing.expectEqualStrings("private reasoning", result.reasoning_content.?);
+     try std.testing.expectEqualStrings("test-model", result.model);
++    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
++    try std.testing.expectEqualStrings("tool-1", result.tool_calls[0].id);
++    try std.testing.expectEqualStrings("read_file", result.tool_calls[0].name);
++    try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", result.tool_calls[0].arguments);
+ }
+ 
+ test "Provider.streamChat fallback emits single chunk and final" {
+diff --git a/src/providers/router.zig b/src/providers/router.zig
+index 4f4da37..9d1f22b 100644
+--- a/src/providers/router.zig
++++ b/src/providers/router.zig
+@@ -158,6 +158,8 @@ pub const RouterProvider = struct {
+         .supports_vision = supportsVisionImpl,
+         .supports_vision_for_model = supportsVisionForModelImpl,
+         .supports_streaming = supportsStreamingImpl,
++        .supports_streaming_native_tools = supportsStreamingNativeToolsImpl,
++        .supports_streaming_native_tools_for_model = supportsStreamingNativeToolsForModelImpl,
+         .stream_chat = streamChatImpl,
+         .getName = getNameImpl,
+         .deinit = deinitImpl,
+@@ -246,6 +248,24 @@ pub const RouterProvider = struct {
+         return self.providers[provider_idx].supportsStreaming();
+     }
+ 
++    fn supportsStreamingNativeToolsForModelImpl(ptr: *anyopaque, model: []const u8) bool {
++        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
++        // Resolve the model the request will actually use. streamChatImpl
++        // resolves the requested model, so consulting default_model here could
++        // enable native schemas for an OpenAI default while the call is routed
++        // to an Anthropic implementation that cannot recover native calls.
++        if (model.len == 0) return supportsStreamingNativeToolsImpl(ptr);
++        const resolved = self.resolve(model);
++        const provider_idx = resolved[0];
++        if (provider_idx >= self.providers.len) return false;
++        return self.providers[provider_idx].supportsStreamingNativeTools();
++    }
++
++    fn supportsStreamingNativeToolsImpl(ptr: *anyopaque) bool {
++        const self: *RouterProvider = @ptrCast(@alignCast(ptr));
++        return supportsStreamingNativeToolsForModelImpl(ptr, self.default_model);
++    }
++
+     fn streamChatImpl(
+         ptr: *anyopaque,
+         allocator: std.mem.Allocator,
+diff --git a/src/providers/sse.zig b/src/providers/sse.zig
+index 87e4cd1..ba0cb1f 100644
+--- a/src/providers/sse.zig
++++ b/src/providers/sse.zig
+@@ -41,6 +41,210 @@ fn finalizeStreamResult(
+     };
+ }
+ 
++const ToolCallSlot = struct {
++    index: usize,
++    id: ?[]u8 = null,
++    name: ?[]u8 = null,
++    arguments: std.ArrayListUnmanaged(u8) = .empty,
++    /// Set when an `arguments` key was seen, even when its value was the empty
++    /// string. Without this, "no argument deltas arrived" is indistinguishable
++    /// from "the call legitimately takes no arguments", and the former used to
++    /// be completed by substituting `{}` -- turning a truncated stream into an
++    /// executable call.
++    saw_arguments: bool = false,
++
++    fn isComplete(self: *const ToolCallSlot) bool {
++        return self.saw_arguments and self.name != null and self.name.?.len > 0;
++    }
++
++    fn deinit(self: *ToolCallSlot, allocator: std.mem.Allocator) void {
++        if (self.id) |id| allocator.free(id);
++        if (self.name) |name| allocator.free(name);
++        self.arguments.deinit(allocator);
++        self.* = .{ .index = self.index };
++    }
++};
++
++const ToolCallAccumulator = struct {
++    slots: std.ArrayListUnmanaged(ToolCallSlot) = .empty,
++
++    fn deinit(self: *ToolCallAccumulator, allocator: std.mem.Allocator) void {
++        for (self.slots.items) |*slot| {
++            slot.deinit(allocator);
++        }
++        self.slots.deinit(allocator);
++        self.* = .{};
++    }
++
++    fn ensureSlot(self: *ToolCallAccumulator, allocator: std.mem.Allocator, index: usize) !*ToolCallSlot {
++        for (self.slots.items) |*slot| {
++            if (slot.index == index) return slot;
++        }
++        try self.slots.append(allocator, .{ .index = index });
++        return &self.slots.items[self.slots.items.len - 1];
++    }
++
++    fn sortSlotsByIndex(self: *ToolCallAccumulator) void {
++        var i: usize = 1;
++        while (i < self.slots.items.len) : (i += 1) {
++            var j = i;
++            while (j > 0 and self.slots.items[j - 1].index > self.slots.items[j].index) : (j -= 1) {
++                std.mem.swap(ToolCallSlot, &self.slots.items[j - 1], &self.slots.items[j]);
++            }
++        }
++    }
++
++    fn appendFromJsonPayload(self: *ToolCallAccumulator, allocator: std.mem.Allocator, json_str: []const u8) !void {
++        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch return;
++        defer parsed.deinit();
++
++        if (parsed.value != .object) return;
++        const choices = parsed.value.object.get("choices") orelse return;
++        if (choices != .array) return;
++
++        // Text is taken from choices[0] (see the text path below), so the
++        // accumulator must read the same choice. Visiting every choice keyed
++        // slots only by tool-call index merged two choices' index-0 calls:
++        // argument strings were concatenated into `{"path":"a"}{"path":"b"}`,
++        // combining one choice's id with another choice's function name.
++        if (choices.array.items.len == 0) return;
++        const choice = choices.array.items[0];
++        if (choice != .object) return;
++        const delta = choice.object.get("delta") orelse return;
++        if (delta != .object) return;
++        const tool_calls = delta.object.get("tool_calls") orelse return;
++        if (tool_calls != .array) return;
++
++        for (tool_calls.array.items, 0..) |tool_call, fallback_index| {
++            if (tool_call != .object) continue;
++            const index = if (tool_call.object.get("index")) |idx|
++                switch (idx) {
++                    .integer => |n| @as(usize, @intCast(@max(0, n))),
++                    else => fallback_index,
++                }
++            else
++                fallback_index;
++
++            const slot = try self.ensureSlot(allocator, index);
++
++            if (tool_call.object.get("id")) |id_val| {
++                if (id_val == .string and id_val.string.len > 0 and slot.id == null) {
++                    slot.id = try allocator.dupe(u8, id_val.string);
++                }
++            }
++
++            const function = tool_call.object.get("function") orelse continue;
++            if (function != .object) continue;
++
++            if (function.object.get("name")) |name_val| {
++                if (name_val == .string and name_val.string.len > 0) {
++                    // Duplicate first, then release the old value: freeing
++                    // before the fallible dupe left the slot pointing at
++                    // released storage when the allocation failed, and the
++                    // deferred cleanup then freed it again.
++                    const replacement = try allocator.dupe(u8, name_val.string);
++                    if (slot.name) |old| allocator.free(old);
++                    slot.name = replacement;
++                }
++            }
++
++            if (function.object.get("arguments")) |args_val| {
++                if (args_val == .string) {
++                    slot.saw_arguments = true;
++                    if (args_val.string.len > 0) {
++                        try slot.arguments.appendSlice(allocator, args_val.string);
++                    }
++                }
++            }
++        }
++    }
++
++    fn toOwnedToolCalls(self: *ToolCallAccumulator, allocator: std.mem.Allocator) ![]const root.ToolCall {
++        self.sortSlotsByIndex();
++
++        // A call is usable only when its name arrived *and* its argument
++        // deltas did. A name without arguments means the stream was cut
++        // mid-call, and executing that would run a tool with invented input.
++        var valid_count: usize = 0;
++        for (self.slots.items) |slot| {
++            if (!slot.isComplete()) continue;
++            if (slot.name) |name| {
++                if (name.len > 0) valid_count += 1;
++            }
++        }
++        if (valid_count == 0) return &.{};
++
++        var calls = try allocator.alloc(root.ToolCall, valid_count);
++        var out_i: usize = 0;
++        errdefer {
++            for (calls[0..out_i]) |tc| {
++                allocator.free(tc.id);
++                allocator.free(tc.name);
++                allocator.free(tc.arguments);
++            }
++            allocator.free(calls);
++        }
++
++        for (self.slots.items) |slot| {
++            if (!slot.isComplete()) continue;
++            const name = slot.name orelse continue;
++            if (name.len == 0) continue;
++
++            calls[out_i] = blk: {
++                const id = if (slot.id) |id_value|
++                    try allocator.dupe(u8, id_value)
++                else
++                    try std.fmt.allocPrint(allocator, "call_{d}", .{slot.index});
++                errdefer allocator.free(id);
++
++                const owned_name = try allocator.dupe(u8, name);
++                errdefer allocator.free(owned_name);
++
++                const arguments = try allocator.dupe(u8, slot.arguments.items);
++                errdefer allocator.free(arguments);
++
++                break :blk .{
++                    .id = id,
++                    .name = owned_name,
++                    .arguments = arguments,
++                };
++            };
++            out_i += 1;
++        }
++
++        return calls;
++    }
++};
++
++fn finalizeStreamResultWithToolCalls(
++    allocator: std.mem.Allocator,
++    accumulated: []const u8,
++    stream_usage: ?root.TokenUsage,
++    tool_call_accumulator: *ToolCallAccumulator,
++    /// Whether the stream ran to a clean completion. Recovery paths (curl
++    /// timeout, nonzero exit, read error) pass false: the text they salvage is
++    /// worth keeping, but a tool call cut mid-flight must never be executed.
++    tool_calls_trusted: bool,
++) !root.StreamChatResult {
++    var result = try finalizeStreamResult(allocator, accumulated, stream_usage);
++    errdefer {
++        if (result.content) |content| allocator.free(content);
++        if (result.reasoning_content) |reasoning| allocator.free(reasoning);
++        if (result.model.len > 0) allocator.free(result.model);
++        for (result.tool_calls) |tc| {
++            allocator.free(tc.id);
++            allocator.free(tc.name);
++            allocator.free(tc.arguments);
++        }
++        if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
++    }
++
++    if (tool_calls_trusted) {
++        result.tool_calls = try tool_call_accumulator.toOwnedToolCalls(allocator);
++    }
++    return result;
++}
++
+ fn parseCurlVersionComponent(component: []const u8) ?u32 {
+     var end: usize = 0;
+     while (end < component.len and std.ascii.isDigit(component[end])) : (end += 1) {}
+@@ -183,20 +387,7 @@ fn appendDeltaContent(
+ /// - `data: {JSON}` → extracts `choices[0].delta.content` → `.delta`
+ /// - Empty lines, comments (`:`) → `.skip`
+ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResult {
+-    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
+-
+-    if (trimmed.len == 0) return .skip;
+-    if (trimmed[0] == ':') return .skip;
+-
+-    // SSE uses "data:" with an optional single leading space before the value.
+-    const prefix = "data:";
+-    if (!std.mem.startsWith(u8, trimmed, prefix)) return .skip;
+-
+-    const data = if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ')
+-        trimmed[prefix.len + 1 ..]
+-    else
+-        trimmed[prefix.len..];
+-
++    const data = extractSseDataPayload(line) orelse return .skip;
+     if (data.len == 0) return .skip;
+ 
+     if (std.mem.eql(u8, data, "[DONE]")) return .done;
+@@ -209,6 +400,32 @@ pub fn parseSseLine(allocator: std.mem.Allocator, line: []const u8) !SseLineResu
+     return .{ .delta = content };
+ }
+ 
++fn extractSseDataPayload(line: []const u8) ?[]const u8 {
++    const trimmed = std_compat.mem.trimRight(u8, line, "\r");
++
++    if (trimmed.len == 0) return null;
++    if (trimmed[0] == ':') return null;
++
++    // SSE uses "data:" with an optional single leading space before the value.
++    const prefix = "data:";
++    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
++
++    return if (trimmed.len > prefix.len and trimmed[prefix.len] == ' ')
++        trimmed[prefix.len + 1 ..]
++    else
++        trimmed[prefix.len..];
++}
++
++fn accumulateToolCallsFromSseLine(
++    accumulator: *ToolCallAccumulator,
++    allocator: std.mem.Allocator,
++    line: []const u8,
++) !void {
++    const data = extractSseDataPayload(line) orelse return;
++    if (std.mem.eql(u8, data, "[DONE]")) return;
++    try accumulator.appendFromJsonPayload(allocator, data);
++}
++
+ /// Extract `usage` object from an OpenAI-compatible streaming chunk.
+ /// The final chunk typically has `choices:[]` and a top-level `usage` object.
+ /// OpenAI usage chunks may contain nested objects (prompt_tokens_details,
+@@ -416,7 +633,7 @@ pub fn curlStream(
+     argc += 1;
+ 
+     if (log_enabled) {
+-        debug_log.info("curl argc={d}, body_len={d}, header_file={}", .{ argc, body.len, prepared_headers.uses_temp_file });
++        debug_log.debug("curl argc={d}, body_len={d}, header_file={}", .{ argc, body.len, prepared_headers.uses_temp_file });
+     }
+ 
+     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
+@@ -425,12 +642,12 @@ pub fn curlStream(
+     child.stderr_behavior = .Ignore;
+ 
+     if (log_enabled) {
+-        debug_log.info("spawning curl process...", .{});
++        debug_log.debug("spawning curl process...", .{});
+     }
+     try child.spawn();
+     if (log_enabled) {
+         const pid: i64 = if (@import("builtin").os.tag == .windows) @intCast(@intFromPtr(child.id)) else child.id;
+-        debug_log.info("curl process spawned, pid={d}", .{pid});
++        debug_log.debug("curl process spawned, pid={d}", .{pid});
+     }
+ 
+     if (child.stdin) |stdin_file| {
+@@ -462,30 +679,32 @@ pub fn curlStream(
+     var total_stdout: usize = 0;
+     var stream_usage: ?root.TokenUsage = null;
+     var in_reasoning = false;
++    var tool_call_accumulator = ToolCallAccumulator{};
++    defer tool_call_accumulator.deinit(allocator);
+ 
+     outer: while (true) {
+         const n = stdout_file.read(&read_buf) catch |err| {
+             if (log_enabled) {
+-                debug_log.info("stdout read error: {}", .{err});
++                debug_log.debug("stdout read error: {}", .{err});
+             }
+             break;
+         };
+         if (n == 0) {
+             if (log_enabled) {
+-                debug_log.info("stdout read returned 0 bytes (EOF)", .{});
++                debug_log.debug("stdout read returned 0 bytes (EOF)", .{});
+             }
+             break;
+         }
+         total_stdout += n;
+ 
+         if (log_enabled) {
+-            debug_log.info("stdout read {d} bytes", .{n});
++            debug_log.debug("stdout read {d} bytes", .{n});
+         }
+ 
+         // Check if this is JSON (starts with '{')
+         if (total_stdout == n and read_buf[0] == '{') {
+             if (log_enabled) {
+-                debug_log.info("Detected JSON response, not SSE", .{});
++                debug_log.debug("Detected JSON response, not SSE", .{});
+             }
+             // This is a JSON error, not SSE
+             const json_response = try allocator.dupe(u8, read_buf[0..n]);
+@@ -510,8 +729,9 @@ pub fn curlStream(
+         for (read_buf[0..n]) |byte| {
+             if (byte == '\n') {
+                 if (log_enabled) {
+-                    debug_log.info("parsing SSE line: len={d}", .{line_buf.items.len});
++                    debug_log.debug("parsing SSE line: len={d}", .{line_buf.items.len});
+                 }
++                try accumulateToolCallsFromSseLine(&tool_call_accumulator, allocator, line_buf.items);
+                 const result = parseSseLine(allocator, line_buf.items) catch {
+                     line_buf.clearRetainingCapacity();
+                     continue;
+@@ -525,7 +745,7 @@ pub fn curlStream(
+                     .usage => |u| stream_usage = u,
+                     .done => {
+                         if (log_enabled) {
+-                            debug_log.info("SSE stream done", .{});
++                            debug_log.debug("SSE stream done", .{});
+                         }
+                         saw_done = true;
+                         break :outer;
+@@ -539,11 +759,12 @@ pub fn curlStream(
+     }
+ 
+     if (log_enabled) {
+-        debug_log.info("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
++        debug_log.debug("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
+     }
+ 
+     // Parse a trailing line when the stream ends without a final '\n'.
+     if (!saw_done and line_buf.items.len > 0) {
++        try accumulateToolCallsFromSseLine(&tool_call_accumulator, allocator, line_buf.items);
+         const trailing = parseSseLine(allocator, line_buf.items) catch null;
+         line_buf.clearRetainingCapacity();
+         if (trailing) |result| {
+@@ -564,12 +785,12 @@ pub fn curlStream(
+         const n = stdout_file.read(&read_buf) catch break;
+         if (n == 0) break;
+         if (log_enabled) {
+-            debug_log.info("drained {d} more stdout bytes", .{n});
++            debug_log.debug("drained {d} more stdout bytes", .{n});
+         }
+     }
+ 
+     if (log_enabled) {
+-        debug_log.info("waiting for curl process to exit...", .{});
++        debug_log.debug("waiting for curl process to exit...", .{});
+     }
+     const term = child.wait() catch |err| {
+         log.err("curlStream child.wait failed: {}", .{err});
+@@ -577,12 +798,12 @@ pub fn curlStream(
+             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
+             try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+             callback(ctx, root.StreamChunk.finalChunk());
+-            return finalizeStreamResult(allocator, accumulated.items, stream_usage);
++            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
+         }
+         return error.CurlWaitError;
+     };
+     if (log_enabled) {
+-        debug_log.info("curl process terminated: {}", .{term});
++        debug_log.debug("curl process terminated: {}", .{term});
+     }
+     switch (term) {
+         .exited => |code| if (code != 0) {
+@@ -590,7 +811,7 @@ pub fn curlStream(
+                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
+                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+                 callback(ctx, root.StreamChunk.finalChunk());
+-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
++                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
+             }
+             return error.CurlFailed;
+         },
+@@ -599,7 +820,7 @@ pub fn curlStream(
+                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
+                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+                 callback(ctx, root.StreamChunk.finalChunk());
+-                return finalizeStreamResult(allocator, accumulated.items, stream_usage);
++                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
+             }
+             return error.CurlFailed;
+         },
+@@ -608,7 +829,7 @@ pub fn curlStream(
+     // Signal stream completion only after curl exits successfully.
+     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+     callback(ctx, root.StreamChunk.finalChunk());
+-    return finalizeStreamResult(allocator, accumulated.items, stream_usage);
++    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, true);
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+@@ -996,6 +1217,200 @@ test "parseSseLine invalid JSON" {
+     try std.testing.expectError(error.InvalidSseJson, parseSseLine(std.testing.allocator, "data: not-json{{{"));
+ }
+ 
++test "extractSseDataPayload strips data framing" {
++    try std.testing.expectEqualStrings("{\"ok\":true}", extractSseDataPayload("data: {\"ok\":true}").?);
++    try std.testing.expectEqualStrings("{\"ok\":true}", extractSseDataPayload("data:{\"ok\":true}\r").?);
++    try std.testing.expect(extractSseDataPayload("") == null);
++    try std.testing.expect(extractSseDataPayload(":keep-alive") == null);
++    try std.testing.expect(extractSseDataPayload("event: message") == null);
++}
++
++test "ToolCallAccumulator combines chunked OpenAI tool call deltas" {
++    // Regression: OpenAI-compatible streaming can emit function.arguments across
++    // multiple delta.tool_calls chunks before finish_reason="tool_calls".
++    const allocator = std.testing.allocator;
++    var accumulator = ToolCallAccumulator{};
++    defer accumulator.deinit(allocator);
++
++    try accumulator.appendFromJsonPayload(allocator,
++        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"shell","arguments":"{\"command\":\""}}]}}]}
++    );
++    try accumulator.appendFromJsonPayload(allocator,
++        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ls\"}"}}]}}]}
++    );
++
++    const tool_calls = try accumulator.toOwnedToolCalls(allocator);
++    defer {
++        for (tool_calls) |tc| {
++            allocator.free(tc.id);
++            allocator.free(tc.name);
++            allocator.free(tc.arguments);
++        }
++        if (tool_calls.len > 0) allocator.free(tool_calls);
++    }
++
++    try std.testing.expectEqual(@as(usize, 1), tool_calls.len);
++    try std.testing.expectEqualStrings("call_1", tool_calls[0].id);
++    try std.testing.expectEqualStrings("shell", tool_calls[0].name);
++    try std.testing.expectEqualStrings("{\"command\":\"ls\"}", tool_calls[0].arguments);
++}
++
++test "ToolCallAccumulator preserves parallel OpenAI tool call indexes" {
++    const allocator = std.testing.allocator;
++    var accumulator = ToolCallAccumulator{};
++    defer accumulator.deinit(allocator);
++
++    try accumulator.appendFromJsonPayload(allocator,
++        \\{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}},{"index":0,"id":"call_a","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}]}}]}
++    );
++
++    const tool_calls = try accumulator.toOwnedToolCalls(allocator);
++    defer {
++        for (tool_calls) |tc| {
++            allocator.free(tc.id);
++            allocator.free(tc.name);
++            allocator.free(tc.arguments);
++        }
++        if (tool_calls.len > 0) allocator.free(tool_calls);
++    }
++
++    try std.testing.expectEqual(@as(usize, 2), tool_calls.len);
++    try std.testing.expectEqualStrings("call_a", tool_calls[0].id);
++    try std.testing.expectEqualStrings("shell", tool_calls[0].name);
++    try std.testing.expectEqualStrings("call_b", tool_calls[1].id);
++    try std.testing.expectEqualStrings("read_file", tool_calls[1].name);
++}
++
++test "ToolCallAccumulator skips malformed and nameless calls" {
++    const allocator = std.testing.allocator;
++    var accumulator = ToolCallAccumulator{};
++    defer accumulator.deinit(allocator);
++
++    try accumulator.appendFromJsonPayload(allocator, "not-json{{{");
++    try accumulator.appendFromJsonPayload(allocator,
++        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_missing","function":{"arguments":"{}"}}]}}]}
++    );
++
++    const tool_calls = try accumulator.toOwnedToolCalls(allocator);
++    defer if (tool_calls.len > 0) allocator.free(tool_calls);
++
++    try std.testing.expectEqual(@as(usize, 0), tool_calls.len);
++}
++
++test "ToolCallAccumulator captures tool calls alongside text deltas" {
++    const allocator = std.testing.allocator;
++    const line =
++        \\data: {"choices":[{"delta":{"content":"working","tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
++    ;
++
++    const result = try parseSseLine(allocator, line);
++    switch (result) {
++        .delta => |content| {
++            defer content.deinit(allocator);
++            try std.testing.expectEqualStrings("working", content.text);
++        },
++        else => return error.TestUnexpectedResult,
++    }
++
++    var accumulator = ToolCallAccumulator{};
++    defer accumulator.deinit(allocator);
++    try accumulateToolCallsFromSseLine(&accumulator, allocator, line);
++
++    const tool_calls = try accumulator.toOwnedToolCalls(allocator);
++    defer {
++        for (tool_calls) |tc| {
++            allocator.free(tc.id);
++            allocator.free(tc.name);
++            allocator.free(tc.arguments);
++        }
++        if (tool_calls.len > 0) allocator.free(tool_calls);
++    }
++
++    try std.testing.expectEqual(@as(usize, 1), tool_calls.len);
++    try std.testing.expectEqualStrings("call_1", tool_calls[0].id);
++    try std.testing.expectEqualStrings("shell", tool_calls[0].name);
++    try std.testing.expectEqualStrings("{}", tool_calls[0].arguments);
++}
++
++test "accumulateToolCallsFromSseLine handles trailing data line without newline" {
++    const allocator = std.testing.allocator;
++    var accumulator = ToolCallAccumulator{};
++    defer accumulator.deinit(allocator);
++
++    try accumulateToolCallsFromSseLine(&accumulator, allocator,
++        \\data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"shell","arguments":"{}"}}]}}]}
++    );
++
++    const tool_calls = try accumulator.toOwnedToolCalls(allocator);
++    defer {
++        for (tool_calls) |tc| {
++            allocator.free(tc.id);
++            allocator.free(tc.name);
++            allocator.free(tc.arguments);
++        }
++        if (tool_calls.len > 0) allocator.free(tool_calls);
++    }
++
++    try std.testing.expectEqual(@as(usize, 1), tool_calls.len);
++    try std.testing.expectEqualStrings("call_0", tool_calls[0].id);
++    try std.testing.expectEqualStrings("shell", tool_calls[0].name);
++}
++
++test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
++    const allocator = std.testing.allocator;
++    var accumulator = ToolCallAccumulator{};
++    defer accumulator.deinit(allocator);
++
++    try accumulator.appendFromJsonPayload(allocator,
++        \\{"choices":[{"delta":{"content":"ignored","tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
++    );
++
++    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator, true);
++    defer {
++        if (result.content) |content| allocator.free(content);
++        if (result.reasoning_content) |reasoning| allocator.free(reasoning);
++        for (result.tool_calls) |tc| {
++            allocator.free(tc.id);
++            allocator.free(tc.name);
++            allocator.free(tc.arguments);
++        }
++        if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
++    }
++
++    try std.testing.expectEqualStrings("visible", result.content.?);
++    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
++    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
++    try std.testing.expectEqualStrings("shell", result.tool_calls[0].name);
++    try std.testing.expectEqualStrings("{}", result.tool_calls[0].arguments);
++}
++
++test "finalizeStreamResultWithToolCalls supports tool-call-only response" {
++    const allocator = std.testing.allocator;
++    var accumulator = ToolCallAccumulator{};
++    defer accumulator.deinit(allocator);
++
++    try accumulator.appendFromJsonPayload(allocator,
++        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
++    );
++
++    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator, true);
++    defer {
++        if (result.content) |content| allocator.free(content);
++        if (result.reasoning_content) |reasoning| allocator.free(reasoning);
++        for (result.tool_calls) |tc| {
++            allocator.free(tc.id);
++            allocator.free(tc.name);
++            allocator.free(tc.arguments);
++        }
++        if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
++    }
++
++    try std.testing.expect(result.content == null);
++    try std.testing.expectEqual(@as(usize, 1), result.tool_calls.len);
++    try std.testing.expectEqualStrings("call_1", result.tool_calls[0].id);
++    try std.testing.expectEqualStrings("shell", result.tool_calls[0].name);
++}
++
+ test "extractDeltaContent with content" {
+     const allocator = std.testing.allocator;
+     const d = (try extractDeltaContent(allocator, "{\"choices\":[{\"delta\":{\"content\":\"world\"}}]}")).?;
+diff --git a/src/session.zig b/src/session.zig
+index 00621c0..1e685f1 100644
+--- a/src/session.zig
++++ b/src/session.zig
+@@ -482,7 +482,7 @@ pub const SessionManager = struct {
+         };
+ 
+         log.info("vision probe: querying model '{s}' for image support", .{probe_model_ref});
+-        const resp = self.provider.chat(allocator, probe_req, probe_model_ref, 0.0) catch |err| {
++        var resp = self.provider.chat(allocator, probe_req, probe_model_ref, 0.0) catch |err| {
+             if (err == error.ProviderDoesNotSupportVision) {
+                 log.info("vision probe: model '{s}' does not support vision", .{probe_model_ref});
+                 self.vision_capable = false;
+@@ -491,8 +491,11 @@ pub const SessionManager = struct {
+             }
+             return;
+         };
+-        if (resp.content) |c| allocator.free(c);
+-        if (resp.reasoning_content) |c| allocator.free(c);
++        // Regression: freeing only content and reasoning_content leaked the
++        // probe response's provider, model and tool_calls — the ReliableProvider
++        // wrapper annotates provider/model and OpenRouter sets model, so every
++        // completed startup probe leaked until process exit.
++        providers.freeChatResponse(allocator, &resp);
+         log.info("vision probe: model '{s}' confirmed vision support", .{probe_model_ref});
+         self.vision_capable = true;
+     }
+@@ -2295,6 +2298,10 @@ const MockProvider = struct {
+     chat_calls: usize = 0,
+     supports_vision: bool = true,
+     vision_model: ?[]const u8 = null,
++    /// When true, the returned response carries allocated provider/model fields,
++    /// mirroring what ReliableProvider and OpenRouter produce. Used to guard the
++    /// probeVision response-freeing regression.
++    annotate: bool = false,
+     last_chat_model_len: usize = 0,
+     last_chat_model_buf: [128]u8 = undefined,
+     last_request_timeout_secs: u64 = 0,
+@@ -2338,7 +2345,12 @@ const MockProvider = struct {
+         @memcpy(self.last_chat_model_buf[0..self.last_chat_model_len], request.model[0..self.last_chat_model_len]);
+         self.last_request_timeout_secs = request.timeout_secs;
+         if (self.chat_error) |err| return err;
+-        return .{ .content = try allocator.dupe(u8, self.response) };
++        var resp = providers.ChatResponse{ .content = try allocator.dupe(u8, self.response) };
++        if (self.annotate) {
++            resp.provider = try allocator.dupe(u8, "mock");
++            resp.model = try allocator.dupe(u8, request.model);
++        }
++        return resp;
+     }
+ 
+     fn mockSupportsNativeTools(_: *anyopaque) bool {
+@@ -2852,6 +2864,25 @@ test "probeVision uses vision route model ref and gateway timeout" {
+     try testing.expectEqual(@as(u64, 77), mock.last_request_timeout_secs);
+ }
+ 
++test "probeVision frees provider and model on the probe response" {
++    // Regression: probeVision freed only content and reasoning_content, so a
++    // probe response annotated with provider/model (ReliableProvider sets both,
++    // OpenRouter sets model) leaked. testing.allocator fails this test if the
++    // response is not fully released.
++    var mock = MockProvider{
++        .response = "ok",
++        .annotate = true,
++        .vision_model = "vision-model",
++    };
++    var cfg = testConfig();
++    cfg.default_model = "vision-model";
++    var sm = testSessionManager(testing.allocator, &mock, &cfg);
++
++    sm.probeVision(testing.allocator);
++    try testing.expectEqual(@as(?bool, true), sm.vision_capable);
++    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
++}
++
+ fn testBuildClaimToken(
+     allocator: Allocator,
+     secret: []const u8,
+-- 
+2.56.0
+

@@ -1,4 +1,4 @@
-From 8f041975cee40c1716c30f0833d6ddcf0dfda99c Mon Sep 17 00:00:00 2001
+From ce7cc6c5eacec51098a04fc84b168bf31825b389 Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 13:13:37 +0900
 Subject: [PATCH] feat(telegram): render live drafts with HTML parse mode
@@ -96,5 +96,5 @@ index 411af14..b4bf182 100644
  
          if (telegram_api.responseHasTelegramError(resp)) {
 -- 
-2.55.0.windows.3
+2.56.0
 

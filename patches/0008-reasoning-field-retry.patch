@@ -1,5 +1,5 @@
-From a59d670276fe2e6e860ad8e747c3df1898ce86d8 Mon Sep 17 00:00:00 2001
-From: wray-lee <i@wray7.top>
+From ccb6e3047f73cb6c891b326e13d0fdfcd3d5a5ee Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 18:23:03 +0900
 Subject: [PATCH] fix(providers): resend assistant history with
  reasoning_content when required
@@ -29,7 +29,7 @@ non-streaming path, so the real reason reaches the user and the log.
  3 files changed, 125 insertions(+)
 
 diff --git a/src/providers/compatible.zig b/src/providers/compatible.zig
-index d06e270..ae07cb4 100644
+index f3571c1..4acde3a 100644
 --- a/src/providers/compatible.zig
 +++ b/src/providers/compatible.zig
 @@ -214,6 +214,11 @@ pub const OpenAiCompatibleProvider = struct {
@@ -102,7 +102,7 @@ index d06e270..ae07cb4 100644
          const effective_model = self.normalizeProviderModel(model);
  
          if (self.api_mode == .responses) {
-@@ -1442,6 +1491,24 @@ pub const OpenAiCompatibleProvider = struct {
+@@ -1440,6 +1489,24 @@ pub const OpenAiCompatibleProvider = struct {
          temperature: f64,
      ) anyerror!ChatResponse {
          const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
@@ -127,7 +127,7 @@ index d06e270..ae07cb4 100644
          const effective_model = self.normalizeProviderModel(model);
          const capped_request = self.capNonStreamingMaxTokens(request);
  
-@@ -1562,6 +1629,10 @@ fn serializeMessagesInto(
+@@ -1560,6 +1627,10 @@ fn serializeMessagesInto(
                  try buf.appendSlice(allocator, ",\"tool_call_id\":");
                  try root.appendJsonString(buf, allocator, tc_id);
              }
@@ -138,7 +138,7 @@ index d06e270..ae07cb4 100644
              try buf.append(allocator, '}');
          }
          return;
-@@ -1617,6 +1688,10 @@ fn serializeMessagesInto(
+@@ -1615,6 +1686,10 @@ fn serializeMessagesInto(
              try buf.appendSlice(allocator, ",\"tool_call_id\":");
              try root.appendJsonString(buf, allocator, tc_id);
          }
@@ -149,7 +149,7 @@ index d06e270..ae07cb4 100644
          try buf.append(allocator, '}');
      }
  }
-@@ -3338,3 +3413,42 @@ test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds li
+@@ -3315,3 +3390,42 @@ test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds li
      const single = root.ChatRequest{ .messages = &[_]root.ChatMessage{m1}, .model = "m" };
      try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(25, single));
  }
@@ -193,7 +193,7 @@ index d06e270..ae07cb4 100644
 +    try std.testing.expect(patched[2].reasoning_content == null);
 +}
 diff --git a/src/providers/root.zig b/src/providers/root.zig
-index 752178d..f5b97f4 100644
+index c1d0014..0763cfd 100644
 --- a/src/providers/root.zig
 +++ b/src/providers/root.zig
 @@ -161,6 +161,9 @@ pub const ChatMessage = struct {
@@ -207,10 +207,10 @@ index 752178d..f5b97f4 100644
      /// serialize these instead of the plain `content` field.
      content_parts: ?[]const ContentPart = null,
 diff --git a/src/providers/sse.zig b/src/providers/sse.zig
-index 451ebdc..87cfaaa 100644
+index ba0cb1f..074c152 100644
 --- a/src/providers/sse.zig
 +++ b/src/providers/sse.zig
-@@ -705,6 +705,14 @@ pub fn curlStream(
+@@ -716,6 +716,14 @@ pub fn curlStream(
                  defer p.deinit();
                  if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
                      _ = child.wait() catch {};
@@ -226,5 +226,5 @@ index 451ebdc..87cfaaa 100644
                  }
              }
 -- 
-2.55.0.windows.3
+2.56.0
 

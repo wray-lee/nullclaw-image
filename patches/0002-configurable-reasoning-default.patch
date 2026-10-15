@@ -1,4 +1,4 @@
-From 014685b44e8b711ccf55e9961df00ab08f784b7a Mon Sep 17 00:00:00 2001
+From cc60359bcfec7edca624a08dbc3981b25d40094e Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 06:20:43 +0900
 Subject: [PATCH] feat(config): add agent.reasoning_mode default
@@ -19,15 +19,15 @@ Docs updated in docs/en/configuration.md and docs/zh/configuration.md.
  docs/en/configuration.md | 18 ++++++++++
  docs/zh/configuration.md | 18 ++++++++++
  src/agent/commands.zig   |  2 +-
- src/agent/root.zig       | 49 +++++++++++++++++++--------
+ src/agent/root.zig       | 50 ++++++++++++++++++++--------
  src/config.zig           | 72 ++++++++++++++++++++++++++++++++++++++++
  src/config_mutator.zig   |  1 +
  src/config_parse.zig     |  5 +++
  src/config_types.zig     | 31 +++++++++++++++++
- 8 files changed, 182 insertions(+), 14 deletions(-)
+ 8 files changed, 183 insertions(+), 14 deletions(-)
 
 diff --git a/docs/en/configuration.md b/docs/en/configuration.md
-index 72bb6c4a..bb486295 100644
+index 72bb6c4..bb48629 100644
 --- a/docs/en/configuration.md
 +++ b/docs/en/configuration.md
 @@ -230,6 +230,24 @@ Example:
@@ -56,7 +56,7 @@ index 72bb6c4a..bb486295 100644
  
  - Selects the provider/model used by `nullclaw workspace audit --llm-triage external`.
 diff --git a/docs/zh/configuration.md b/docs/zh/configuration.md
-index f69b2b97..3bb5baab 100644
+index f69b2b9..3bb5baa 100644
 --- a/docs/zh/configuration.md
 +++ b/docs/zh/configuration.md
 @@ -210,6 +210,24 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API
@@ -85,7 +85,7 @@ index f69b2b97..3bb5baab 100644
  
  - 选择 `nullclaw workspace audit --llm-triage external` 使用的 provider/model。
 diff --git a/src/agent/commands.zig b/src/agent/commands.zig
-index 7ec79cb7..2c054e94 100644
+index 7ec79cb..2c054e9 100644
 --- a/src/agent/commands.zig
 +++ b/src/agent/commands.zig
 @@ -3451,7 +3451,7 @@ fn parseDurationSeconds(raw: []const u8) ?u64 {
@@ -98,7 +98,7 @@ index 7ec79cb7..2c054e94 100644
      self.exec_host = .gateway;
      self.exec_security = self.default_exec_security;
 diff --git a/src/agent/root.zig b/src/agent/root.zig
-index f481c2c1..9dd8ef1e 100644
+index c63f5a1..f39214e 100644
 --- a/src/agent/root.zig
 +++ b/src/agent/root.zig
 @@ -107,19 +107,9 @@ pub const Agent = struct {
@@ -142,7 +142,7 @@ index f481c2c1..9dd8ef1e 100644
              .status_show_emojis = cfg.agent.status_show_emojis,
              .message_timeout_secs = cfg.agent.message_timeout_secs,
              .log_tool_calls = cfg.diagnostics.log_tool_calls,
-@@ -5353,6 +5347,35 @@ test "Agent.fromConfig applies default_queue_mode" {
+@@ -5353,6 +5347,36 @@ test "Agent.fromConfig applies default_queue_mode" {
      try std.testing.expectEqual(Agent.QueueMode.latest, agent.queue_mode);
  }
  
@@ -175,11 +175,12 @@ index f481c2c1..9dd8ef1e 100644
 +    defer allocator.free(reset);
 +    try std.testing.expectEqual(Agent.ReasoningMode.stream, agent.reasoning_mode);
 +}
- 
++
  test "slash /new clears history" {
      const allocator = std.testing.allocator;
+     var agent = try makeTestAgent(allocator);
 diff --git a/src/config.zig b/src/config.zig
-index 0c3cbaeb..352898ae 100644
+index 0c3cbae..352898a 100644
 --- a/src/config.zig
 +++ b/src/config.zig
 @@ -1354,6 +1354,7 @@ pub const Config = struct {
@@ -269,7 +270,7 @@ index 0c3cbaeb..352898ae 100644
      const allocator = std.testing.allocator;
      var tmp = std.testing.tmpDir(.{});
 diff --git a/src/config_mutator.zig b/src/config_mutator.zig
-index 4d5d53e1..b9a21a08 100644
+index 4d5d53e..b9a21a0 100644
 --- a/src/config_mutator.zig
 +++ b/src/config_mutator.zig
 @@ -124,6 +124,7 @@ pub fn pathRequiresRestart(path: []const u8) bool {
@@ -281,7 +282,7 @@ index 4d5d53e1..b9a21a08 100644
  }
  
 diff --git a/src/config_parse.zig b/src/config_parse.zig
-index acbcd8f5..2f1480f7 100644
+index acbcd8f..2f1480f 100644
 --- a/src/config_parse.zig
 +++ b/src/config_parse.zig
 @@ -1791,6 +1791,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
@@ -297,7 +298,7 @@ index acbcd8f5..2f1480f7 100644
                  if (v != .string) return error.InvalidDefaultQueueMode;
                  self.agent.default_queue_mode = types.QueueMode.fromSlice(v.string) orelse
 diff --git a/src/config_types.zig b/src/config_types.zig
-index 05fc133d..63b23f26 100644
+index 05fc133..63b23f2 100644
 --- a/src/config_types.zig
 +++ b/src/config_types.zig
 @@ -403,6 +403,33 @@ pub const QueueMode = enum {

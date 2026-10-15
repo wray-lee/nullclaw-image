@@ -1,4 +1,4 @@
-From ea4e568fd3bcb360fef11d219560479537ef7e28 Mon Sep 17 00:00:00 2001
+From 4f7e086e1af01fa5ef9b693f162cdb30a96ffa8d Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 14:16:04 +0900
 Subject: [PATCH] feat(security): per-agent autonomy for named agents
@@ -413,7 +413,7 @@ index 2c054e9..3111606 100644
      const action = parsed.head;
  
 diff --git a/src/agent/root.zig b/src/agent/root.zig
-index 9dd8ef1..a09a6f1 100644
+index f39214e..bcabe4f 100644
 --- a/src/agent/root.zig
 +++ b/src/agent/root.zig
 @@ -276,6 +276,11 @@ pub const Agent = struct {
@@ -1677,7 +1677,7 @@ index e4bba0a..c535a6a 100644
      const p = SecurityPolicy{};
      try std.testing.expect(!p.isCommandAllowed("echo hello | tee /tmp/out"));
 diff --git a/src/session.zig b/src/session.zig
-index b68de56..126aa85 100644
+index a4ef82d..74bb593 100644
 --- a/src/session.zig
 +++ b/src/session.zig
 @@ -36,8 +36,10 @@ const tools_mod = @import("tools/root.zig");
@@ -1718,7 +1718,7 @@ index b68de56..126aa85 100644
          allocator.free(self.workspace_dir);
          allocator.free(self.agent_id);
      }
-@@ -1215,10 +1231,57 @@ pub const SessionManager = struct {
+@@ -1218,10 +1234,57 @@ pub const SessionManager = struct {
      fn shouldUseDedicatedRuntime(self: *SessionManager, agent_id: []const u8, named_agent: ?NamedAgentConfig) bool {
          if (named_agent) |cfg| {
              if (cfg.workspace_path != null) return true;
@@ -1776,7 +1776,7 @@ index b68de56..126aa85 100644
      fn sanitizePathComponent(allocator: Allocator, value: []const u8) ![]u8 {
          var trimmed = std.mem.trim(u8, value, " \t\r\n");
          if (trimmed.len == 0) trimmed = "default";
-@@ -1249,6 +1312,13 @@ pub const SessionManager = struct {
+@@ -1252,6 +1315,13 @@ pub const SessionManager = struct {
              cfg.default_provider = agent_cfg.provider;
              cfg.default_model = agent_cfg.model;
              if (agent_cfg.temperature) |t| cfg.default_temperature = t;
@@ -1790,7 +1790,7 @@ index b68de56..126aa85 100644
          }
          cfg.syncFlatFields();
          return cfg;
-@@ -1268,6 +1338,23 @@ pub const SessionManager = struct {
+@@ -1271,6 +1341,23 @@ pub const SessionManager = struct {
          const workspace_dir = try self.resolveAgentWorkspaceDir(agent_id, named_agent);
          errdefer self.allocator.free(workspace_dir);
  
@@ -1814,7 +1814,7 @@ index b68de56..126aa85 100644
          var mem_rt = memory_mod.initRuntime(self.allocator, &self.config.memory, workspace_dir);
          errdefer if (mem_rt) |*rt| rt.deinit();
  
-@@ -1296,13 +1383,17 @@ pub const SessionManager = struct {
+@@ -1299,13 +1386,17 @@ pub const SessionManager = struct {
              .web_search_fallback_providers = self.config.http_request.search_fallback_providers,
              .browser_enabled = self.config.browser.enabled,
              .screenshot_enabled = true,
@@ -1834,7 +1834,7 @@ index b68de56..126aa85 100644
              .subagent_manager = self.subagent_manager,
              .bootstrap_provider = bootstrap_provider,
              .backend_name = self.config.memory.backend,
-@@ -1322,6 +1413,8 @@ pub const SessionManager = struct {
+@@ -1325,6 +1416,8 @@ pub const SessionManager = struct {
              .session_store = session_store,
              .response_cache = response_cache,
              .bootstrap_provider = bootstrap_provider,
@@ -1843,7 +1843,7 @@ index b68de56..126aa85 100644
          };
  
          tools_mod.bindMemoryTools(runtime.tools, runtime.mem);
-@@ -1445,7 +1538,7 @@ pub const SessionManager = struct {
+@@ -1448,7 +1541,7 @@ pub const SessionManager = struct {
              self.observer,
              agent_profile,
          );
@@ -1852,7 +1852,7 @@ index b68de56..126aa85 100644
          agent.session_store = selected_session_store;
          agent.response_cache = selected_response_cache;
          agent.mem_rt = selected_mem_rt;
-@@ -1767,7 +1860,35 @@ pub const SessionManager = struct {
+@@ -1770,7 +1863,35 @@ pub const SessionManager = struct {
              }
          }
  
@@ -1889,7 +1889,7 @@ index b68de56..126aa85 100644
      }
  
      /// Process a message within a session context and optionally forward text deltas and progress hints.
-@@ -1959,6 +2080,11 @@ pub const SessionManager = struct {
+@@ -1962,6 +2083,11 @@ pub const SessionManager = struct {
              );
          }
  
@@ -1901,7 +1901,7 @@ index b68de56..126aa85 100644
          if (display_rehydrate_allowed) {
              if (session.agent.redactor) |r| {
                  if (r.wouldRehydrate()) {
-@@ -3458,6 +3584,231 @@ test "getOrCreate named agent workspace override creates dedicated runtime" {
+@@ -3489,6 +3615,231 @@ test "getOrCreate named agent workspace override creates dedicated runtime" {
      try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
  }
  
@@ -2321,5 +2321,5 @@ index 95258ce..08d9b2c 100644
      const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
          .tools_config = .{
 -- 
-2.55.0.windows.3
+2.56.0
 

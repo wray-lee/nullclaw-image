@@ -1,4 +1,4 @@
-From 94a34ba0a672dedf7b09f1c0571350a722e59273 Mon Sep 17 00:00:00 2001
+From f8bdcacd2578044d0cc9d4eb6d40ba939fb15ea5 Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 05:44:56 +0900
 Subject: [PATCH 1/2] feat(slack): stream outbound replies while they are
@@ -49,7 +49,7 @@ Validation: `zig build test --summary all` (7555 passed, 0 leaked) and
  create mode 100755 src/channels/slack_stream_presenter.zig
 
 diff --git a/docs/en/configuration.md b/docs/en/configuration.md
-index bb486295..b5788dd1 100644
+index bb48629..b5788dd 100644
 --- a/docs/en/configuration.md
 +++ b/docs/en/configuration.md
 @@ -1034,6 +1034,113 @@ Common issues:
@@ -167,7 +167,7 @@ index bb486295..b5788dd1 100644
  
  - `backend`: start with `sqlite`. Available engines: `sqlite`, `markdown`, `clickhouse`, `postgres`, `redis`, `lancedb`, `lucid`, `memory` (LRU), `api`, `none`.
 diff --git a/docs/zh/configuration.md b/docs/zh/configuration.md
-index 3bb5baab..9ff5d0f1 100644
+index 3bb5baa..9ff5d0f 100644
 --- a/docs/zh/configuration.md
 +++ b/docs/zh/configuration.md
 @@ -836,6 +836,89 @@ Max 说明：
@@ -261,7 +261,7 @@ index 3bb5baab..9ff5d0f1 100644
  
  - `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。
 diff --git a/src/channels/slack.zig b/src/channels/slack.zig
-index 3e016482..f29dda19 100644
+index 3e01648..f29dda1 100644
 --- a/src/channels/slack.zig
 +++ b/src/channels/slack.zig
 @@ -6,6 +6,7 @@ const config_types = @import("../config_types.zig");
@@ -1099,7 +1099,7 @@ index 3e016482..f29dda19 100644
      defer parsed.deinit();
 diff --git a/src/channels/slack_stream_presenter.zig b/src/channels/slack_stream_presenter.zig
 new file mode 100755
-index 00000000..b8b774d5
+index 0000000..b8b774d
 --- /dev/null
 +++ b/src/channels/slack_stream_presenter.zig
 @@ -0,0 +1,767 @@
@@ -1871,7 +1871,7 @@ index 00000000..b8b774d5
 +    try std.testing.expect(states.count() == 0);
 +}
 diff --git a/src/channels/telegram_draft_presenter.zig b/src/channels/telegram_draft_presenter.zig
-index f65148d1..3132d987 100644
+index f65148d..3132d98 100644
 --- a/src/channels/telegram_draft_presenter.zig
 +++ b/src/channels/telegram_draft_presenter.zig
 @@ -75,10 +75,16 @@ fn hasPendingVisibleDraft(state: *const DraftState) bool {
@@ -1931,7 +1931,7 @@ index f65148d1..3132d987 100644
  }
  
 diff --git a/src/config.zig b/src/config.zig
-index 352898ae..1422cfcb 100644
+index 352898a..1422cfc 100644
 --- a/src/config.zig
 +++ b/src/config.zig
 @@ -7163,6 +7163,74 @@ test "parse slack accounts" {
@@ -2010,7 +2010,7 @@ index 352898ae..1422cfcb 100644
      const allocator = std.testing.allocator;
      const json =
 diff --git a/src/config_types.zig b/src/config_types.zig
-index 63b23f26..93089b67 100644
+index 63b23f2..93089b6 100644
 --- a/src/config_types.zig
 +++ b/src/config_types.zig
 @@ -704,6 +704,11 @@ pub const SlackConfig = struct {
@@ -2026,7 +2026,7 @@ index 63b23f26..93089b67 100644
  
  pub const TeamsConfig = struct {
 diff --git a/src/daemon.zig b/src/daemon.zig
-index b3dfd916..c2b73d9f 100644
+index b3dfd91..c2b73d9 100644
 --- a/src/daemon.zig
 +++ b/src/daemon.zig
 @@ -1174,13 +1174,24 @@ fn makeAssistantReplyPayload(allocator: std.mem.Allocator, reply: []const u8) !A
@@ -2142,7 +2142,7 @@ index b3dfd916..c2b73d9f 100644
  }
  
 diff --git a/src/providers/helpers.zig b/src/providers/helpers.zig
-index 5a07259e..944d2334 100644
+index 5a07259..944d233 100644
 --- a/src/providers/helpers.zig
 +++ b/src/providers/helpers.zig
 @@ -91,6 +91,55 @@ pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
@@ -2234,7 +2234,7 @@ index 5a07259e..944d2334 100644
 +    try std.testing.expectEqualStrings("answer tail", out);
 +}
 diff --git a/src/providers/root.zig b/src/providers/root.zig
-index 2e9d0924..752178d8 100644
+index 9d6cd32..c1d0014 100644
 --- a/src/providers/root.zig
 +++ b/src/providers/root.zig
 @@ -65,6 +65,7 @@ pub const curlPostFormTimed = helpers.curlPostFormTimed;
@@ -2246,10 +2246,10 @@ index 2e9d0924..752178d8 100644
  pub const normalizeOpenAiReasoningEffort = helpers.normalizeOpenAiReasoningEffort;
  pub const appendOpenAiBodyExtraParams = helpers.appendOpenAiBodyExtraParams;
 diff --git a/src/session.zig b/src/session.zig
-index 00621c0f..d5290dc5 100644
+index 1e685f1..cca5add 100644
 --- a/src/session.zig
 +++ b/src/session.zig
-@@ -2026,6 +2026,17 @@ pub const SessionManager = struct {
+@@ -2029,6 +2029,17 @@ pub const SessionManager = struct {
          return session.turn_running.load(.acquire);
      }
  
@@ -2268,7 +2268,7 @@ index 00621c0f..d5290dc5 100644
          process,
          skip,
 diff --git a/src/streaming.zig b/src/streaming.zig
-index 0f33338a..314cae91 100644
+index 0f33338..314cae9 100644
 --- a/src/streaming.zig
 +++ b/src/streaming.zig
 @@ -51,8 +51,20 @@ pub fn forwardProviderChunk(sink: Sink, chunk: providers.StreamChunk) void {
@@ -2435,7 +2435,7 @@ index 0f33338a..314cae91 100644
 2.56.0
 
 
-From 75c08d8278895605f1971a4888663f79016edeea Mon Sep 17 00:00:00 2001
+From 8a1c93d5cdae49c1c7333ebf3e918627bcfb8847 Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 07:01:11 +0900
 Subject: [PATCH 2/2] fix(channels): actually show live reasoning, and strip
@@ -2477,7 +2477,7 @@ leaked) and `zig fmt --check` on the changed files, both in the Zig
  5 files changed, 274 insertions(+), 6 deletions(-)
 
 diff --git a/src/channel_loop.zig b/src/channel_loop.zig
-index 612d70e2..4727a3b6 100644
+index 612d70e..4727a3b 100644
 --- a/src/channel_loop.zig
 +++ b/src/channel_loop.zig
 @@ -980,6 +980,11 @@ fn processTelegramMessage(
@@ -2493,7 +2493,7 @@ index 612d70e2..4727a3b6 100644
      const sink = tg_ptr.makeSink(&stream_ctx);
  
 diff --git a/src/channels/telegram.zig b/src/channels/telegram.zig
-index 0c103c27..6f3e3447 100644
+index 0c103c2..6f3e344 100644
 --- a/src/channels/telegram.zig
 +++ b/src/channels/telegram.zig
 @@ -3362,6 +3362,10 @@ pub const TelegramChannel = struct {
@@ -2546,7 +2546,7 @@ index 0c103c27..6f3e3447 100644
      var ch = TelegramChannel.init(std.testing.allocator, "test-token", &.{}, &.{}, "allowlist");
      ch.streaming_enabled = true;
 diff --git a/src/providers/helpers.zig b/src/providers/helpers.zig
-index 944d2334..5faaca8c 100644
+index 944d233..5faaca8 100644
 --- a/src/providers/helpers.zig
 +++ b/src/providers/helpers.zig
 @@ -10,6 +10,48 @@ const ToolSpec = root.ToolSpec;
@@ -2701,10 +2701,10 @@ index 944d2334..5faaca8c 100644
      const alloc = std.testing.allocator;
      const out = try quoteThinkBlocks(alloc, "<think>step one\nstep two</think>The answer");
 diff --git a/src/session.zig b/src/session.zig
-index d5290dc5..b68de568 100644
+index cca5add..a4ef82d 100644
 --- a/src/session.zig
 +++ b/src/session.zig
-@@ -2028,12 +2028,19 @@ pub const SessionManager = struct {
+@@ -2031,12 +2031,19 @@ pub const SessionManager = struct {
  
      /// True when the session's agent streams reasoning to the caller
      /// (`/reasoning stream`), which is what lets a channel draft show the
@@ -2728,7 +2728,7 @@ index d5290dc5..b68de568 100644
      }
  
 diff --git a/src/streaming.zig b/src/streaming.zig
-index 314cae91..096469d3 100644
+index 314cae9..096469d 100644
 --- a/src/streaming.zig
 +++ b/src/streaming.zig
 @@ -66,6 +66,10 @@ pub const TagFilter = struct {
