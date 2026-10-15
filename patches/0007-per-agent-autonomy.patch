@@ -1,0 +1,2214 @@
+From 7406cd26cf431612cb9bd53ba818aafe70e87869 Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Thu, 15 Oct 2026 14:16:04 +0900
+Subject: [PATCH] feat(security): per-agent autonomy for named agents
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Named agents all ran with the global autonomy policy: SessionManager built
+every agent runtime's tools from the global config.autonomy and shared the
+single global SecurityPolicy, so a guest agent bound to one chat peer had the
+same shell and path permissions as the main agent.
+
+Give agents.list[] entries an optional "autonomy" object with the same keys as
+the top-level block. When present it replaces the global autonomy for that
+agent; omitted keys fall back to the secure AutonomyConfig defaults instead of
+inheriting the (possibly yolo) global values, and an unknown level is rejected
+at config load. Such an agent always gets a dedicated runtime that owns its own
+SecurityPolicy and RateTracker, built from its autonomy and scoped to its own
+workspace, and its sessions use that policy.
+
+Tools that would run work under the global policy instead of the agent's, or
+that reach outside its workspace, are withheld from an agent with its own
+autonomy:
+  - spawn: the SubagentManager is bound to the global config, so subagents
+    execute under the global autonomy.
+  - schedule: creates cron shell jobs that run under the scheduler's global
+    shell policy.
+  - image_info: opens any absolute path with no workspace/policy check, so it
+    is a host-path metadata oracle.
+  - git: writes to the repository (commit, checkout, reset, ...) regardless of
+    read_only intent.
+  - screenshot: captures the host screen, leaking information outside the
+    workspace.
+  - MCP tools: initMcpTools spawns each configured server as a child process
+    and proxies its tools without consulting the agent's policy.
+The cron_* tools are not registered in the agent tool set at all, and delegate
+is kept because it performs a single tool-less completion (no shell, no file
+access).
+
+The global configuration surface is closed too, because it is reachable from a
+bound chat peer's message:
+  - /config is refused: get/set/apply/reload read or rewrite the shared
+    config.json (provider keys, channel tokens, the autonomy/security blocks)
+    under the global policy.
+  - /capabilities no longer reads the shared config.json; it reports only the
+    agent's own runtime tools.
+  - /model no longer persists agents.defaults.model.primary for such an agent,
+    and its interactive provider/model menu no longer reads the shared
+    config.json (it falls back to the public model list instead of the global
+    provider keys).
+  - /export is refused: it takes an arbitrary absolute path and
+    truncates/creates it, a whole-host file-write primitive reachable from a
+    bound chat peer. The remaining slash commands are session-local (model,
+    think, verbose, reasoning, usage, cost, queue, tts, focus/dock/activation/
+    send, session ttl, context, memory, skills, debug, stop, compact, doctor),
+    or operate on subagents that are unavailable to the agent because spawn is
+    withheld (/subagents spawn, /steer, /tell, /agents, /kill, /poll report the
+    manager is disabled). /bash, /approve, /exec and /elevated run through the
+    agent's own shell tool and policy, so the confinement below applies to them.
+  - Telegram /bind is refused when the peer is routed to an agent with its own
+    autonomy: otherwise /bind clear or /bind <other> would move the peer to the
+    default or another (unrestricted) agent.
+  - The runtime config used to build the agent carries the agent's own autonomy
+    (makeAgentConfig), so Agent.fromConfigWithProfile derives exec_security/
+    exec_ask, allowed_paths and multimodal_unrestricted from it instead of the
+    global yolo block.
+  - The per-agent shell policy is confined to the agent's workspace. The command
+    is word-split on every byte the shell treats as IFS whitespace (space, tab,
+    newline, vertical tab, form feed) and every resulting argument that names a
+    path (absolute, `..` traversal or `~`) is rejected; a control byte anywhere
+    in the command is rejected outright, because /bin/sh splits on it into
+    arguments the check would otherwise not see (`cat x\t/etc/passwd` runs
+    `cat x /etc/passwd`). `$` parameter expansion (`$IFS`, `$HOME`, `$1`, `$@`,
+    `${...}`, `$'...'`, ...) and unquoted glob/brace metacharacters are
+    rejected, because the shell expands them at execution time into text the
+    argument check never sees (`cat $IFS/etc/passwd` becomes `cat /etc/passwd`,
+    `cat {.,..}/etc/passwd` becomes `cat ../etc/passwd`). Commands that execute
+    code taken from the workspace are refused outright: the package managers
+    and their run/build verbs (`npm`, `pnpm`, `yarn`, `npx`, `bun`, `bunx`,
+    `deno`, `cargo`), and the git subcommands that run a script (`git bisect`,
+    `git submodule`, `git filter-branch`, `git filter-repo`, plus git `-c`
+    config injection and `!`-aliases, which the git argument check already
+    rejects). This is a best-effort argument check applied to every command, not
+    a filesystem jail, and it is defence-in-depth for the common no-sandbox case
+    rather than a substitute for an external sandbox. The global policy keeps
+    its current behaviour.
+
+Outbound attachments are confined too. Channels parse the agent's reply text
+for legacy [DOCUMENT:/abs/path] / [FILE:..] / [IMAGE:..] markers and upload any
+absolute path (curl --form file=@path) with no workspace or policy check; this
+does not go through a tool call, so it also affected read_only. When the agent
+has its own autonomy the reply is now filtered at the session boundary — in
+both processMessageStreaming and handleLocalSlashCommand (the Telegram
+callback-menu path), through one helper — so a local attachment target must be
+an absolute path that resolves (realpath, symlinks followed) inside the agent's
+workspace or one of its own allowed_paths (isResolvedPathAllowed). Relative
+targets are refused as well, because the channel uploader resolves them against
+its own process cwd rather than the workspace, so a relative marker could pass
+this check while the channel uploads a different file (e.g. the real
+config.json). Escaping or relative markers are dropped and logged, and remote
+http(s) URLs are unaffected. Filtering at the session boundary covers every
+channel that uploads markers (Telegram, Max, Signal, ...) with one check. Slack
+never uploads attachment targets (it returns NotSupported for payloads that
+carry attachments), so it needed no change.
+
+The inbound multimodal path is closed as well: an agent with its own autonomy
+no longer gets the platform temp dir in the multimodal allowed_dirs, so a bound
+peer cannot make it read a host file under the temp dir by sending
+[IMAGE:/tmp/<file>] — a tool-less read outside the workspace that also applied
+to read_only. Agents without their own autonomy keep the temp dir.
+
+Docs (en + zh) now state the guarantees exactly: the supervised shell
+confinement is a best-effort argument check, not a jail; read_only is the
+recommended level for untrusted guests (it disables all tool calls); and the
+attachment and slash-command restrictions are listed.
+
+Two latent problems found while reviewing this change are fixed as well: an
+unknown autonomy level is now rejected before parseJson writes any field, so
+Config.load no longer keeps a half-parsed config that silently drops the rest;
+and Config.save no longer double-frees the serialized agent api_key strings when
+the loop errors part-way.
+
+Backslash escapes outside single quotes are refused in the confined shell
+check: the shell unescapes them after the check runs on the raw text, so
+`cat \/etc/passwd` reaches /etc/passwd. The delegate tool is also withheld,
+since it runs any configured agent's provider with the operator's key.
+---
+ docs/en/configuration.md |  58 +++++++
+ docs/zh/configuration.md |  58 +++++++
+ src/agent/commands.zig   |  48 +++++-
+ src/agent/root.zig       | 188 +++++++++++++++++++-
+ src/channel_loop.zig     |  87 ++++++++++
+ src/config.zig           | 135 ++++++++++++++-
+ src/config_parse.zig     | 117 +++++++++----
+ src/config_types.zig     |  15 ++
+ src/outbound.zig         | 158 +++++++++++++++++
+ src/security/policy.zig  | 289 +++++++++++++++++++++++++++++++
+ src/session.zig          | 361 ++++++++++++++++++++++++++++++++++++++-
+ src/tools/root.zig       | 138 ++++++++++++---
+ 12 files changed, 1579 insertions(+), 73 deletions(-)
+
+diff --git a/docs/en/configuration.md b/docs/en/configuration.md
+index a44adf5..8b1cc23 100644
+--- a/docs/en/configuration.md
++++ b/docs/en/configuration.md
+@@ -412,6 +412,64 @@ Practical effect:
+ - Two named agents can share the same provider/model family but keep separate durable notes and separate workspaces.
+ - `workspace_path` does not route chats by itself. Routing still comes from `bindings`, `/bind`, or explicit `--agent` / `/subagents spawn --agent`.
+ 
++#### `agents.list[].autonomy`
++
++Use `autonomy` when a named agent (for example a guest bound to a single chat peer) must run with a stricter security policy than the global one.
++
++- The object accepts the same keys as the top-level `autonomy` block: `level`, `workspace_only`, `allowed_commands`, `allowed_paths`, `max_actions_per_hour`, `require_approval_for_medium_risk`, `block_high_risk_commands`, `block_medium_risk_commands`, `allow_raw_url_chars`.
++- When present it **replaces** the global `autonomy` for that agent. Keys you omit fall back to the secure `AutonomyConfig` defaults (`supervised`, `workspace_only: true`, empty `allowed_paths`, the conservative command allowlist) — they are **not** inherited from the global block. An unknown `level` is rejected at config load.
++- The agent always gets its own runtime and its own security policy (rate limit, command allowlist, path scope), even without `workspace_path`.
++- Tools that run work under the global policy instead of the agent's, or that reach outside its workspace, are **withheld** from an agent with its own autonomy, because they would act with permissions the agent's policy does not grant:
++  - `spawn` — background subagents run under the global autonomy.
++  - `schedule` — cron shell jobs run under the scheduler's global shell policy.
++  - `image_info` — opens any absolute path with no workspace/policy check, so it is a host-path metadata oracle (existence, size, format).
++  - `git` (`git_operations`) — writes to the repository (commit, checkout, reset, …) regardless of `read_only` intent.
++  - `screenshot` — captures the host screen, leaking information outside the workspace.
++  - MCP tools — each configured MCP server is spawned as a child process and its tools are proxied without consulting the agent's policy.
++  - `delegate` — it can name any configured agent and run that agent's provider and model with the operator's API key, so a guest could spend other agents' keys and send its content to providers it was never given.
++
++  The `cron_*` tools are not part of the agent tool set at all.
++- Slash commands that touch the shared configuration, write outside the workspace, or read host state are gated:
++  - `/config` (`get`, `set`, `unset`, `apply`, `reload`, `validate`) is refused. It reads or rewrites the shared `config.json` under the global policy, which would leak provider keys and channel tokens or let the guest weaken the main agent's `autonomy`/`security` blocks.
++  - `/capabilities` reports only the agent's own runtime tools; it no longer reads the shared `config.json` to list configured channels and tools.
++  - `/model` still switches the model for that agent's own session, but no longer persists `agents.defaults.model.primary` to the global config, and the interactive provider/model menu does not read the shared `config.json` — it falls back to the public model list instead of the global provider keys.
++  - `/export` is refused: it takes an arbitrary absolute path and truncates/creates it, i.e. a whole-host file-write primitive reachable from a bound chat peer.
++  - Telegram `/bind` is refused when the peer is currently routed to an agent with its own autonomy. Otherwise the guest could `/bind clear` back to the default route or `/bind <other-agent>` to move to an unrestricted agent, escaping the restricted one. (`/bind status` stays read-only.)
++  - Every other slash command is session-local (model, think, verbose, reasoning, usage, cost, queue, tts, focus/unfocus/dock/activation/send, session ttl, context, memory, skills, debug, stop, compact, doctor), or operates on the agent's own subagents — which are unavailable to it because the `spawn` tool is withheld (`/subagents spawn`, `/steer`, `/tell`, `/agents`, `/kill`, `/poll` all report the subagent manager is disabled). `/bash`, `/approve`, `/exec` and `/elevated` still run through the agent's own shell tool and policy, so the confinement below applies to them.
++- Outbound attachments are confined: an outbound reply may only attach local files named by an **absolute** path that resolves (symlinks followed) inside the agent's workspace (plus its own `allowed_paths`). Relative targets are refused, because the channel uploader (`curl --form file=@<target>`) resolves them against its own process cwd rather than the workspace, so the uploaded file need not be the one the check resolved. Legacy reply markers (`[IMAGE:…]`, `[DOCUMENT:…]`, `[FILE:…]`, `[PHOTO:…]`, `[VIDEO:…]`, `[AUDIO:…]`, `[VOICE:…]`) whose target escapes the workspace or is relative are dropped and logged before the reply is sent, on every channel that uploads such markers (Telegram, Max, Signal, …). Remote `http(s)` URLs name no local file and are unaffected. This is a text-only exfiltration path that does not go through tool calls, so it also applies to `read_only`.
++- The shell tool is confined to the agent's workspace. The command is word-split on every byte the shell treats as IFS whitespace (space, tab, newline, vertical tab, form feed), and every resulting argument that names a path (absolute, `..` traversal or `~`) is rejected; a control byte anywhere in the command is rejected outright, because the shell splits on it into arguments the check would otherwise not see (`cat x\t/etc/passwd` runs `cat x /etc/passwd`). `$` parameter expansion (`$IFS`, `$HOME`, `$1`, `$@`, …), backslash escapes outside single quotes, and unquoted glob/brace metacharacters are rejected because the shell expands or unescapes them at execution time into text the argument check never sees (`cat $IFS/etc/passwd` and `cat \/etc/passwd` both become `cat /etc/passwd`). Commands that execute code taken from the workspace are refused outright — the package managers and their run/build verbs (`npm`, `pnpm`, `yarn`, `npx`, `bun`, `deno`, `cargo`) and the git subcommands that run a script (`git bisect`, `git submodule`, `git filter-branch`, `git filter-repo`, plus git `-c` config injection and `!`-aliases) — because such code runs with the agent's privileges and ignores the confinement.
++- **This shell confinement is a best-effort argument check, not a filesystem jail.** It is defence-in-depth for the common case of no external sandbox (bubblewrap/firejail/docker/landlock), and a command that reaches a host file through a mechanism the check does not model can still slip through. For an untrusted guest, prefer `"level": "read_only"`, which disables **all** tool calls outright, and run the process under an external sandbox.
++- Agents without an `autonomy` block keep using the shared global policy.
++
++Example — a guest bound to one Telegram peer, read-only:
++
++```json
++{
++  "agents": {
++    "list": [
++      {
++        "id": "guest",
++        "model": { "primary": "anthropic/claude-haiku-3.5" },
++        "system_prompt": "You are a read-only guest. Answer questions, never modify anything.",
++        "autonomy": { "level": "read_only" }
++      }
++    ]
++  },
++  "bindings": [
++    {
++      "agent_id": "guest",
++      "match": {
++        "channel": "telegram",
++        "account_id": "main",
++        "peer": { "kind": "direct", "id": "123456789" }
++      }
++    }
++  ]
++}
++```
++
++For an untrusted guest prefer `"level": "read_only"`: it disables all tool calls, and only the confinement above (shell argument check and outbound-attachment check) is relied upon. Use `"level": "supervised"` instead when the guest may act but every medium/high-risk command still needs approval; add `allowed_commands` / `allowed_paths` to grant a narrow, explicit scope. Neither level is a filesystem jail — pair it with an external sandbox for untrusted input.
++
+ ### `messages.inbound`
+ 
+ - `debounce_ms` delays handling rapid-fire plain-text inbound messages so several short fragments can collapse into one turn.
+diff --git a/docs/zh/configuration.md b/docs/zh/configuration.md
+index 132cea4..33bc34a 100644
+--- a/docs/zh/configuration.md
++++ b/docs/zh/configuration.md
+@@ -348,6 +348,64 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API
+ - 两个命名 agent 即使使用相同的 provider/model，也可以保持各自独立的持久笔记和工作区。
+ - `workspace_path` 本身不会决定聊天路由；路由仍然由 `bindings`、`/bind` 或显式 `--agent` / `/subagents spawn --agent` 决定。
+ 
++#### `agents.list[].autonomy`
++
++当某个命名 agent（例如只绑定单个聊天对端的 guest）需要使用比全局更严格的安全策略时，使用 `autonomy`。
++
++- 该对象支持与顶层 `autonomy` 相同的字段：`level`、`workspace_only`、`allowed_commands`、`allowed_paths`、`max_actions_per_hour`、`require_approval_for_medium_risk`、`block_high_risk_commands`、`block_medium_risk_commands`、`allow_raw_url_chars`。
++- 一旦设置，它会**替换**该 agent 的全局 `autonomy`。未写出的字段回落到 `AutonomyConfig` 的安全默认值（`supervised`、`workspace_only: true`、空的 `allowed_paths`、保守的命令白名单），**不会**从全局块继承。`level` 取值非法时会在加载配置时直接报错。
++- 即使没有设置 `workspace_path`，该 agent 也会拥有独立的 runtime 与独立的安全策略（限速、命令白名单、路径范围）。
++- 对于拥有独立 autonomy 的 agent，以下“在全局策略下执行工作”或“会触达工作区之外”的工具会被**移除**（否则它们会以该 agent 策略并未授予的权限执行）：
++  - `spawn` —— 后台 subagent 运行在全局 autonomy 下。
++  - `schedule` —— cron shell 任务运行在调度器的全局 shell 策略下。
++  - `image_info` —— 直接打开任意绝对路径、不做工作区/策略校验，是主机路径的元数据探测器（存在性、大小、格式）。
++  - `git`（`git_operations`）—— 会无视 `read_only` 意图直接写仓库（commit、checkout、reset 等）。
++  - `screenshot` —— 截取主机屏幕，泄露工作区之外的信息。
++  - MCP 工具 —— 每个已配置的 MCP server 会作为子进程启动并代理其工具，且不会经过该 agent 的策略。
++  - `delegate` —— 它可以指定任意已配置的 agent，并用运营者的 API key 调用该 agent 的 provider 和模型，访客因此可以消耗其他 agent 的 key，并把内容发给原本没有授权给它的 provider。
++
++  `cron_*` 系列工具本身就不在 agent 工具集中。
++- 涉及共享配置、在工作区之外写入、或读取主机状态的 slash 命令会被拦截：
++  - `/config`（`get`、`set`、`unset`、`apply`、`reload`、`validate`）会被拒绝。它会在全局策略下读写共享的 `config.json`，从而泄露 provider key 与 channel token，或让 guest 削弱主 agent 的 `autonomy`/`security` 配置块。
++  - `/capabilities` 只报告该 agent 自身的 runtime 工具，不再读取共享 `config.json` 来列出已配置的 channel 与工具。
++  - `/model` 仍然可以为该 agent 自身的会话切换模型，但不再把 `agents.defaults.model.primary` 持久化到全局配置，且交互式 provider/model 菜单不再读取共享 `config.json` —— 它改用公开模型列表，而不是全局 provider key。
++  - `/export` 会被拒绝：它接受任意绝对路径并截断/创建该文件，是一个可被绑定聊天对端触发的“整机文件写入”原语。
++  - 当该 Telegram 对端当前被路由到拥有独立 autonomy 的 agent 时，`/bind` 会被拒绝。否则 guest 可以用 `/bind clear` 回退到默认路由，或用 `/bind <其他 agent>` 迁移到无限制的 agent，从而逃离受限 agent。（`/bind status` 仍为只读。）
++  - 其余 slash 命令要么只影响自身会话（model、think、verbose、reasoning、usage、cost、queue、tts、focus/unfocus/dock/activation/send、session ttl、context、memory、skills、debug、stop、compact、doctor），要么作用于该 agent 自己的 subagent —— 而后者对它不可用，因为 `spawn` 工具已被移除（`/subagents spawn`、`/steer`、`/tell`、`/agents`、`/kill`、`/poll` 都会提示 subagent manager 已禁用）。`/bash`、`/approve`、`/exec`、`/elevated` 仍走该 agent 自己的 shell 工具与策略，因此下面的限制同样适用于它们。
++- 出站附件被限制：一次出站回复只能附带由**绝对路径**命名、且解析后（跟随符号链接）位于该 agent 工作区（及其自身 `allowed_paths`）之内的本地文件。相对路径会被拒绝，因为 channel 上传器（`curl --form file=@<target>`）会按自身进程 cwd 而非工作区解析它，导致上传的文件未必是检查所解析的那个。回复文本中目标落在工作区之外或为相对路径的旧式标记（`[IMAGE:…]`、`[DOCUMENT:…]`、`[FILE:…]`、`[PHOTO:…]`、`[VIDEO:…]`、`[AUDIO:…]`、`[VOICE:…]`）会在发送前被丢弃并记录日志，对所有会上传此类标记的 channel（Telegram、Max、Signal 等）都生效。远程 `http(s)` URL 不指向本地文件，不受影响。这是一条不经过工具调用的纯文本外泄路径，因此 `read_only` 同样适用。
++- shell 工具被限制在该 agent 的工作区内。命令会按 shell 视为 IFS 空白的所有字节（空格、tab、换行、垂直制表符、换页符）做词切分，随后任何命名路径的参数（绝对路径、`..` 回溯、`~`）都会被拒绝；命令中出现任何控制字节都会被直接拒绝，因为 shell 会据此切分出参数检查看不到的参数（`cat x\t/etc/passwd` 会执行 `cat x /etc/passwd`）。`$` 参数展开（`$IFS`、`$HOME`、`$1`、`$@` 等）、单引号之外的反斜杠转义，以及未加引号的 glob/花括号元字符也会被拒绝，因为 shell 会在执行时把它们展开或去转义成参数检查看不到的文本（`cat $IFS/etc/passwd` 和 `cat \/etc/passwd` 都会变成 `cat /etc/passwd`）。会直接拒绝执行来自工作区代码的命令 —— 包管理器及其 run/build 子命令（`npm`、`pnpm`、`yarn`、`npx`、`bun`、`deno`、`cargo`），以及会运行脚本的 git 子命令（`git bisect`、`git submodule`、`git filter-branch`、`git filter-repo`，外加 git `-c` 配置注入与 `!` 别名）—— 因为这类代码以 agent 进程的权限运行并绕过该限制。
++- **该 shell 限制是尽力而为的参数检查，而非文件系统 jail。** 它是在常见的无外部沙箱（bubblewrap/firejail/docker/landlock）场景下的纵深防御；若某命令通过该检查未覆盖的机制访问主机文件，仍可能绕过。对不可信的 guest，优先使用 `"level": "read_only"` —— 它会直接禁用**所有**工具调用，并让进程运行在外部沙箱中。
++- 没有 `autonomy` 块的 agent 仍然共用全局策略。
++
++示例 —— 一个只绑定单个 Telegram 对端、只读的 guest：
++
++```json
++{
++  "agents": {
++    "list": [
++      {
++        "id": "guest",
++        "model": { "primary": "anthropic/claude-haiku-3.5" },
++        "system_prompt": "You are a read-only guest. Answer questions, never modify anything.",
++        "autonomy": { "level": "read_only" }
++      }
++    ]
++  },
++  "bindings": [
++    {
++      "agent_id": "guest",
++      "match": {
++        "channel": "telegram",
++        "account_id": "main",
++        "peer": { "kind": "direct", "id": "123456789" }
++      }
++    }
++  ]
++}
++```
++
++对不可信的 guest，优先使用 `"level": "read_only"`：它会禁用所有工具调用，只依赖上面的限制（shell 参数检查与出站附件检查）。当 guest 可以执行动作、但所有中高风险命令仍需审批时，改用 `"level": "supervised"`，并通过 `allowed_commands` / `allowed_paths` 授予一个明确而狭窄的范围。两种 level 都不是文件系统 jail —— 面对不可信输入时应配合外部沙箱。
++
+ ### `messages.inbound`
+ 
+ - `debounce_ms` 用来延迟处理连续快速到达的纯文本入站消息，把短时间内的多条碎片合并成一次 turn。
+diff --git a/src/agent/commands.zig b/src/agent/commands.zig
+index 2c054e9..3111606 100644
+--- a/src/agent/commands.zig
++++ b/src/agent/commands.zig
+@@ -495,7 +495,13 @@ fn renderInteractiveModelMenu(self: anytype, provider_name: []const u8, page_num
+     if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
+     if (!@hasField(@TypeOf(self.*), "model_name")) return null;
+ 
+-    var cfg_opt: ?config_module.Config = if (builtin.is_test) null else config_module.Config.load(self.allocator) catch null;
++    // A restricted agent must not read the shared config.json (provider keys,
++    // base URLs). It still gets the interactive menu, but without the global
++    // provider credentials: fetchModels falls back to the public model list.
++    var cfg_opt: ?config_module.Config = if (builtin.is_test or hasOwnAutonomy(self))
++        null
++    else
++        config_module.Config.load(self.allocator) catch null;
+     defer if (cfg_opt) |*cfg| cfg.deinit();
+ 
+     const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(provider_name) else null;
+@@ -827,6 +833,9 @@ fn configPrimaryModelMutationValue(self: anytype, model: []const u8) ![]u8 {
+ 
+ fn persistSelectedModelToConfig(self: anytype, model: []const u8) !void {
+     if (builtin.is_test) return;
++    // A restricted agent switches model for its own session only; it must not
++    // rewrite the global agents.defaults.model.primary.
++    if (hasOwnAutonomy(self)) return;
+ 
+     const value_raw = try configPrimaryModelMutationValue(self, model);
+     defer self.allocator.free(value_raw);
+@@ -3910,6 +3919,16 @@ fn handleContextCommand(self: anytype, arg: []const u8) ![]const u8 {
+ }
+ 
+ fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
++    // A restricted agent must not write files outside its workspace: /export
++    // takes an arbitrary absolute path and truncates/creates it, so it is a
++    // whole-host file write primitive reachable from a bound chat peer.
++    if (hasOwnAutonomy(self)) {
++        return try self.allocator.dupe(
++            u8,
++            "The /export command is unavailable for this agent: it has its own autonomy and cannot write files outside its workspace.",
++        );
++    }
++
+     const raw_path = firstToken(arg);
+     const path = if (raw_path.len == 0)
+         try std.fmt.allocPrint(self.allocator, "{s}/session-{d}.md", .{ self.workspace_dir, std_compat.time.timestamp() })
+@@ -5054,7 +5073,14 @@ fn handleCapabilitiesCommand(self: anytype, arg: []const u8) ![]const u8 {
+     const trimmed = std.mem.trim(u8, arg, " \t");
+     const as_json = std.mem.eql(u8, trimmed, "--json") or std.ascii.eqlIgnoreCase(trimmed, "json");
+ 
+-    var cfg_opt: ?config_module.Config = config_module.Config.load(self.allocator) catch null;
++    // A restricted agent must not read the shared config.json: /capabilities
++    // would otherwise report the configured channel and tool names from the
++    // global config (structural information the /config refusal closes off).
++    // Such an agent reports only its own runtime tool set (cfg = null).
++    var cfg_opt: ?config_module.Config = if (hasOwnAutonomy(self))
++        null
++    else
++        config_module.Config.load(self.allocator) catch null;
+     defer if (cfg_opt) |*cfg| cfg.deinit();
+     const cfg_ptr: ?*const config_module.Config = if (cfg_opt) |*cfg| cfg else null;
+ 
+@@ -5069,7 +5095,25 @@ fn handleCapabilitiesCommand(self: anytype, arg: []const u8) ![]const u8 {
+     return capabilities_mod.buildSummaryText(self.allocator, cfg_ptr, runtime_tools);
+ }
+ 
++/// True when the agent was built from a named-agent profile that carries its
++/// own autonomy block. Such an agent is barred from the global config surface:
++/// `/config` reads and rewrites the shared config.json (provider api_keys,
++/// channel bot tokens, the autonomy/security blocks) under the global policy,
++/// which would let a restricted guest both exfiltrate secrets and weaken the
++/// main agent or any agent without its own autonomy.
++fn hasOwnAutonomy(self: anytype) bool {
++    if (comptime @hasField(@TypeOf(self.*), "has_own_autonomy")) return self.has_own_autonomy;
++    return false;
++}
++
+ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
++    if (hasOwnAutonomy(self)) {
++        return try self.allocator.dupe(
++            u8,
++            "The /config command is unavailable for this agent: it has its own autonomy and cannot read or change the global configuration.",
++        );
++    }
++
+     const parsed = splitFirstToken(arg);
+     const action = parsed.head;
+ 
+diff --git a/src/agent/root.zig b/src/agent/root.zig
+index 9dd8ef1..a09a6f1 100644
+--- a/src/agent/root.zig
++++ b/src/agent/root.zig
+@@ -276,6 +276,11 @@ pub const Agent = struct {
+     workspace_dir_owned: bool = false,
+     allowed_paths: []const []const u8 = &.{},
+     multimodal_unrestricted: bool = false,
++    /// True when this agent was built from a named-agent profile that carries
++    /// its own autonomy block. Such an agent must not reach the global config
++    /// surface (`/config`, `/model` persistence), which reads or rewrites the
++    /// shared config.json under the global policy.
++    has_own_autonomy: bool = false,
+     /// List of models that do not support image/vision input.
+     /// When image markers are detected and the model is in this list,
+     /// the agent will skip processing images instead of returning an error.
+@@ -600,6 +605,7 @@ pub const Agent = struct {
+             .workspace_dir_owned = workspace_dir_owned,
+             .allowed_paths = cfg.autonomy.allowed_paths,
+             .multimodal_unrestricted = cfg.autonomy.level == .yolo,
++            .has_own_autonomy = if (profile) |agent_profile| agent_profile.autonomy != null else false,
+             .vision_disabled_models = cfg.agent.vision_disabled_models,
+             .auto_disable_vision_on_error = cfg.agent.auto_disable_vision_on_error,
+             .max_tool_iterations = cfg.agent.max_tool_iterations,
+@@ -3658,8 +3664,18 @@ pub const Agent = struct {
+         for (self.allowed_paths) |dir| {
+             try appendMultimodalAllowedDir(arena, &allowed_dirs_list, dir);
+         }
+-        if (platform.getTempDir(arena) catch null) |tmp_dir| {
+-            try appendMultimodalAllowedDir(arena, &allowed_dirs_list, tmp_dir);
++        // The platform temp dir is a host path outside the workspace. An agent
++        // with its own autonomy must not reach it: the marker scan counts image
++        // markers in the last user message, so a bound peer could send
++        // `[IMAGE:/tmp/<file>]` and have the agent read and forward that file
++        // to the model provider — a tool-less read outside the workspace that
++        // also applies to read_only. Only agents without their own autonomy
++        // (and the unrestricted skip_dir_check case, where allowed_dirs is moot)
++        // keep the temp dir.
++        if (!self.has_own_autonomy or self.multimodal_unrestricted) {
++            if (platform.getTempDir(arena) catch null) |tmp_dir| {
++                try appendMultimodalAllowedDir(arena, &allowed_dirs_list, tmp_dir);
++            }
+         }
+         const allowed = try allowed_dirs_list.toOwnedSlice(arena);
+ 
+@@ -4567,6 +4583,124 @@ test "Agent buildProviderMessages allows workspace image paths" {
+     try std.testing.expect(has_image_part);
+ }
+ 
++test "Agent buildProviderMessages with own autonomy rejects platform temp dir images" {
++    const DummyProvider = struct {
++        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return allocator.dupe(u8, "");
++        }
++        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++            return .{};
++        }
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return false;
++        }
++        fn supportsVision(_: *anyopaque) bool {
++            return true;
++        }
++        fn supportsVisionForModel(_: *anyopaque, _: []const u8) bool {
++            return true;
++        }
++        fn getTraceId(_: *anyopaque) ?[32]u8 {
++            return null;
++        }
++        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
++        fn getName(_: *anyopaque) []const u8 {
++            return "dummy";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++
++    var tmp_ws = std.testing.tmpDir(.{});
++    defer tmp_ws.cleanup();
++
++    const allocator = std.testing.allocator;
++    const workspace_path = try @import("compat").fs.Dir.wrap(tmp_ws.dir).realpathAlloc(allocator, ".");
++    defer allocator.free(workspace_path);
++
++    // Create an image inside the platform temp dir (outside this agent's workspace).
++    const sys_temp = try platform.getTempDir(allocator);
++    defer allocator.free(sys_temp);
++    const temp_img_name = "nullclaw-test-guest-temp.png";
++    const temp_img_path = try std_compat.fs.path.join(allocator, &.{ sys_temp, temp_img_name });
++    defer allocator.free(temp_img_path);
++    {
++        const f = try std_compat.fs.createFileAbsolute(temp_img_path, .{ .truncate = true });
++        defer f.close();
++        try f.writeAll("\x89PNG\x0d\x0a\x1a\x0a");
++    }
++    defer std_compat.fs.deleteFileAbsolute(temp_img_path) catch {};
++
++    var dummy: u8 = 0;
++    const vtable = Provider.VTable{
++        .chatWithSystem = DummyProvider.chatWithSystem,
++        .chat = DummyProvider.chat,
++        .supportsNativeTools = DummyProvider.supportsNativeTools,
++        .supports_vision = DummyProvider.supportsVision,
++        .supports_vision_for_model = DummyProvider.supportsVisionForModel,
++        .getName = DummyProvider.getName,
++        .deinit = DummyProvider.deinitFn,
++    };
++    const prov = Provider{ .ptr = @ptrCast(&dummy), .vtable = &vtable };
++
++    var noop = observability.NoopObserver{};
++    var agent = Agent{
++        .allocator = allocator,
++        .provider = prov,
++        .tools = &.{},
++        .tool_specs = try allocator.alloc(ToolSpec, 0),
++        .mem = null,
++        .observer = noop.observer(),
++        .model_name = "vision-model",
++        .temperature = 0.7,
++        .workspace_dir = workspace_path,
++        .max_tool_iterations = 10,
++        .max_history_messages = 50,
++        .auto_save = false,
++        .history = .empty,
++        .total_tokens = 0,
++        .has_system_prompt = false,
++        .has_own_autonomy = false,
++        .multimodal_unrestricted = false,
++    };
++    defer agent.deinit();
++
++    try agent.history.append(allocator, .{
++        .role = .user,
++        .content = try std.fmt.allocPrint(allocator, "Inspect [IMAGE:{s}]", .{temp_img_path}),
++    });
++
++    // Positive control: without its own autonomy the agent keeps the previous
++    // behaviour and reads the temp-dir image.
++    {
++        var arena_impl = std.heap.ArenaAllocator.init(allocator);
++        defer arena_impl.deinit();
++        const messages = try agent.buildProviderMessages(arena_impl.allocator(), agent.model_name);
++        try std.testing.expectEqual(@as(usize, 1), messages.len);
++        var has_image_part = false;
++        if (messages[0].content_parts) |parts| {
++            for (parts) |part| {
++                if (part == .image_base64) has_image_part = true;
++            }
++        }
++        try std.testing.expect(has_image_part);
++    }
++
++    // With its own autonomy, the platform temp dir is not an allowed dir, so a
++    // peer-supplied `[IMAGE:/tmp/<file>]` must not be read: no image_base64 part.
++    agent.has_own_autonomy = true;
++    {
++        var arena_impl = std.heap.ArenaAllocator.init(allocator);
++        defer arena_impl.deinit();
++        const messages = try agent.buildProviderMessages(arena_impl.allocator(), agent.model_name);
++        try std.testing.expectEqual(@as(usize, 1), messages.len);
++        if (messages[0].content_parts) |parts| {
++            for (parts) |part| {
++                try std.testing.expect(part != .image_base64);
++            }
++        }
++    }
++}
++
+ test "Agent max_tool_iterations default" {
+     try std.testing.expectEqual(@as(u32, 25), DEFAULT_MAX_TOOL_ITERATIONS);
+ }
+@@ -8299,6 +8433,56 @@ test "slash /config reload returns summary" {
+     try std.testing.expect(std.mem.indexOf(u8, response, "Config hot reload complete") != null);
+ }
+ 
++test "slash /config is refused for an agent with its own autonomy" {
++    const allocator = std.testing.allocator;
++
++    // A restricted agent must not be able to read the global config.json (which
++    // holds provider keys and channel tokens) through /config get.
++    var guest = try makeTestAgent(allocator);
++    defer guest.deinit();
++    guest.has_own_autonomy = true;
++    const refused = (try guest.handleSlashCommand("/config get providers")).?;
++    defer allocator.free(refused);
++    try std.testing.expect(std.mem.indexOf(u8, refused, "unavailable for this agent") != null);
++
++    // An agent without its own autonomy keeps the normal config surface.
++    var plain = try makeTestAgent(allocator);
++    defer plain.deinit();
++    try std.testing.expect(!plain.has_own_autonomy);
++    const show = (try plain.handleSlashCommand("/config show")).?;
++    defer allocator.free(show);
++    try std.testing.expect(std.mem.indexOf(u8, show, "unavailable for this agent") == null);
++}
++
++test "slash /export is refused for an agent with its own autonomy" {
++    const allocator = std.testing.allocator;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
++    defer allocator.free(base);
++    const export_path = try std.fmt.allocPrint(allocator, "{s}/export-probe.md", .{base});
++    defer allocator.free(export_path);
++    const cmd = try std.fmt.allocPrint(allocator, "/export {s}", .{export_path});
++    defer allocator.free(cmd);
++
++    // A restricted agent must not be able to write an arbitrary absolute path
++    // (or truncate an existing file) through /export.
++    var guest = try makeTestAgent(allocator);
++    defer guest.deinit();
++    guest.has_own_autonomy = true;
++    const refused = (try guest.handleSlashCommand(cmd)).?;
++    defer allocator.free(refused);
++    try std.testing.expect(std.mem.indexOf(u8, refused, "unavailable for this agent") != null);
++
++    // An agent without its own autonomy keeps the normal export surface.
++    var plain = try makeTestAgent(allocator);
++    defer plain.deinit();
++    try std.testing.expect(!plain.has_own_autonomy);
++    const exported = (try plain.handleSlashCommand(cmd)).?;
++    defer allocator.free(exported);
++    try std.testing.expect(std.mem.indexOf(u8, exported, "unavailable for this agent") == null);
++}
++
+ test "Agent streaming fields default to null" {
+     const allocator = std.testing.allocator;
+     var noop = observability.NoopObserver{};
+diff --git a/src/channel_loop.zig b/src/channel_loop.zig
+index 4727a3b..0adc48c 100644
+--- a/src/channel_loop.zig
++++ b/src/channel_loop.zig
+@@ -335,6 +335,40 @@ pub fn buildTelegramBindingStatusReply(
+     return try out.toOwnedSlice(allocator);
+ }
+ 
++/// True when the agent currently routed for this Telegram peer carries its own
++/// autonomy block (see NamedAgentConfig.autonomy). Such a peer is a restricted
++/// guest and must not be able to rebind itself out of that agent. Resolution
++/// mirrors buildTelegramBindingStatusReply; a resolution failure is treated as
++/// "not restricted" so a transient error cannot lock a peer out of /bind.
++fn telegramPeerRoutedAgentIsRestricted(
++    allocator: std.mem.Allocator,
++    config: *const Config,
++    account_id: []const u8,
++    sender: []const u8,
++    is_group: bool,
++) bool {
++    const base_chat_id = if (is_group) telegram.targetChatId(sender) else sender;
++    const thread_id = if (is_group) telegram.targetThreadId(sender) else null;
++    const peer_kind = currentTelegramBindingKind(is_group);
++    const peer_id = currentTelegramBindingPeerId(allocator, sender, is_group) catch return false;
++    defer allocator.free(peer_id);
++
++    const route = agent_routing.resolveRouteWithSession(allocator, .{
++        .channel = "telegram",
++        .account_id = account_id,
++        .peer = .{ .kind = peer_kind, .id = peer_id },
++        .parent_peer = if (is_group and thread_id != null)
++            .{ .kind = peer_kind, .id = base_chat_id }
++        else
++            null,
++    }, config.agent_bindings, config.agents, config.session) catch return false;
++    defer allocator.free(route.session_key);
++    defer allocator.free(route.main_session_key);
++
++    const profile = agent_bindings_config.findNamedAgent(config.agents, route.agent_id) orelse return false;
++    return profile.autonomy != null;
++}
++
+ pub fn applyTelegramBindingCommand(
+     allocator: std.mem.Allocator,
+     config: *const Config,
+@@ -353,6 +387,19 @@ pub fn applyTelegramBindingCommand(
+     const peer_id = try currentTelegramBindingPeerId(allocator, sender, is_group);
+     defer allocator.free(peer_id);
+ 
++    // A peer currently routed to an agent with its own autonomy must not rebind
++    // itself: `/bind clear` falls back to the default route and `/bind <other>`
++    // moves the peer to another agent, either of which would escape the
++    // restricted guest agent entirely. `/bind status`/`help` is read-only and
++    // returned above, so only the mutating forms are refused here.
++    if (telegramPeerRoutedAgentIsRestricted(allocator, config, account_id, sender, is_group)) {
++        return std.fmt.allocPrint(
++            allocator,
++            "This {s} is bound to an agent with its own autonomy; binding changes are disabled for it.",
++            .{binding_label},
++        );
++    }
++
+     const binding_target = agent_bindings_config.BindingTarget{
+         .channel = "telegram",
+         .account_id = account_id,
+@@ -3138,6 +3185,46 @@ test "buildTelegramBindingStatusReply shows synthetic peer agent for auto-provis
+     try std.testing.expect(std.mem.indexOf(u8, reply, "Matched by: default") != null);
+ }
+ 
++test "applyTelegramBindingCommand refuses rebinding a peer routed to a restricted agent" {
++    const allocator = std.testing.allocator;
++    const agents = [_]config_types.NamedAgentConfig{
++        .{ .name = "guest", .provider = "openai", .model = "gpt-4", .autonomy = .{ .level = .supervised } },
++        .{ .name = "plain", .provider = "openai", .model = "gpt-4" },
++    };
++    const bindings = [_]agent_routing.AgentBinding{
++        .{
++            .agent_id = "guest",
++            .match = .{
++                .channel = "telegram",
++                .peer = .{ .kind = .direct, .id = "123456" },
++            },
++        },
++    };
++    const cfg = Config{
++        .workspace_dir = "/tmp/nullclaw",
++        .config_path = "/tmp/nullclaw/config.json",
++        .allocator = allocator,
++        .agents = &agents,
++        .agent_bindings = &bindings,
++    };
++
++    // The guest peer cannot clear its binding (which would fall back to the
++    // unrestricted default route)...
++    const cleared = try applyTelegramBindingCommand(allocator, &cfg, "main", "123456", false, "clear");
++    defer allocator.free(cleared);
++    try std.testing.expect(std.mem.indexOf(u8, cleared, "binding changes are disabled") != null);
++
++    // ...nor move itself to another agent.
++    const moved = try applyTelegramBindingCommand(allocator, &cfg, "main", "123456", false, "plain");
++    defer allocator.free(moved);
++    try std.testing.expect(std.mem.indexOf(u8, moved, "binding changes are disabled") != null);
++
++    // A peer routed to an agent without its own autonomy keeps the normal path.
++    const other = try applyTelegramBindingCommand(allocator, &cfg, "main", "999999", false, "nope");
++    defer allocator.free(other);
++    try std.testing.expect(std.mem.indexOf(u8, other, "binding changes are disabled") == null);
++}
++
+ test "telegram update offset store roundtrip" {
+     const allocator = std.testing.allocator;
+ 
+diff --git a/src/config.zig b/src/config.zig
+index fb382c5..63c50b2 100644
+--- a/src/config.zig
++++ b/src/config.zig
+@@ -156,6 +156,7 @@ const SerializedNamedAgentConfig = struct {
+     temperature: ?f64 = null,
+     max_depth: u32 = 3,
+     enable_pii_redaction: bool = true,
++    autonomy: ?config_types.AutonomyConfig = null,
+ };
+ 
+ const SerializedModelRouteConfig = struct {
+@@ -176,6 +177,7 @@ fn freeNamedAgentSlice(allocator: std.mem.Allocator, agents: []const NamedAgentC
+         if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
+         if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
+         if (agent_cfg.api_key) |api_key| allocator.free(api_key);
++        if (agent_cfg.autonomy) |*autonomy| config_types.freeAutonomyConfig(allocator, autonomy);
+     }
+     allocator.free(agents);
+ }
+@@ -1224,11 +1226,13 @@ pub const Config = struct {
+                 if (has_agents) {
+                     const serialized_agents = try self.allocator.alloc(SerializedNamedAgentConfig, self.agents.len);
+                     defer self.allocator.free(serialized_agents);
+-                    var agent_count: usize = 0;
+-                    errdefer {
+-                        for (serialized_agents[0..agent_count]) |agent_cfg| {
+-                            if (agent_cfg.api_key) |value| self.allocator.free(value);
+-                        }
++                    // Pre-initialize every slot so the single cleanup defer below
++                    // is safe even when the loop errors part-way: unfilled slots
++                    // free a null api_key. (Previously an errdefer over the filled
++                    // prefix and this defer both freed the same api_key strings on
++                    // error — a latent double free.)
++                    for (serialized_agents) |*slot| {
++                        slot.* = .{ .name = "", .provider = "", .model = "" };
+                     }
+                     for (self.agents, 0..) |agent_cfg, i| {
+                         const encrypted_key = try self.encryptConfigSecret(&store, agent_cfg.api_key);
+@@ -1242,8 +1246,8 @@ pub const Config = struct {
+                             .temperature = agent_cfg.temperature,
+                             .max_depth = agent_cfg.max_depth,
+                             .enable_pii_redaction = agent_cfg.enable_pii_redaction,
++                            .autonomy = agent_cfg.autonomy,
+                         };
+-                        agent_count += 1;
+                     }
+                     defer {
+                         for (serialized_agents) |agent_cfg| {
+@@ -4860,6 +4864,125 @@ test "json parse agents" {
+     try std.testing.expect(!cfg.agents[1].enable_pii_redaction);
+ }
+ 
++test "json parse agents.list autonomy replaces global with secure defaults" {
++    const allocator = std.testing.allocator;
++    const json =
++        \\{"autonomy": {"level": "yolo", "workspace_only": false, "allowed_commands": ["*"]},
++        \\ "agents": {"list": [
++        \\  {"id": "guest", "provider": "anthropic", "model": "claude-haiku-3.5", "autonomy": {"level": "read_only"}},
++        \\  {"id": "plain", "provider": "anthropic", "model": "claude-haiku-3.5"}
++        \\]}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try cfg.parseJson(json);
++    defer freeNamedAgentSlice(allocator, cfg.agents);
++    defer {
++        for (cfg.autonomy.allowed_commands) |cmd| allocator.free(cmd);
++        allocator.free(cfg.autonomy.allowed_commands);
++    }
++
++    try std.testing.expectEqual(@as(usize, 2), cfg.agents.len);
++    const autonomy = cfg.agents[0].autonomy orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(AutonomyLevel.read_only, autonomy.level);
++    // Keys default to the secure AutonomyConfig defaults — NOT the global yolo block.
++    try std.testing.expect(autonomy.workspace_only);
++    try std.testing.expect(autonomy.block_high_risk_commands);
++    try std.testing.expect(autonomy.block_medium_risk_commands);
++    try std.testing.expect(autonomy.require_approval_for_medium_risk);
++    try std.testing.expectEqual(@as(usize, 0), autonomy.allowed_commands.len);
++    try std.testing.expectEqual(@as(usize, 0), autonomy.allowed_paths.len);
++    // An agent without an autonomy block keeps `null` so it uses the global policy.
++    try std.testing.expect(cfg.agents[1].autonomy == null);
++}
++
++test "json parse agents.list autonomy invalid level rejected" {
++    const allocator = std.testing.allocator;
++    const json =
++        \\{"agents": {"list": [
++        \\  {"id": "guest", "provider": "anthropic", "model": "claude-haiku-3.5", "autonomy": {"level": "god-mode"}}
++        \\]}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try std.testing.expectError(error.InvalidAutonomyLevel, cfg.parseJson(json));
++}
++
++test "json parse top-level autonomy invalid level rejected" {
++    // The per-agent parser shares the top-level parser, so an unknown level is
++    // rejected in both places instead of silently falling back to a default.
++    const allocator = std.testing.allocator;
++    const json =
++        \\{"autonomy": {"level": "god-mode"}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try std.testing.expectError(error.InvalidAutonomyLevel, cfg.parseJson(json));
++}
++
++test "agents.list autonomy round trips through save" {
++    const allocator = std.testing.allocator;
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
++    defer allocator.free(base);
++    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
++    defer allocator.free(config_path);
++
++    const json =
++        \\{"agents": {"list": [
++        \\  {"id": "guest", "provider": "anthropic", "model": "claude-haiku-3.5", "autonomy": {"level": "read_only", "workspace_only": true, "allowed_paths": ["/tmp/guest-shared"]}},
++        \\  {"id": "plain", "provider": "anthropic", "model": "claude-haiku-3.5"}
++        \\]}}
++    ;
++    var cfg = Config{ .workspace_dir = base, .config_path = config_path, .allocator = allocator };
++    try cfg.parseJson(json);
++    defer freeNamedAgentSlice(allocator, cfg.agents);
++    try cfg.save();
++
++    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
++    defer file.close();
++    const content = try file.readToEndAlloc(allocator, 128 * 1024);
++    defer allocator.free(content);
++    try std.testing.expect(std.mem.indexOf(u8, content, "\"autonomy\"") != null);
++
++    var arena = std.heap.ArenaAllocator.init(allocator);
++    defer arena.deinit();
++    var loaded = Config{ .workspace_dir = base, .config_path = config_path, .allocator = arena.allocator() };
++    try loaded.parseJson(content);
++    try std.testing.expectEqual(@as(usize, 2), loaded.agents.len);
++    const autonomy = loaded.agents[0].autonomy orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(AutonomyLevel.read_only, autonomy.level);
++    try std.testing.expect(autonomy.workspace_only);
++    try std.testing.expectEqual(@as(usize, 1), autonomy.allowed_paths.len);
++    try std.testing.expectEqualStrings("/tmp/guest-shared", autonomy.allowed_paths[0]);
++    try std.testing.expect(loaded.agents[1].autonomy == null);
++}
++
++test "invalid autonomy level aborts the parse before any field is written" {
++    const allocator = std.testing.allocator;
++    // `workspace` is parsed before `autonomy` in parseJson. An unknown level must
++    // fail the parse before that (or any) field is written, so Config.load does
++    // not keep a half-parsed config that silently drops the rest.
++    const json =
++        \\{"workspace": "/tmp/should-not-be-applied", "autonomy": {"level": "bogus"}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try std.testing.expectError(error.InvalidAutonomyLevel, cfg.parseJson(json));
++    try std.testing.expect(cfg.workspace_dir_override == null);
++}
++
++test "invalid per-agent autonomy level aborts the parse before any field is written" {
++    const allocator = std.testing.allocator;
++    const json =
++        \\{"workspace": "/tmp/should-not-be-applied",
++        \\ "agents": {"list": [
++        \\  {"id": "guest", "provider": "anthropic", "model": "claude-haiku-3.5", "autonomy": {"level": "god-mode"}}
++        \\]}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try std.testing.expectError(error.InvalidAutonomyLevel, cfg.parseJson(json));
++    try std.testing.expect(cfg.workspace_dir_override == null);
++    try std.testing.expectEqual(@as(usize, 0), cfg.agents.len);
++}
++
+ test "json parse root agent pii redaction flag" {
+     const allocator = std.testing.allocator;
+     const json =
+diff --git a/src/config_parse.zig b/src/config_parse.zig
+index 2f1480f..8ed4bcf 100644
+--- a/src/config_parse.zig
++++ b/src/config_parse.zig
+@@ -242,6 +242,7 @@ fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAge
+     if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
+     if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
+     if (agent_cfg.api_key) |api_key| allocator.free(api_key);
++    if (agent_cfg.autonomy) |*autonomy| types.freeAutonomyConfig(allocator, autonomy);
+ }
+ 
+ fn parsePrimaryModelObject(
+@@ -442,6 +443,78 @@ fn parseDiagnosticsOtelHeaders(
+     return try header_list.toOwnedSlice(allocator);
+ }
+ 
++/// Reject an unknown autonomy `level` up front, before parseJson writes any
++/// field onto `self`. parseJson mutates `self` in place, so an error raised
++/// half-way through it leaves a partially-populated Config: Config.load keeps
++/// that half-built value (it only logs a warning), silently dropping every
++/// section that comes after the bad key. Validating the top-level and per-agent
++/// autonomy levels here turns a typo into a clean failure that falls back to
++/// defaults as a whole, instead of a config that is half-parsed.
++fn validateAutonomyLevels(root: std.json.ObjectMap) !void {
++    if (root.get("autonomy")) |aut| {
++        if (aut == .object) try validateAutonomyObjectLevel(aut.object);
++    }
++    const agents = root.get("agents") orelse return;
++    if (agents != .object) return;
++    const list = agents.object.get("list") orelse return;
++    if (list != .array) return;
++    for (list.array.items) |item| {
++        if (item != .object) continue;
++        const aut = item.object.get("autonomy") orelse continue;
++        if (aut == .object) try validateAutonomyObjectLevel(aut.object);
++    }
++}
++
++fn validateAutonomyObjectLevel(obj: std.json.ObjectMap) !void {
++    const v = obj.get("level") orelse return;
++    if (v != .string) return;
++    if (types.AutonomyLevel.fromString(v.string) == null) return error.InvalidAutonomyLevel;
++}
++
++/// Parse an `autonomy` JSON object into an AutonomyConfig. Keys that are absent
++/// keep the AutonomyConfig struct defaults (secure defaults), and the returned
++/// value REPLACES any other autonomy block rather than merging with it. A
++/// present-but-unrecognised `level` string is rejected (fail fast) instead of
++/// silently falling back to a default.
++fn parseAutonomyObject(allocator: std.mem.Allocator, obj: std.json.ObjectMap) !types.AutonomyConfig {
++    var autonomy = types.AutonomyConfig{};
++    errdefer types.freeAutonomyConfig(allocator, &autonomy);
++
++    if (obj.get("workspace_only")) |v| {
++        if (v == .bool) autonomy.workspace_only = v.bool;
++    }
++    if (obj.get("max_actions_per_hour")) |v| {
++        if (v == .integer) autonomy.max_actions_per_hour = @intCast(v.integer);
++    }
++    // max_cost_per_day_cents: ignored (removed — never enforced at runtime)
++    if (obj.get("require_approval_for_medium_risk")) |v| {
++        if (v == .bool) autonomy.require_approval_for_medium_risk = v.bool;
++    }
++    if (obj.get("block_high_risk_commands")) |v| {
++        if (v == .bool) autonomy.block_high_risk_commands = v.bool;
++    }
++    if (obj.get("block_medium_risk_commands")) |v| {
++        if (v == .bool) autonomy.block_medium_risk_commands = v.bool;
++    }
++    if (obj.get("level")) |v| {
++        if (v == .string) {
++            autonomy.level = types.AutonomyLevel.fromString(v.string) orelse
++                return error.InvalidAutonomyLevel;
++        }
++    }
++    if (obj.get("allowed_commands")) |v| {
++        if (v == .array) autonomy.allowed_commands = try parseStringArray(allocator, v.array);
++    }
++    if (obj.get("allow_raw_url_chars")) |v| {
++        if (v == .bool) autonomy.allow_raw_url_chars = v.bool;
++    }
++    // forbidden_paths: ignored (removed — path security handled by path_security.zig)
++    if (obj.get("allowed_paths")) |v| {
++        if (v == .array) autonomy.allowed_paths = try parseStringArray(allocator, v.array);
++    }
++    return autonomy;
++}
++
+ fn parseNamedAgentObject(
+     allocator: std.mem.Allocator,
+     config_path: []const u8,
+@@ -542,6 +615,11 @@ fn parseNamedAgentObject(
+     if (item.object.get("enable_pii_redaction")) |v| {
+         if (v == .bool) agent_cfg.enable_pii_redaction = v.bool;
+     }
++    if (item.object.get("autonomy")) |aut| {
++        if (aut == .object) {
++            agent_cfg.autonomy = try parseAutonomyObject(allocator, aut.object);
++        }
++    }
+     return agent_cfg;
+ }
+ 
+@@ -1109,6 +1187,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
+     defer parsed.deinit();
+ 
+     const root = parsed.value.object;
++
++    // Reject an unknown autonomy level before any field is written onto `self`
++    // so Config.load does not keep a half-parsed config (see validateAutonomyLevels).
++    try validateAutonomyLevels(root);
++
+     const explicit_provider_names = try collectExplicitProviderNames(self.allocator, root);
+     defer if (explicit_provider_names.len > 0) self.allocator.free(explicit_provider_names);
+ 
+@@ -1571,39 +1654,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
+     // Autonomy
+     if (root.get("autonomy")) |aut| {
+         if (aut == .object) {
+-            if (aut.object.get("workspace_only")) |v| {
+-                if (v == .bool) self.autonomy.workspace_only = v.bool;
+-            }
+-            if (aut.object.get("max_actions_per_hour")) |v| {
+-                if (v == .integer) self.autonomy.max_actions_per_hour = @intCast(v.integer);
+-            }
+-            // max_cost_per_day_cents: ignored (removed — never enforced at runtime)
+-            if (aut.object.get("require_approval_for_medium_risk")) |v| {
+-                if (v == .bool) self.autonomy.require_approval_for_medium_risk = v.bool;
+-            }
+-            if (aut.object.get("block_high_risk_commands")) |v| {
+-                if (v == .bool) self.autonomy.block_high_risk_commands = v.bool;
+-            }
+-            if (aut.object.get("block_medium_risk_commands")) |v| {
+-                if (v == .bool) self.autonomy.block_medium_risk_commands = v.bool;
+-            }
+-            if (aut.object.get("level")) |v| {
+-                if (v == .string) {
+-                    if (types.AutonomyLevel.fromString(v.string)) |lvl| {
+-                        self.autonomy.level = lvl;
+-                    }
+-                }
+-            }
+-            if (aut.object.get("allowed_commands")) |v| {
+-                if (v == .array) self.autonomy.allowed_commands = try parseStringArray(self.allocator, v.array);
+-            }
+-            if (aut.object.get("allow_raw_url_chars")) |v| {
+-                if (v == .bool) self.autonomy.allow_raw_url_chars = v.bool;
+-            }
+-            // forbidden_paths: ignored (removed — path security handled by path_security.zig)
+-            if (aut.object.get("allowed_paths")) |v| {
+-                if (v == .array) self.autonomy.allowed_paths = try parseStringArray(self.allocator, v.array);
+-            }
++            self.autonomy = try parseAutonomyObject(self.allocator, aut.object);
+         }
+     }
+ 
+diff --git a/src/config_types.zig b/src/config_types.zig
+index 1e0242a..c7bf68a 100644
+--- a/src/config_types.zig
++++ b/src/config_types.zig
+@@ -301,6 +301,15 @@ pub const AutonomyConfig = struct {
+     allowed_paths: []const []const u8 = &.{},
+ };
+ 
++/// Free the heap slices owned by an AutonomyConfig (allowed_commands / allowed_paths).
++/// The struct itself is left untouched; callers must drop it after freeing.
++pub fn freeAutonomyConfig(allocator: std.mem.Allocator, autonomy: *const AutonomyConfig) void {
++    for (autonomy.allowed_commands) |cmd| allocator.free(cmd);
++    allocator.free(autonomy.allowed_commands);
++    for (autonomy.allowed_paths) |path| allocator.free(path);
++    allocator.free(autonomy.allowed_paths);
++}
++
+ pub const DockerRuntimeConfig = struct {
+     image: []const u8 = "alpine:3.24",
+     network: []const u8 = "none",
+@@ -1938,6 +1947,12 @@ pub const NamedAgentConfig = struct {
+     /// outbound provider messages so user data does not leak to remote LLMs.
+     /// Default true (secure-by-default). Disable explicitly for known-local-only agents.
+     enable_pii_redaction: bool = true,
++    /// Optional per-agent security policy. When present it REPLACES the global
++    /// `autonomy` block for this agent (keys default to the secure
++    /// AutonomyConfig defaults, not the global values). Agents with their own
++    /// autonomy always run in a dedicated runtime and have global-scope escape
++    /// hatches (`spawn`, `schedule`) withheld.
++    autonomy: ?AutonomyConfig = null,
+ };
+ 
+ // ── MCP Server Config ──────────────────────────────────────────
+diff --git a/src/outbound.zig b/src/outbound.zig
+index 85e1608..ab21744 100644
+--- a/src/outbound.zig
++++ b/src/outbound.zig
+@@ -5,6 +5,9 @@
+ //! DingTalk. Channels can consume only the subset they support.
+ 
+ const std = @import("std");
++const std_compat = @import("compat");
++const fs_compat = @import("fs_compat.zig");
++const path_security = @import("tools/path_security.zig");
+ 
+ pub const AttachmentKind = enum {
+     image,
+@@ -155,6 +158,161 @@ test "outbound has_legacy_attachment_markers ignores plain text" {
+     try std.testing.expect(!has_legacy_attachment_markers("[IMAGINE:/tmp/photo.png] is not a marker."));
+ }
+ 
++/// Restricts which local files an agent's outbound reply may attach. Set for an
++/// agent that carries its own autonomy: a local attachment target must resolve
++/// (symlinks followed) inside the agent's workspace or one of its allowed_paths.
++/// Remote http(s) URLs name no local file and are always allowed.
++pub const AttachmentScope = struct {
++    workspace_dir: []const u8,
++    allowed_paths: []const []const u8 = &.{},
++};
++
++/// True when `target` may be attached under `scope`. Remote http(s) URLs name
++/// no local file and are always allowed. A local target must be an absolute
++/// path that resolves (symlinks followed) inside the agent's workspace or one
++/// of its allowed_paths.
++///
++/// Relative targets are refused. The outbound channels
++/// (telegram/max/signal `resolveAttachmentPath`) hand a relative target
++/// straight to `curl --form file=@<target>`, which resolves it against the
++/// *process* cwd — not the workspace this check resolves against. Keeping a
++/// relative marker would therefore allow a marker that resolves to a
++/// workspace file here while the channel uploads a different, cwd-relative
++/// file (e.g. the real config.json).
++pub fn attachmentTargetAllowed(
++    allocator: std.mem.Allocator,
++    scope: AttachmentScope,
++    target: []const u8,
++) bool {
++    const trimmed = std.mem.trim(u8, target, " \t");
++    if (trimmed.len == 0) return false;
++    if (std.mem.startsWith(u8, trimmed, "http://") or std.mem.startsWith(u8, trimmed, "https://")) return true;
++    if (!std_compat.fs.path.isAbsolute(trimmed)) return false;
++
++    const resolved = fs_compat.realpathAllocPath(allocator, trimmed) catch return false;
++    defer allocator.free(resolved);
++    const ws_resolved = fs_compat.realpathAllocPath(allocator, scope.workspace_dir) catch return false;
++    defer allocator.free(ws_resolved);
++    return path_security.isResolvedPathAllowed(allocator, resolved, ws_resolved, scope.allowed_paths);
++}
++
++const legacy_marker_kinds = [_][]const u8{ "image", "photo", "file", "document", "video", "audio", "voice" };
++
++/// Return the target of a legacy `[KIND:target]` attachment marker, or null when
++/// `marker` (the text between the brackets) is not a known marker.
++fn legacyMarkerTarget(marker: []const u8) ?[]const u8 {
++    const colon = std.mem.indexOfScalar(u8, marker, ':') orelse return null;
++    const kind = std.mem.trim(u8, marker[0..colon], " ");
++    for (legacy_marker_kinds) |known| {
++        if (std.ascii.eqlIgnoreCase(kind, known)) {
++            const target = std.mem.trim(u8, marker[colon + 1 ..], " ");
++            return if (target.len == 0) null else target;
++        }
++    }
++    return null;
++}
++
++/// Remove legacy attachment markers whose local target escapes `scope` (an
++/// agent's workspace + allowed_paths). Remote URL targets are kept. Returns an
++/// owned copy of `text`; each dropped marker is logged. Used to keep an agent
++/// with its own autonomy from exfiltrating files outside its workspace through
++/// its reply text, independent of tool calls.
++pub fn stripEscapingAttachmentMarkers(
++    allocator: std.mem.Allocator,
++    text: []const u8,
++    scope: AttachmentScope,
++) ![]const u8 {
++    var out: std.ArrayListUnmanaged(u8) = .empty;
++    errdefer out.deinit(allocator);
++
++    var cursor: usize = 0;
++    while (cursor < text.len) {
++        const open = std.mem.indexOfPos(u8, text, cursor, "[") orelse {
++            try out.appendSlice(allocator, text[cursor..]);
++            break;
++        };
++        try out.appendSlice(allocator, text[cursor..open]);
++
++        const close = std.mem.indexOfPos(u8, text, open, "]") orelse {
++            try out.appendSlice(allocator, text[open..]);
++            break;
++        };
++
++        const marker = text[open + 1 .. close];
++        if (legacyMarkerTarget(marker)) |target| {
++            if (attachmentTargetAllowed(allocator, scope, target)) {
++                try out.appendSlice(allocator, text[open .. close + 1]);
++            } else {
++                std.log.warn("dropped outbound attachment marker outside the agent workspace: {s}", .{marker});
++            }
++        } else {
++            try out.appendSlice(allocator, text[open .. close + 1]);
++        }
++        cursor = close + 1;
++    }
++    return out.toOwnedSlice(allocator);
++}
++
++test "attachmentTargetAllowed keeps workspace files and rejects escapes" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const dir = std_compat.fs.Dir.wrap(tmp.dir);
++    const base = try dir.realpathAlloc(std.testing.allocator, ".");
++    defer std.testing.allocator.free(base);
++
++    try dir.writeFile(.{ .sub_path = "notes.txt", .data = "hi" });
++    const inside = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "notes.txt" });
++    defer std.testing.allocator.free(inside);
++
++    const scope = AttachmentScope{ .workspace_dir = base };
++    try std.testing.expect(attachmentTargetAllowed(std.testing.allocator, scope, inside));
++    // Relative targets are refused because the channel uploader resolves them
++    // against the process cwd instead of the workspace.
++    try std.testing.expect(!attachmentTargetAllowed(std.testing.allocator, scope, "notes.txt"));
++    try std.testing.expect(!attachmentTargetAllowed(std.testing.allocator, scope, "./notes.txt"));
++    // Absolute paths outside the workspace, and `..` traversal, are refused.
++    try std.testing.expect(!attachmentTargetAllowed(std.testing.allocator, scope, "/etc/passwd"));
++    try std.testing.expect(!attachmentTargetAllowed(std.testing.allocator, scope, "../../config.json"));
++    try std.testing.expect(!attachmentTargetAllowed(std.testing.allocator, scope, "/nonexistent-nullclaw-probe.txt"));
++    // Remote URLs name no local file.
++    try std.testing.expect(attachmentTargetAllowed(std.testing.allocator, scope, "https://example.com/x.png"));
++}
++
++test "stripEscapingAttachmentMarkers drops escapes and keeps workspace and urls" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const dir = std_compat.fs.Dir.wrap(tmp.dir);
++    const base = try dir.realpathAlloc(std.testing.allocator, ".");
++    defer std.testing.allocator.free(base);
++
++    try dir.writeFile(.{ .sub_path = "report.pdf", .data = "hi" });
++    const inside = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "report.pdf" });
++    defer std.testing.allocator.free(inside);
++
++    const scope = AttachmentScope{ .workspace_dir = base };
++
++    const keep = try std.fmt.allocPrint(std.testing.allocator, "see [DOCUMENT:{s}] and [IMAGE:https://example.com/a.png]", .{inside});
++    defer std.testing.allocator.free(keep);
++    const kept = try stripEscapingAttachmentMarkers(std.testing.allocator, keep, scope);
++    defer std.testing.allocator.free(kept);
++    try std.testing.expect(std.mem.indexOf(u8, kept, "report.pdf") != null);
++    try std.testing.expect(std.mem.indexOf(u8, kept, "https://example.com/a.png") != null);
++
++    // A marker pointing at an absolute path outside the workspace is dropped,
++    // while surrounding text survives.
++    const escape = "here you go [DOCUMENT:/etc/passwd] bye";
++    const stripped = try stripEscapingAttachmentMarkers(std.testing.allocator, escape, scope);
++    defer std.testing.allocator.free(stripped);
++    try std.testing.expect(std.mem.indexOf(u8, stripped, "/etc/passwd") == null);
++    try std.testing.expect(std.mem.indexOf(u8, stripped, "here you go") != null);
++    try std.testing.expect(std.mem.indexOf(u8, stripped, "bye") != null);
++
++    // Non-marker brackets are untouched.
++    const plain = try stripEscapingAttachmentMarkers(std.testing.allocator, "hello [world] there", scope);
++    defer std.testing.allocator.free(plain);
++    try std.testing.expectEqualStrings("hello [world] there", plain);
++}
++
+ test "Payload toPlainText includes structured card fields and choices" {
+     const buttons = [_]ActionButton{
+         .{ .id = "approve", .label = "Approve" },
+diff --git a/src/security/policy.zig b/src/security/policy.zig
+index e4bba0a..976dee8 100644
+--- a/src/security/policy.zig
++++ b/src/security/policy.zig
+@@ -102,6 +102,16 @@ pub const SecurityPolicy = struct {
+     /// When true, skip the single-`&` check entirely so that bare
+     /// `&` in URLs (e.g. `curl https://...?a=1&b=2`) is permitted.
+     allow_raw_url_chars: bool = false,
++    /// When true, EVERY command argument that names a path must resolve inside
++    /// the workspace: absolute paths, `..` traversal and `~` expansion are
++    /// rejected, and commands that execute code taken from the workspace
++    /// (package managers and their run/build verbs) are refused outright,
++    /// because such code runs with the agent's privileges and can read anything
++    /// the confinement hides. Set for per-agent policies so a restricted agent
++    /// cannot reach files outside its workspace (e.g. the global config.json or
++    /// /etc/passwd) through the shell tool when no external sandbox is active.
++    /// Left off for the global policy so existing setups keep their behaviour.
++    confine_paths: bool = false,
+     tracker: ?*RateTracker = null,
+ 
+     /// Classify command risk level.
+@@ -682,12 +692,152 @@ fn isSafeGitChangeDirArg(self: *const SecurityPolicy, raw_arg: []const u8) bool
+     return true;
+ }
+ 
++/// True when no argument of `full_cmd` names a path outside the workspace: no
++/// absolute paths, no `..` traversal and no `~` expansion. Option values joined
++/// with `=` (e.g. `--file=/etc/passwd`) are checked by their value. The first
++/// token (the command itself) is skipped. Applied to every command argument for
++/// a confined policy — a command-specific allowlist is brittle, as
++/// `git diff --no-index <path>` reads any file without naming a file-reading
++/// command.
++fn argsConfinedToWorkspace(full_cmd: []const u8) bool {
++    // Split on every byte the shell treats as IFS whitespace (space, tab,
++    // newline, vertical tab, form feed), not just space: the command is run by
++    // `/bin/sh -c`, which word-splits on all of them, so `cat x\t/etc/passwd`
++    // is `cat x /etc/passwd`. Splitting on space alone would keep
++    // "x\t/etc/passwd" as one token that is neither absolute nor a `..`
++    // traversal and let it through. Control bytes are also rejected outright
++    // (see commandHasControlChar) so this is defence in depth.
++    var iter = std.mem.tokenizeAny(u8, full_cmd, " \t\n\x0b\x0c");
++    _ = iter.next(); // skip the command word
++    while (iter.next()) |raw_arg| {
++        const arg = trimMatchingQuotes(std.mem.trim(u8, raw_arg, " \t"));
++        if (arg.len == 0) continue;
++        var candidate = arg;
++        if (std.mem.indexOfScalar(u8, arg, '=')) |eq| candidate = arg[eq + 1 ..];
++        if (candidate.len == 0) continue;
++        if (candidate[0] == '~') return false;
++        if (std_compat.fs.path.isAbsolute(candidate)) return false;
++        if (hasParentTraversalSegment(candidate)) return false;
++    }
++    return true;
++}
++
++/// Commands that execute code taken from the workspace (or fetched from the
++/// network) under the agent process's privileges. A confined policy refuses
++/// them outright: their build/run verbs run arbitrary code that ignores the
++/// workspace confinement (e.g. `cargo build` runs build.rs, `npm run <script>`
++/// and `npm exec` run package scripts), which is a full shell escape even when
++/// every argument names a path inside the workspace. Their network/state verbs
++/// (`install`, `add`, `publish`, …) are already medium risk and blocked.
++fn commandExecutesArbitraryCode(base: []const u8) bool {
++    const runners = [_][]const u8{ "npm", "pnpm", "yarn", "npx", "bun", "bunx", "deno", "cargo" };
++    for (runners) |name| {
++        if (std.mem.eql(u8, base, name)) return true;
++    }
++    return false;
++}
++
++/// True when `cmd` contains a shell construct that expands at execution time
++/// into text the workspace confinement never inspects. Two families:
++///   * a `$` expansion — `$IFS`, `$HOME`, `$1`, `$@`, `${...}`, `$(...)`, and
++///     ANSI-C quoting `$'...'` — which the shell substitutes before the command
++///     runs, so `cat $IFS/etc/passwd` becomes `cat /etc/passwd` while the raw
++///     argument names no absolute path. Any `$` outside single quotes is
++///     rejected: a `$` expansion also happens inside double quotes, and `$'...'`
++///     can synthesize separators from escape sequences, so the raw character is
++///     the only reliable thing to check. A single-quoted `$` is literal and
++///     stays allowed.
++///   * an unquoted glob/brace metacharacter — `cat {.,..}/etc/passwd`
++///     brace-expands to `cat ../etc/passwd`. Quoted metacharacters are literal
++///     and stay allowed (e.g. `find . -name '*.txt'`).
++fn commandHasShellExpansion(cmd: []const u8) bool {
++    var quote: u8 = 0;
++    var i: usize = 0;
++    while (i < cmd.len) : (i += 1) {
++        const c = cmd[i];
++        if (quote == '\'') {
++            if (c == '\'') quote = 0;
++            continue; // single quotes: everything literal, including `$` and globs
++        }
++        // A backslash outside single quotes is unescaped by the shell after the
++        // argument check has run on the raw text, so `cat \/etc/passwd` names
++        // an absolute path the check never sees. Refuse every escape instead of
++        // reproducing the shell's unescaping rules.
++        if (c == '\\') return true;
++        if (c == '$') return true;
++        if (quote == '"') {
++            if (c == '"') quote = 0;
++            continue; // double quotes still expand `$` (checked above) but not globs
++        }
++        if (c == '\'' or c == '"') {
++            quote = c;
++            continue;
++        }
++        if (c == '*' or c == '?' or c == '[' or c == ']' or c == '{' or c == '}') return true;
++    }
++    return false;
++}
++
++/// True when `cmd` contains an ASCII control byte (tab, newline, vertical tab,
++/// form feed, carriage return, DEL, …). The shell word-splits on the IFS
++/// whitespace bytes, so a control byte smuggled inside an otherwise in-workspace
++/// token (`x\t/etc/passwd`) becomes a second word (`/etc/passwd`) that the
++/// argument check never inspected. `normalizeCommand` only rewrites `\n` `;` `|`
++/// and `&&`/`||`, so a tab reaches the analysis intact. A confined policy
++/// rejects every control byte outright: no legitimate single command needs one.
++fn commandHasControlChar(cmd: []const u8) bool {
++    for (cmd) |c| {
++        if (c < 0x20 or c == 0x7f) return true;
++    }
++    return false;
++}
++
++/// Git subcommands that run a command or script taken from the workspace (or
++/// the object store) under the agent's privileges, regardless of the arguments:
++/// `git bisect run ./script`, `git submodule foreach ...`,
++/// `git filter-branch --tree-filter ...`, `git filter-repo ...`. The executed
++/// code is named by the subcommand, not by a path argument, so the per-argument
++/// workspace check never sees it — the same class as the package managers, and
++/// a confined policy refuses them for the same reason. Scanned across all
++/// arguments (over-broad on purpose: a confined guest can rename a file rather
++/// than pass it to a read-only git verb).
++fn gitArgsExecuteArbitraryCode(full_cmd: []const u8) bool {
++    var iter = std.mem.tokenizeAny(u8, full_cmd, " \t\n\x0b\x0c");
++    _ = iter.next(); // skip "git"
++    while (iter.next()) |arg| {
++        if (std.ascii.eqlIgnoreCase(arg, "bisect") or
++            std.ascii.eqlIgnoreCase(arg, "submodule") or
++            std.ascii.eqlIgnoreCase(arg, "filter-branch") or
++            std.ascii.eqlIgnoreCase(arg, "filter-repo"))
++        {
++            return true;
++        }
++    }
++    return false;
++}
++
+ fn isArgsSafe(self: *const SecurityPolicy, base_cmd: []const u8, full_cmd: []const u8) bool {
+     const lower_base = lowerBuf(base_cmd);
+     const lower_cmd = lowerBuf(full_cmd);
+     const base = lower_base.slice();
+     const cmd = lower_cmd.slice();
+ 
++    // Per-agent workspace confinement (confine_paths): a restricted agent must
++    // not reach files outside its workspace through the shell tool when no
++    // external sandbox is active. Applied to EVERY command rather than a
++    // file-reading denylist (which `git diff --no-index` and friends slip past):
++    // reject commands that execute workspace code (the package managers and the
++    // git subcommands that run a script), reject shell expansions and control
++    // bytes the argument check never sees, and reject any argument that names an
++    // absolute path, a `..` traversal or `~`.
++    if (self.confine_paths) {
++        if (commandExecutesArbitraryCode(base)) return false;
++        if (std.mem.eql(u8, base, "git") and gitArgsExecuteArbitraryCode(full_cmd)) return false;
++        if (commandHasShellExpansion(full_cmd)) return false;
++        if (commandHasControlChar(full_cmd)) return false;
++        if (!argsConfinedToWorkspace(full_cmd)) return false;
++    }
++
+     if (std.mem.eql(u8, base, "find")) {
+         // find -exec and find -ok allow arbitrary command execution
+         var iter = std.mem.tokenizeScalar(u8, cmd, ' ');
+@@ -1548,6 +1698,145 @@ test "git -C absolute paths are allowed when workspace_only is disabled" {
+     try std.testing.expect(p.isCommandAllowed("git -C /tmp/repo log"));
+ }
+ 
++test "confine_paths blocks file args escaping the workspace" {
++    const confined = SecurityPolicy{ .confine_paths = true };
++    // Absolute paths and `..` traversal are rejected for any command, not just
++    // the file-reading ones.
++    try std.testing.expect(!confined.isCommandAllowed("cat /etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat ../../../config.json"));
++    try std.testing.expect(!confined.isCommandAllowed("cat ../config.json"));
++    try std.testing.expect(!confined.isCommandAllowed("cat --file=/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("head -n 5 /etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("tail /var/log/syslog"));
++    try std.testing.expect(!confined.isCommandAllowed("grep -r secret /etc"));
++    try std.testing.expect(!confined.isCommandAllowed("wc -l /etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("ls /root"));
++    try std.testing.expect(!confined.isCommandAllowed("find / -name id_rsa"));
++    // `git` is allowlisted but is not a file-reading command, so the old
++    // per-command denylist let `git diff --no-index <path>` read any host file.
++    // The general rule rejects the escaping path argument instead.
++    try std.testing.expect(!confined.isCommandAllowed("git diff --no-index /etc/passwd /dev/null"));
++    try std.testing.expect(!confined.isCommandAllowed("git diff --no-index ../../config.json /dev/null"));
++    try std.testing.expect(!confined.isCommandAllowed("git log --output=/tmp/x"));
++    // Package managers run code taken from the workspace (build.rs, npm scripts)
++    // with the agent's privileges, so they are refused regardless of arguments.
++    try std.testing.expect(!confined.isCommandAllowed("cargo build --release"));
++    try std.testing.expect(!confined.isCommandAllowed("cargo run"));
++    try std.testing.expect(!confined.isCommandAllowed("npm run build"));
++    try std.testing.expect(!confined.isCommandAllowed("npm exec foo"));
++    try std.testing.expect(!confined.isCommandAllowed("npx cowsay hi"));
++    // Relative paths inside the workspace are still allowed, and so are
++    // path-free commands that do not execute workspace code.
++    try std.testing.expect(confined.isCommandAllowed("cat file.txt"));
++    try std.testing.expect(confined.isCommandAllowed("ls -la"));
++    try std.testing.expect(confined.isCommandAllowed("grep foo notes/todo.md"));
++    try std.testing.expect(confined.isCommandAllowed("find . -name '*.txt'"));
++    try std.testing.expect(confined.isCommandAllowed("git status"));
++    try std.testing.expect(confined.isCommandAllowed("git log --oneline"));
++
++    // The default (global) policy keeps its existing behaviour: confinement is
++    // opt-in for per-agent policies only.
++    const global = SecurityPolicy{};
++    try std.testing.expect(global.isCommandAllowed("cat /etc/passwd"));
++    try std.testing.expect(global.isCommandAllowed("ls /root"));
++    try std.testing.expect(global.isCommandAllowed("cargo build --release"));
++}
++
++test "confine_paths blocks shell $ parameter expansion" {
++    const confined = SecurityPolicy{ .confine_paths = true };
++    // `$IFS` expands to whitespace, so `cat $IFS/etc/passwd` runs
++    // `cat /etc/passwd` even though the raw argument names no absolute path.
++    try std.testing.expect(!confined.isCommandAllowed("cat $IFS/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat $HOME/x"));
++    try std.testing.expect(!confined.isCommandAllowed("cat $PWD/config.json"));
++    try std.testing.expect(!confined.isCommandAllowed("head $1"));
++    try std.testing.expect(!confined.isCommandAllowed("cat $@"));
++    try std.testing.expect(!confined.isCommandAllowed("ls $*"));
++    try std.testing.expect(!confined.isCommandAllowed("cat \"$HOME/x\""));
++    try std.testing.expect(!confined.isCommandAllowed("cat \"$IFS/etc/passwd\""));
++    // ANSI-C quoting expands escape sequences into path characters:
++    // `$'\057etc\057passwd'` is `/etc/passwd`.
++    try std.testing.expect(!confined.isCommandAllowed("cat $'\\057etc\\057passwd'"));
++    // A backslash outside single quotes is unescaped by the shell after the
++    // check, so `\/etc/passwd` is `/etc/passwd`.
++    try std.testing.expect(!confined.isCommandAllowed("cat \\/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat \\/etc\\/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("head -n1 x \\/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat \"\\/etc/passwd\""));
++    try std.testing.expect(!confined.isCommandAllowed("cat \\.\\./config.json"));
++    // Inside single quotes a backslash is literal, so the argument the check
++    // sees is the argument the command gets.
++    try std.testing.expect(confined.isCommandAllowed("grep -n 'a\\b' notes.txt"));
++    // A `$` inside single quotes is literal, so it stays allowed.
++    try std.testing.expect(confined.isCommandAllowed("grep -n 'a$' notes.txt"));
++    try std.testing.expect(confined.isCommandAllowed("grep foo file.txt"));
++    // The global policy keeps its behaviour.
++    const global = SecurityPolicy{};
++    try std.testing.expect(global.isCommandAllowed("cat $IFS/etc/passwd"));
++    try std.testing.expect(global.isCommandAllowed("cat $HOME/x"));
++}
++
++test "confine_paths blocks unquoted glob and brace expansion" {
++    const confined = SecurityPolicy{ .confine_paths = true };
++    // Brace expansion synthesizes separators and `..`: `cat {.,..}/etc/passwd`
++    // expands to `cat ./etc/passwd ../etc/passwd`.
++    try std.testing.expect(!confined.isCommandAllowed("cat {.,..}/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat {/,}etc/passwd"));
++    // Unquoted glob metacharacters are refused outright.
++    try std.testing.expect(!confined.isCommandAllowed("ls *.txt"));
++    try std.testing.expect(!confined.isCommandAllowed("ls ?.txt"));
++    try std.testing.expect(!confined.isCommandAllowed("ls [a-z]*.txt"));
++    // Quoting a glob makes it literal, so it stays allowed.
++    try std.testing.expect(confined.isCommandAllowed("find . -name '*.txt'"));
++    try std.testing.expect(confined.isCommandAllowed("grep foo 'a*b' notes.txt"));
++    // The global policy keeps its behaviour.
++    const global = SecurityPolicy{};
++    try std.testing.expect(global.isCommandAllowed("cat {.,..}/etc/passwd"));
++    try std.testing.expect(global.isCommandAllowed("ls *.txt"));
++}
++
++test "confine_paths blocks IFS-whitespace and control-byte argument splitting" {
++    const confined = SecurityPolicy{ .confine_paths = true };
++    // `/bin/sh -c` word-splits on tab as well as space, so `cat x\t/etc/passwd`
++    // runs `cat x /etc/passwd`. Splitting on space alone left "x\t/etc/passwd"
++    // as one token that named no absolute path.
++    try std.testing.expect(!confined.isCommandAllowed("cat x\t/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("head -1 x\t/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat x\t~/config.json"));
++    try std.testing.expect(!confined.isCommandAllowed("ls -la\t/etc"));
++    // The other IFS whitespace bytes and a stray carriage return / DEL are
++    // rejected outright (no legitimate single command contains one).
++    try std.testing.expect(!confined.isCommandAllowed("cat x\x0b/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat x\x0c/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat x\r/etc/passwd"));
++    try std.testing.expect(!confined.isCommandAllowed("cat x\x7f/etc/passwd"));
++    // In-workspace commands with no control byte are unaffected.
++    try std.testing.expect(confined.isCommandAllowed("cat file.txt"));
++    try std.testing.expect(confined.isCommandAllowed("grep foo notes/todo.md"));
++    // The global policy keeps its behaviour.
++    const global = SecurityPolicy{};
++    try std.testing.expect(global.isCommandAllowed("cat x\t/etc/passwd"));
++}
++
++test "confine_paths blocks git subcommands that run workspace code" {
++    const confined = SecurityPolicy{ .confine_paths = true };
++    // `git bisect run <cmd>` and the other script-running subcommands execute
++    // workspace code named by the subcommand, not by a checked path argument.
++    try std.testing.expect(!confined.isCommandAllowed("git bisect run ./script.sh"));
++    try std.testing.expect(!confined.isCommandAllowed("git bisect start"));
++    try std.testing.expect(!confined.isCommandAllowed("git submodule foreach 'sh -c id'"));
++    try std.testing.expect(!confined.isCommandAllowed("git filter-branch --tree-filter './x' HEAD"));
++    try std.testing.expect(!confined.isCommandAllowed("git -c alias.x='!id' x"));
++    try std.testing.expect(!confined.isCommandAllowed("git alias.x '!id'"));
++    // Read-only git verbs inside the workspace stay allowed.
++    try std.testing.expect(confined.isCommandAllowed("git status"));
++    try std.testing.expect(confined.isCommandAllowed("git log --oneline"));
++    try std.testing.expect(confined.isCommandAllowed("git diff"));
++    // The global policy keeps its behaviour.
++    const global = SecurityPolicy{};
++    try std.testing.expect(global.isCommandAllowed("git bisect run ./script.sh"));
++}
++
+ test "echo hello | tee /tmp/out is blocked" {
+     const p = SecurityPolicy{};
+     try std.testing.expect(!p.isCommandAllowed("echo hello | tee /tmp/out"));
+diff --git a/src/session.zig b/src/session.zig
+index b68de56..126aa85 100644
+--- a/src/session.zig
++++ b/src/session.zig
+@@ -36,8 +36,10 @@ const tools_mod = @import("tools/root.zig");
+ const cron_mod = @import("cron.zig");
+ const cron_add_mod = @import("tools/cron_add.zig");
+ const Tool = tools_mod.Tool;
+-const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
++const security = @import("security/policy.zig");
++const SecurityPolicy = security.SecurityPolicy;
+ const streaming = @import("streaming.zig");
++const outbound_mod = @import("outbound.zig");
+ const thread_stacks = @import("thread_stacks.zig");
+ const cost_mod = @import("cost.zig");
+ const log = std.log.scoped(.session);
+@@ -284,11 +286,25 @@ const AgentRuntime = struct {
+     session_store: ?memory_mod.SessionStore,
+     response_cache: ?*memory_mod.cache.ResponseCache,
+     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
++    /// Security policy used for this agent's sessions and tools. Points at the
++    /// global SessionManager policy unless the agent declares its own autonomy,
++    /// in which case it points at `owned_policy`.
++    policy: ?*const SecurityPolicy = null,
++    /// Per-agent policy/tracker, owned only when the named agent has its own
++    /// autonomy block (see `createAgentSecurityPolicy`).
++    owned_policy: ?*SecurityPolicy = null,
+ 
+     fn deinit(self: *AgentRuntime, allocator: Allocator) void {
+         if (self.tools.len > 0) tools_mod.deinitTools(allocator, self.tools);
+         if (self.bootstrap_provider) |bp| bp.deinit();
+         if (self.mem_rt) |*rt| rt.deinit();
++        if (self.owned_policy) |policy| {
++            if (policy.tracker) |tracker| {
++                tracker.deinit();
++                allocator.destroy(tracker);
++            }
++            allocator.destroy(policy);
++        }
+         allocator.free(self.workspace_dir);
+         allocator.free(self.agent_id);
+     }
+@@ -1215,10 +1231,57 @@ pub const SessionManager = struct {
+     fn shouldUseDedicatedRuntime(self: *SessionManager, agent_id: []const u8, named_agent: ?NamedAgentConfig) bool {
+         if (named_agent) |cfg| {
+             if (cfg.workspace_path != null) return true;
++            // An agent with its own autonomy needs a dedicated runtime so its
++            // stricter policy never falls back to the shared global one.
++            if (cfg.autonomy != null) return true;
+         }
+         return self.config.session.auto_provision_direct_agents and std.mem.startsWith(u8, agent_id, "peer-");
+     }
+ 
++    /// Build a SecurityPolicy + RateTracker from an autonomy block. Mirrors the
++    /// field mapping ChannelRuntime.init (channel_loop.zig) uses for the global
++    /// policy, but scoped to this agent's workspace. The returned policy owns
++    /// its tracker; free both with `destroyAgentSecurityPolicy`.
++    fn createAgentSecurityPolicy(
++        allocator: Allocator,
++        autonomy: config_types.AutonomyConfig,
++        workspace_dir: []const u8,
++    ) !*SecurityPolicy {
++        const tracker = try allocator.create(security.RateTracker);
++        errdefer allocator.destroy(tracker);
++        tracker.* = security.RateTracker.init(allocator, autonomy.max_actions_per_hour);
++        errdefer tracker.deinit();
++
++        const policy = try allocator.create(SecurityPolicy);
++        errdefer allocator.destroy(policy);
++        policy.* = .{
++            .autonomy = autonomy.level,
++            .workspace_dir = workspace_dir,
++            .workspace_only = autonomy.workspace_only,
++            .allowed_commands = security.resolveAllowedCommands(autonomy.level, autonomy.allowed_commands),
++            .max_actions_per_hour = autonomy.max_actions_per_hour,
++            .require_approval_for_medium_risk = autonomy.require_approval_for_medium_risk,
++            .block_high_risk_commands = autonomy.block_high_risk_commands,
++            .block_medium_risk_commands = autonomy.block_medium_risk_commands,
++            .allow_raw_url_chars = autonomy.allow_raw_url_chars,
++            // Confine file-path arguments of the file-reading shell commands to
++            // this agent's workspace. Without an active external sandbox (the
++            // common case in a container) the shell tool would otherwise let a
++            // supervised guest `cat ../../../config.json` or `cat /etc/passwd`.
++            .confine_paths = true,
++            .tracker = tracker,
++        };
++        return policy;
++    }
++
++    fn destroyAgentSecurityPolicy(allocator: Allocator, policy: *SecurityPolicy) void {
++        if (policy.tracker) |tracker| {
++            tracker.deinit();
++            allocator.destroy(tracker);
++        }
++        allocator.destroy(policy);
++    }
++
+     fn sanitizePathComponent(allocator: Allocator, value: []const u8) ![]u8 {
+         var trimmed = std.mem.trim(u8, value, " \t\r\n");
+         if (trimmed.len == 0) trimmed = "default";
+@@ -1249,6 +1312,13 @@ pub const SessionManager = struct {
+             cfg.default_provider = agent_cfg.provider;
+             cfg.default_model = agent_cfg.model;
+             if (agent_cfg.temperature) |t| cfg.default_temperature = t;
++            // Agent.fromConfigWithProfile derives security-relevant fields
++            // (exec_security/exec_ask, allowed_paths, multimodal_unrestricted,
++            // the skip_dir_check/allow_remote_fetch pair) straight from
++            // cfg.autonomy. Override the copied global block with the agent's own
++            // autonomy so a restricted guest does not inherit the global yolo
++            // permissions (e.g. reading any local image via [IMAGE:...]).
++            if (agent_cfg.autonomy) |autonomy| cfg.autonomy = autonomy;
+         }
+         cfg.syncFlatFields();
+         return cfg;
+@@ -1268,6 +1338,23 @@ pub const SessionManager = struct {
+         const workspace_dir = try self.resolveAgentWorkspaceDir(agent_id, named_agent);
+         errdefer self.allocator.free(workspace_dir);
+ 
++        const agent_autonomy: ?config_types.AutonomyConfig = if (named_agent) |cfg| cfg.autonomy else null;
++
++        // Agents with their own autonomy get a dedicated policy (and rate
++        // tracker) built from that autonomy. Everyone else keeps sharing the
++        // global SessionManager policy so existing configs behave exactly as
++        // before.
++        var owned_policy: ?*SecurityPolicy = null;
++        errdefer if (owned_policy) |policy| destroyAgentSecurityPolicy(self.allocator, policy);
++        if (agent_autonomy) |autonomy| {
++            owned_policy = try createAgentSecurityPolicy(self.allocator, autonomy, workspace_dir);
++        }
++        const runtime_policy: ?*const SecurityPolicy = if (owned_policy) |policy| policy else self.policy;
++        const runtime_allowed_paths: []const []const u8 = if (agent_autonomy) |autonomy|
++            autonomy.allowed_paths
++        else
++            self.config.autonomy.allowed_paths;
++
+         var mem_rt = memory_mod.initRuntime(self.allocator, &self.config.memory, workspace_dir);
+         errdefer if (mem_rt) |*rt| rt.deinit();
+ 
+@@ -1296,13 +1383,17 @@ pub const SessionManager = struct {
+             .web_search_fallback_providers = self.config.http_request.search_fallback_providers,
+             .browser_enabled = self.config.browser.enabled,
+             .screenshot_enabled = true,
++            // MCP tools spawn configured servers as child processes and never
++            // consult the agent policy; allTools skips them when
++            // withhold_escape_hatches is set (an agent with its own autonomy).
+             .mcp_server_configs = self.config.mcp_servers,
+             .agents = self.config.agents,
+             .configured_providers = self.config.providers,
+             .fallback_api_key = self.config.defaultProviderKey(),
+             .tools_config = self.config.tools,
+-            .allowed_paths = self.config.autonomy.allowed_paths,
+-            .policy = self.policy,
++            .allowed_paths = runtime_allowed_paths,
++            .policy = runtime_policy,
++            .withhold_escape_hatches = agent_autonomy != null,
+             .subagent_manager = self.subagent_manager,
+             .bootstrap_provider = bootstrap_provider,
+             .backend_name = self.config.memory.backend,
+@@ -1322,6 +1413,8 @@ pub const SessionManager = struct {
+             .session_store = session_store,
+             .response_cache = response_cache,
+             .bootstrap_provider = bootstrap_provider,
++            .policy = runtime_policy,
++            .owned_policy = owned_policy,
+         };
+ 
+         tools_mod.bindMemoryTools(runtime.tools, runtime.mem);
+@@ -1445,7 +1538,7 @@ pub const SessionManager = struct {
+             self.observer,
+             agent_profile,
+         );
+-        agent.policy = self.policy;
++        agent.policy = if (dedicated_runtime) |rt| rt.policy else self.policy;
+         agent.session_store = selected_session_store;
+         agent.response_cache = selected_response_cache;
+         agent.mem_rt = selected_mem_rt;
+@@ -1767,7 +1860,35 @@ pub const SessionManager = struct {
+             }
+         }
+ 
+-        return maybe_response;
++        // Same session-boundary attachment filter as processMessageStreaming:
++        // a slash command's reply leaves the session here too (this backs the
++        // Telegram callback menus), so a command that emitted a local-file
++        // marker must be filtered for a restricted agent as well.
++        return try self.filterOutboundAttachmentMarkers(session, maybe_response.?);
++    }
++
++    /// Drop legacy outbound attachment markers whose local target does not
++    /// resolve inside `session`'s agent workspace (+ its allowed_paths). An
++    /// agent with its own autonomy must not be able to exfiltrate host files
++    /// through `[DOCUMENT:/abs/path]`-style markers in its reply text: the
++    /// outbound channels (telegram, max, signal, …) upload any absolute path
++    /// the reply names with no policy check, independent of tool calls (so this
++    /// also covers read_only). Returns an owned copy of `response` and frees the
++    /// input when a filter runs; an agent without its own autonomy is returned
++    /// unchanged.
++    fn filterOutboundAttachmentMarkers(
++        self: *SessionManager,
++        session: *Session,
++        response: []const u8,
++    ) ![]const u8 {
++        if (!session.agent.has_own_autonomy) return response;
++        const scope = outbound_mod.AttachmentScope{
++            .workspace_dir = session.agent.workspace_dir,
++            .allowed_paths = session.agent.allowed_paths,
++        };
++        const filtered = try outbound_mod.stripEscapingAttachmentMarkers(self.allocator, response, scope);
++        self.allocator.free(response);
++        return filtered;
+     }
+ 
+     /// Process a message within a session context and optionally forward text deltas and progress hints.
+@@ -1959,6 +2080,11 @@ pub const SessionManager = struct {
+             );
+         }
+ 
++        // An agent with its own autonomy must not be able to exfiltrate files
++        // outside its workspace through legacy attachment markers in its reply
++        // text (see filterOutboundAttachmentMarkers).
++        response = try self.filterOutboundAttachmentMarkers(session, response);
++
+         if (display_rehydrate_allowed) {
+             if (session.agent.redactor) |r| {
+                 if (r.wouldRehydrate()) {
+@@ -3458,6 +3584,231 @@ test "getOrCreate named agent workspace override creates dedicated runtime" {
+     try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
+ }
+ 
++test "named agent autonomy gets a dedicated stricter runtime policy" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++
++    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
++    defer testing.allocator.free(base);
++    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
++    defer testing.allocator.free(config_path);
++
++    const agents = [_]NamedAgentConfig{
++        .{
++            .name = "guest",
++            .provider = "openrouter",
++            .model = "test/mock-model",
++            .autonomy = .{ .level = .supervised },
++        },
++        .{
++            .name = "plain",
++            .provider = "openrouter",
++            .model = "test/mock-model",
++        },
++        .{
++            .name = "worker",
++            .provider = "openrouter",
++            .model = "test/mock-model",
++            .workspace_path = "agents/worker-workspace",
++        },
++    };
++
++    var cfg = testConfig();
++    cfg.workspace_dir = base;
++    cfg.config_path = config_path;
++    cfg.agents = &agents;
++    // Global autonomy is maximally permissive; the guest must not inherit it.
++    cfg.autonomy.level = .yolo;
++    cfg.autonomy.workspace_only = false;
++
++    var mock = MockProvider{ .response = "ok" };
++    var sm = testSessionManager(testing.allocator, &mock, &cfg);
++    defer sm.deinit();
++
++    var global_tracker = security.RateTracker.init(testing.allocator, 20);
++    defer global_tracker.deinit();
++    var global_policy = SecurityPolicy{
++        .autonomy = .yolo,
++        .workspace_dir = base,
++        .workspace_only = false,
++        .tracker = &global_tracker,
++    };
++    sm.policy = &global_policy;
++
++    // Guest has its own autonomy but no workspace_path -> still a dedicated runtime.
++    const guest = try sm.getOrCreate("agent:guest:telegram:direct:42");
++    try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
++    const guest_policy = guest.agent.policy orelse return error.TestUnexpectedResult;
++    try testing.expect(guest_policy != &global_policy);
++    try testing.expectEqual(config_types.AutonomyLevel.supervised, guest_policy.autonomy);
++    try testing.expect(guest_policy.workspace_only);
++    // Supervised policy blocks command substitution; the global yolo policy allows it.
++    try testing.expect(!guest_policy.isCommandAllowed("echo $(whoami)"));
++    try testing.expect(global_policy.isCommandAllowed("echo $(whoami)"));
++    // Per-agent policies confine file-path arguments to the workspace so the
++    // guest cannot cat the global config.json; the global policy does not.
++    try testing.expect(guest_policy.confine_paths);
++    try testing.expect(!guest_policy.isCommandAllowed("cat ../../../config.json"));
++    try testing.expect(global_policy.isCommandAllowed("cat ../../../config.json"));
++
++    const guest_runtime = sm.agent_runtimes.get("guest") orelse return error.TestUnexpectedResult;
++    // The runtime config carries the agent's own autonomy, so Agent derives its
++    // exec/path/multimodal fields from it rather than the global yolo block.
++    try testing.expect(guest.agent.has_own_autonomy);
++    try testing.expect(!guest.agent.multimodal_unrestricted);
++    try testing.expectEqual(config_types.AutonomyLevel.supervised, guest_runtime.config.autonomy.level);
++    var saw_read = false;
++    for (guest_runtime.tools) |t| {
++        // Escape hatches run work under the global policy, so they are withheld.
++        try testing.expect(!std.mem.eql(u8, t.name(), "spawn"));
++        try testing.expect(!std.mem.eql(u8, t.name(), "schedule"));
++        // image_info opens any absolute path with no policy — withheld as a
++        // host-path metadata oracle.
++        try testing.expect(!std.mem.eql(u8, t.name(), "image_info"));
++        if (!std.mem.eql(u8, t.name(), "file_read")) continue;
++        const read_tool: *tools_mod.file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
++        // No extra allowed paths, so absolute paths outside the workspace fail.
++        try testing.expectEqual(@as(usize, 0), read_tool.allowed_paths.len);
++        try expectPathContains(read_tool.workspace_dir, "/agents/guest/workspace");
++        saw_read = true;
++    }
++    try testing.expect(saw_read);
++
++    const parsed = try tools_mod.parseTestArgs("{\"path\": \"/tmp/nullclaw-outside-probe\"}");
++    defer parsed.deinit();
++    for (guest_runtime.tools) |t| {
++        if (!std.mem.eql(u8, t.name(), "file_read")) continue;
++        const result = try t.execute(testing.allocator, parsed.value.object);
++        defer if (result.output.len > 0) testing.allocator.free(result.output);
++        try testing.expect(!result.success);
++        // ToolResult.fail carries a static message — do not free it.
++        try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Absolute paths not allowed") != null);
++    }
++
++    // An agent without autonomy keeps the shared global policy.
++    const plain = try sm.getOrCreate("agent:plain:telegram:direct:42");
++    try testing.expect(plain.agent.policy == &global_policy);
++    try testing.expect(!plain.agent.has_own_autonomy);
++    // The global policy is yolo, so a non-restricted agent keeps the permissive
++    // multimodal behaviour (no regression).
++    try testing.expect(plain.agent.multimodal_unrestricted);
++    try testing.expectEqual(@as(usize, 1), sm.agent_runtimes.count());
++
++    // A dedicated runtime without an autonomy block keeps the escape hatches.
++    const worker = try sm.getOrCreate("agent:worker:telegram:direct:42");
++    try testing.expect(worker.agent.policy == &global_policy);
++    const worker_runtime = sm.agent_runtimes.get("worker") orelse return error.TestUnexpectedResult;
++    var saw_spawn = false;
++    var saw_schedule = false;
++    var saw_image_info = false;
++    for (worker_runtime.tools) |t| {
++        if (std.mem.eql(u8, t.name(), "spawn")) saw_spawn = true;
++        if (std.mem.eql(u8, t.name(), "schedule")) saw_schedule = true;
++        if (std.mem.eql(u8, t.name(), "image_info")) saw_image_info = true;
++    }
++    try testing.expect(saw_spawn);
++    try testing.expect(saw_schedule);
++    try testing.expect(saw_image_info);
++}
++
++test "reply attachment markers escaping the workspace are dropped for an agent with its own autonomy" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++
++    const tmp_dir = std_compat.fs.Dir.wrap(tmp.dir);
++    const base = try tmp_dir.realpathAlloc(testing.allocator, ".");
++    defer testing.allocator.free(base);
++    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
++    defer testing.allocator.free(config_path);
++    try tmp_dir.writeFile(.{ .sub_path = "ok.txt", .data = "hi" });
++
++    const inside = try std.fmt.allocPrint(testing.allocator, "{s}/ok.txt", .{base});
++    defer testing.allocator.free(inside);
++    const reply = try std.fmt.allocPrint(
++        testing.allocator,
++        "here [DOCUMENT:/etc/passwd] and [FILE:{s}]",
++        .{inside},
++    );
++    defer testing.allocator.free(reply);
++
++    var cfg = testConfig();
++    cfg.workspace_dir = base;
++    cfg.config_path = config_path;
++
++    var mock = MockProvider{ .response = reply };
++    var sm = testSessionManager(testing.allocator, &mock, &cfg);
++    defer sm.deinit();
++
++    // Simulate a named agent that carries its own autonomy (has_own_autonomy is
++    // set from the named-agent profile in Agent.fromConfigWithProfile).
++    const session = try sm.getOrCreate("user:1");
++    session.agent.has_own_autonomy = true;
++
++    const resp = try sm.processMessage("user:1", "hello", null);
++    defer testing.allocator.free(resp);
++    // The absolute path outside the workspace is dropped...
++    try testing.expect(std.mem.indexOf(u8, resp, "/etc/passwd") == null);
++    // ...while the in-workspace attachment survives.
++    try testing.expect(std.mem.indexOf(u8, resp, "ok.txt") != null);
++}
++
++test "reply attachment markers are kept for an agent without its own autonomy" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++
++    const tmp_dir = std_compat.fs.Dir.wrap(tmp.dir);
++    const base = try tmp_dir.realpathAlloc(testing.allocator, ".");
++    defer testing.allocator.free(base);
++    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
++    defer testing.allocator.free(config_path);
++
++    var cfg = testConfig();
++    cfg.workspace_dir = base;
++    cfg.config_path = config_path;
++
++    var mock = MockProvider{ .response = "here [DOCUMENT:/etc/passwd] bye" };
++    var sm = testSessionManager(testing.allocator, &mock, &cfg);
++    defer sm.deinit();
++
++    const resp = try sm.processMessage("user:1", "hello", null);
++    defer testing.allocator.free(resp);
++    // No regression: an agent without its own autonomy keeps the current
++    // behaviour (the channel decides whether to upload).
++    try testing.expect(std.mem.indexOf(u8, resp, "/etc/passwd") != null);
++}
++
++test "handleLocalSlashCommand drops escaping attachment markers for an agent with its own autonomy" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++
++    const tmp_dir = std_compat.fs.Dir.wrap(tmp.dir);
++    const base = try tmp_dir.realpathAlloc(testing.allocator, ".");
++    defer testing.allocator.free(base);
++    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
++    defer testing.allocator.free(config_path);
++
++    var cfg = testConfig();
++    cfg.workspace_dir = base;
++    cfg.config_path = config_path;
++
++    var mock = MockProvider{ .response = "ok" };
++    var sm = testSessionManager(testing.allocator, &mock, &cfg);
++    defer sm.deinit();
++
++    const session_key = "agent:guest:telegram:direct:42";
++    const session = try sm.getOrCreate(session_key);
++    session.agent.has_own_autonomy = true;
++
++    // A command that returns text containing an escaping marker is filtered:
++    // /whoami returns status text. We test filterOutboundAttachmentMarkers
++    // via a synthetic response to ensure handleLocalSlashCommand threads it.
++    const synthetic = "Status [DOCUMENT:/etc/passwd] done";
++    const filtered = try sm.filterOutboundAttachmentMarkers(session, try testing.allocator.dupe(u8, synthetic));
++    defer testing.allocator.free(filtered);
++    try testing.expect(std.mem.indexOf(u8, filtered, "/etc/passwd") == null);
++    try testing.expect(std.mem.indexOf(u8, filtered, "Status") != null);
++}
++
+ test "handleLocalSlashCommand activates interactive skill session" {
+     var tmp = std.testing.tmpDir(.{});
+     defer tmp.cleanup();
+diff --git a/src/tools/root.zig b/src/tools/root.zig
+index 95258ce..08d9b2c 100644
+--- a/src/tools/root.zig
++++ b/src/tools/root.zig
+@@ -379,6 +379,11 @@ pub fn allTools(
+         allowed_paths: []const []const u8 = &.{},
+         tools_config: @import("../config.zig").ToolsConfig = .{},
+         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
++        /// Withhold tools that execute work outside the caller's security policy
++        /// (see the `spawn` / `schedule` note below). Set for agents that carry
++        /// their own autonomy so a restricted agent cannot reach the global
++        /// (possibly yolo) policy through them.
++        withhold_escape_hatches: bool = false,
+         bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
+         backend_name: []const u8 = "hybrid",
+         sandbox_backend: ConfigSandboxBackend = .auto,
+@@ -479,14 +484,27 @@ pub fn allTools(
+     };
+     try list.append(allocator, feh.tool());
+ 
+-    const gt = try allocator.create(git.GitTool);
+-    gt.* = .{ .workspace_dir = workspace_dir };
+-    try list.append(allocator, gt.tool());
++    // git is withheld for an agent with its own autonomy: it writes to the
++    // repository (commit, checkout, reset, …) without consulting read_only
++    // intent, and `git` is a wide surface a restricted guest should not reach.
++    if (!opts.withhold_escape_hatches) {
++        const gt = try allocator.create(git.GitTool);
++        gt.* = .{ .workspace_dir = workspace_dir };
++        try list.append(allocator, gt.tool());
++    }
+ 
+     // Tools without workspace_dir
+-    const it = try allocator.create(image.ImageInfoTool);
+-    it.* = .{};
+-    try list.append(allocator, it.tool());
++    //
++    // image_info is registered only for unrestricted agents: it opens any
++    // absolute path directly (no workspace_dir, no allowed_paths, no policy),
++    // so a restricted agent could use it as a metadata oracle (existence, size
++    // and format) for files outside its workspace. It is withheld below with
++    // the other escape hatches.
++    if (!opts.withhold_escape_hatches) {
++        const it = try allocator.create(image.ImageInfoTool);
++        it.* = .{};
++        try list.append(allocator, it.tool());
++    }
+ 
+     const calt = try allocator.create(calculator.CalculatorTool);
+     calt.* = .{};
+@@ -520,24 +538,41 @@ pub fn allTools(
+     mft.* = .{};
+     try list.append(allocator, mft.tool());
+ 
+-    // Delegate and schedule tools
+-    const dlt = try allocator.create(delegate.DelegateTool);
+-    dlt.* = .{
+-        .agents = opts.agents orelse &.{},
+-        .configured_providers = opts.configured_providers,
+-        .fallback_api_key = opts.fallback_api_key,
+-        .depth = opts.delegate_depth,
+-    };
+-    try list.append(allocator, dlt.tool());
+-
+-    const scht = try allocator.create(schedule.ScheduleTool);
+-    scht.* = .{};
+-    try list.append(allocator, scht.tool());
++    // Delegate tool. Withheld for a restricted agent: it can name ANY configured
++    // agent and run that agent's provider/model with the operator's resolved API
++    // key, so a guest could spend other agents' keys and send its content to
++    // providers it was never given.
++    if (!opts.withhold_escape_hatches) {
++        const dlt = try allocator.create(delegate.DelegateTool);
++        dlt.* = .{
++            .agents = opts.agents orelse &.{},
++            .configured_providers = opts.configured_providers,
++            .fallback_api_key = opts.fallback_api_key,
++            .depth = opts.delegate_depth,
++        };
++        try list.append(allocator, dlt.tool());
++    }
+ 
+-    // Spawn tool (async subagent)
+-    const sp = try allocator.create(spawn.SpawnTool);
+-    sp.* = .{ .manager = opts.subagent_manager };
+-    try list.append(allocator, sp.tool());
++    // Escape hatches — tools that run work under the GLOBAL policy instead of
++    // the calling agent's, or that reach outside its workspace, so a restricted
++    // agent must not get them:
++    //   * schedule → creates cron shell jobs that execute under the scheduler's
++    //     global shell policy (cron.zig), bypassing the caller's policy.
++    //   * spawn    → the SubagentManager is bound to the global config, so
++    //     subagents run under the global autonomy (subagent_runner.zig).
++    // The cron_* tools (cron_add/list/remove/runs/run/update) are not registered
++    // here at all, so there is nothing to withhold for them. image_info, git and
++    // screenshot (above), `delegate` and the MCP tools (below) are withheld too.
++    if (!opts.withhold_escape_hatches) {
++        const scht = try allocator.create(schedule.ScheduleTool);
++        scht.* = .{};
++        try list.append(allocator, scht.tool());
++
++        // Spawn tool (async subagent)
++        const sp = try allocator.create(spawn.SpawnTool);
++        sp.* = .{ .manager = opts.subagent_manager };
++        try list.append(allocator, sp.tool());
++    }
+ 
+     if (opts.http_enabled) {
+         // Pushover notification tool (network egress, gated with HTTP tools).
+@@ -576,7 +611,9 @@ pub fn allTools(
+         try list.append(allocator, bt.tool());
+     }
+ 
+-    if (opts.screenshot_enabled) {
++    // screenshot captures the host screen, so it leaks information outside the
++    // agent's workspace; it is withheld for an agent with its own autonomy.
++    if (opts.screenshot_enabled and !opts.withhold_escape_hatches) {
+         const sst = try allocator.create(screenshot.ScreenshotTool);
+         sst.* = .{ .workspace_dir = workspace_dir };
+         try list.append(allocator, sst.tool());
+@@ -609,7 +646,13 @@ pub fn allTools(
+     }
+ 
+     // MCP tools — connect to configured servers and register their tools.
+-    if (opts.mcp_server_configs.len > 0) {
++    //
++    // Withheld for an agent with its own autonomy: initMcpTools spawns each
++    // configured server as a child process (config.command + args) and proxies
++    // its tools, and MCP tool calls never consult the agent's SecurityPolicy —
++    // so a restricted agent would inherit a tool that runs work entirely
++    // outside its per-agent policy.
++    if (opts.mcp_server_configs.len > 0 and !opts.withhold_escape_hatches) {
+         const mcp_tools = mcp_mod.initMcpTools(allocator, opts.mcp_server_configs) catch |err| blk: {
+             std.log.warn("allTools: MCP init failed: {}", .{err});
+             break :blk &[_]Tool{};
+@@ -1174,6 +1217,51 @@ test "all tools wires subagent manager into spawn tool" {
+     try std.testing.expect(checked_spawn);
+ }
+ 
++test "withhold_escape_hatches drops spawn, schedule, delegate, image_info, git and screenshot" {
++    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
++        .withhold_escape_hatches = true,
++        .screenshot_enabled = true,
++    });
++    defer deinitTools(std.testing.allocator, tools);
++
++    for (tools) |t| {
++        try std.testing.expect(!std.mem.eql(u8, t.name(), "spawn"));
++        try std.testing.expect(!std.mem.eql(u8, t.name(), "delegate"));
++        try std.testing.expect(!std.mem.eql(u8, t.name(), "schedule"));
++        try std.testing.expect(!std.mem.eql(u8, t.name(), "cron_add"));
++        // image_info opens any absolute path with no policy, so it is withheld
++        // as a host-path metadata oracle.
++        try std.testing.expect(!std.mem.eql(u8, t.name(), "image_info"));
++        // git writes to the repo ignoring read_only intent; screenshot leaks the
++        // host screen. Both are withheld for a restricted agent.
++        try std.testing.expect(!std.mem.eql(u8, t.name(), "git_operations"));
++        try std.testing.expect(!std.mem.eql(u8, t.name(), "screenshot"));
++    }
++}
++
++test "default allTools keeps spawn, schedule, image_info, git and screenshot" {
++    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{ .screenshot_enabled = true });
++    defer deinitTools(std.testing.allocator, tools);
++
++    var saw_spawn = false;
++    var saw_schedule = false;
++    var saw_image_info = false;
++    var saw_git = false;
++    var saw_screenshot = false;
++    for (tools) |t| {
++        if (std.mem.eql(u8, t.name(), "spawn")) saw_spawn = true;
++        if (std.mem.eql(u8, t.name(), "schedule")) saw_schedule = true;
++        if (std.mem.eql(u8, t.name(), "image_info")) saw_image_info = true;
++        if (std.mem.eql(u8, t.name(), "git_operations")) saw_git = true;
++        if (std.mem.eql(u8, t.name(), "screenshot")) saw_screenshot = true;
++    }
++    try std.testing.expect(saw_spawn);
++    try std.testing.expect(saw_schedule);
++    try std.testing.expect(saw_image_info);
++    try std.testing.expect(saw_git);
++    try std.testing.expect(saw_screenshot);
++}
++
+ test "subagent tools use configured shell and file limits" {
+     const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
+         .tools_config = .{
+-- 
+2.55.0.windows.3
+

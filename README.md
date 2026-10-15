@@ -15,6 +15,7 @@ Applied in filename order; they are a stack (each is diffed against the previous
 | `0004-slack-status-reactions.patch` | Slack task lifecycle reactions (`reactions.add`/`reactions.remove`) driven from the bus path, since `status_reactions` previously existed only on Telegram's polling loop. |
 | `0005-route-configured-providers-by-prefix.patch` | A `provider/model` reference routes to any provider configured under `models.providers`, not just `reliability.fallback_providers`. Routing and failover stay separate: a bare model keeps its existing failover chain. |
 | `0006-telegram-draft-html.patch` | Telegram live drafts are rendered with HTML parse mode like the final message, so reasoning quotes and formatting show while streaming; falls back to plain text if Telegram rejects the entities. |
+| `0007-per-agent-autonomy.patch` | `agents.list[].autonomy` gives a named agent its own security policy and runtime, so a guest bound to one chat peer does not inherit the main agent's `yolo`. Tools that would act under the global policy (spawn, schedule, delegate, MCP, git, screenshot, image_info), `/config`, `/export` and `/bind` are withheld, and outbound attachment markers are confined to the agent's workspace. Use `"level": "read_only"` for untrusted guests: the `supervised` shell confinement is a best-effort argument check, not a sandbox. |
 
 ## Builds
 
