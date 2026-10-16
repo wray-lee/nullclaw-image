@@ -1,7 +1,7 @@
 From cc60359bcfec7edca624a08dbc3981b25d40094e Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 06:20:43 +0900
-Subject: [PATCH] feat(config): add agent.reasoning_mode default
+Subject: [PATCH 02/15] feat(config): add agent.reasoning_mode default
 
 The reasoning display mode always started at `off` and `/restart` and
 `/debug reset` hard-coded it back to `off`, so users on evicted idle

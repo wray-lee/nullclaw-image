@@ -1,7 +1,8 @@
 From 3943e269e4df1477f4db9909e173e8f0f07b1248 Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 06:20:43 +0900
-Subject: [PATCH] fix(providers): route configured providers by explicit prefix
+Subject: [PATCH 06/15] fix(providers): route configured providers by explicit
+ prefix
 
 Only `reliability.fallback_providers` were registered as ReliableProvider
 extras, so a model reference such as `newapi/dpsk` for a provider that is

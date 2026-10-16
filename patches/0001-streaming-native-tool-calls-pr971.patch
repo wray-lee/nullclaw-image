@@ -1,7 +1,8 @@
 From acf83fa0a30f49fb01dd2d9c04d12b1ea3c4d48f Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 20:56:19 +0900
-Subject: [PATCH] feat(providers): support native tool calls while streaming
+Subject: [PATCH 01/15] feat(providers): support native tool calls while
+ streaming
 
 This is nullclaw PR #971 (vernonstinebaker), carried here until it is merged
 upstream. Drop this patch from the stack once #971 lands on main.

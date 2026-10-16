@@ -1,0 +1,412 @@
+From 27cb7db997d87ad0f17891e13e9c299af8c5a4af Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Fri, 16 Oct 2026 02:22:42 +0900
+Subject: [PATCH 13/15] fix(telegram): keep the live draft owned by the running
+ turn
+
+The per-chat live-draft slot (draft_buffers) had no notion of turn
+ownership. Every inbound message called startTypingTurn -> beginDraftTurn
+-> beginDraftStateLocked, which cleared the chat's draft buffer and
+rotated its draft_id, and the deferred finishDraftTurn then deleted the
+slot outright. When a second message (or an interactive callback) was
+handled while a turn was still generating, it reset/deleted the draft
+that the running turn's StreamCtx still held, so every later streamed
+reasoning chunk hit the  guard in
+sendDraftChunkForTurn and was silently dropped. The user was left with
+only the "Interim result is still being prepared." heartbeat.
+
+Make the draft owned by the turn that began it:
+
+- DraftState gains an  flag, set when a turn claims the draft.
+- beginDraftTurn refuses to clobber an active draft (returns 0), so a
+  second caller starts no draft and cannot orphan the running one.
+- startTypingTurn claims the draft before touching the typing loop and
+  returns a TypingTurn{started, draft_id}: when it cannot claim a draft
+  it leaves the owner (and its typing indicator) untouched.
+- startTyping, the generic Channel entry point the daemon/webhook inbound
+  indicator uses, now starts only the typing loop: it must not claim a
+  draft, because that path releases the draft through sendEvent rather
+  than through finishDraftTurn.
+- processTelegramMessage and handleTelegramInteractiveCallback consult
+  the inbound router before starting the typing/draft turn, so an
+  injected/dropped message never resets the running turn's draft.
+
+The daemon path creates the draft lazily through sendEvent(.chunk) and
+releases it on every turn-final delivery, including the inline-choices
+(sendRich) and replace_message (editMessage) paths that bypass
+sendEvent(.final), so the next turn starts from a clean, empty draft.
+
+finishDraftTurn already clears only its own draft id, and a queued
+message that later runs its own turn gets a fresh draft because the
+previous turn's slot was already removed.
+---
+ src/channel_loop.zig                      |  36 ++--
+ src/channels/telegram.zig                 | 195 ++++++++++++++++++++--
+ src/channels/telegram_draft_presenter.zig |   4 +
+ 3 files changed, 206 insertions(+), 29 deletions(-)
+
+diff --git a/src/channel_loop.zig b/src/channel_loop.zig
+index c39f70e..b5a9efc 100644
+--- a/src/channel_loop.zig
++++ b/src/channel_loop.zig
+@@ -797,20 +797,29 @@ fn handleTelegramInteractiveCallback(
+     is_group: bool,
+     message_sender_id: []const u8,
+ ) bool {
++    // Route before starting the typing/draft turn, mirroring processTelegramMessage:
++    // a callback the router folds into the running turn must not start a new
++    // draft turn and reset the running turn's live draft. Slash commands are
++    // handled locally and never consult the router, so they keep the indicator.
++    const is_slash_command = control_plane.parseSlashCommand(content) != null;
++    if (!is_slash_command and runtime.session_mgr.routeInbound(session_key, content) == .skip) {
++        return true;
++    }
++
+     // Mirror processTelegramMessage: keep callback-query processing visible
+     // during slow model calls from interactive Telegram buttons.
+     const typing_target = sender;
+-    const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
++    const typing_turn = tg_ptr.startTypingTurn(typing_target) catch telegram.TelegramChannel.TypingTurn{};
+     defer {
+-        tg_ptr.stopTyping(typing_target) catch {};
+-        if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
++        if (typing_turn.started) tg_ptr.stopTyping(typing_target) catch {};
++        if (typing_turn.draft_id != 0) tg_ptr.finishDraftTurn(typing_target, typing_turn.draft_id) catch {};
+     }
+ 
+     const conversation_context = telegramConversationContext(tg_ptr.account_id, sender, is_group);
+ 
+     var response_owned = false;
+     const response = blk: {
+-        if (control_plane.parseSlashCommand(content) != null) {
++        if (is_slash_command) {
+             const maybe_local = runtime.session_mgr.handleLocalSlashCommand(session_key, content, conversation_context) catch |err| {
+                 log.err("failed to handle telegram callback slash command locally: {}", .{err});
+                 response_owned = true;
+@@ -823,10 +832,6 @@ fn handleTelegramInteractiveCallback(
+             return false;
+         }
+ 
+-        if (runtime.session_mgr.routeInbound(session_key, content) == .skip) {
+-            return true;
+-        }
+-
+         const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
+             log.err("failed to process telegram callback interaction: {}", .{err});
+             response_owned = true;
+@@ -993,11 +998,16 @@ fn processTelegramMessage(
+     message_sender_id: []const u8,
+     replace_message: bool,
+ ) void {
++    // Route before starting the typing/draft turn: a message the router folds
++    // into the running turn (injected/dropped) must not start a new draft turn
++    // and reset the running turn's live draft.
++    if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
++
+     const typing_target = sender;
+-    const draft_turn_id = tg_ptr.startTypingTurn(typing_target) catch 0;
++    const typing_turn = tg_ptr.startTypingTurn(typing_target) catch telegram.TelegramChannel.TypingTurn{};
+     defer {
+-        tg_ptr.stopTyping(typing_target) catch {};
+-        if (draft_turn_id != 0) tg_ptr.finishDraftTurn(typing_target, draft_turn_id) catch {};
++        if (typing_turn.started) tg_ptr.stopTyping(typing_target) catch {};
++        if (typing_turn.draft_id != 0) tg_ptr.finishDraftTurn(typing_target, typing_turn.draft_id) catch {};
+     }
+ 
+     // Set ScheduleTool context for delivery.
+@@ -1026,7 +1036,7 @@ fn processTelegramMessage(
+     var stream_ctx = telegram.TelegramChannel.StreamCtx{
+         .tg_ptr = tg_ptr,
+         .chat_id = sender,
+-        .draft_id = draft_turn_id,
++        .draft_id = typing_turn.draft_id,
+         // Telegram is served by this loop rather than daemon.processInboundMessage,
+         // so the reasoning passthrough that the daemon selects has to be selected
+         // here too. The draft shows the thinking as a quoted block; the delivered
+@@ -1036,8 +1046,6 @@ fn processTelegramMessage(
+     defer stream_ctx.deinit();
+     const sink = tg_ptr.makeSink(&stream_ctx);
+ 
+-    if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
+-
+     tg_ptr.setTaskReaction(sender, message_id, .running);
+     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
+         logAgentProcessingError(allocator, "Agent error", err);
+diff --git a/src/channels/telegram.zig b/src/channels/telegram.zig
+index e0b8e36..058e6c6 100644
+--- a/src/channels/telegram.zig
++++ b/src/channels/telegram.zig
+@@ -1193,19 +1193,53 @@ pub const TelegramChannel = struct {
+         return topic.message_thread_id;
+     }
+ 
++    /// Show the typing indicator for a chat. This is the generic Channel entry
++    /// point (the daemon/webhook inbound indicator uses it) and deliberately
++    /// does NOT claim the chat's live draft: that path creates and releases the
++    /// draft through sendEvent chunk/final, so a claim made here would never be
++    /// released and would block the next turn's typing indicator.
+     pub fn startTyping(self: *TelegramChannel, chat_id: []const u8) !void {
+-        _ = try self.startTypingTurn(chat_id);
++        try self.startTypingLoop(chat_id);
+     }
+ 
+-    pub fn startTypingTurn(self: *TelegramChannel, chat_id: []const u8) !u64 {
+-        if (chat_id.len == 0) return 0;
+-        try self.stopTyping(chat_id);
++    /// Result of starting a typing/draft turn for one inbound message.
++    pub const TypingTurn = struct {
++        /// Whether this call started the typing indicator loop for the chat and
++        /// must therefore stop it when the turn ends.
++        started: bool = false,
++        /// The live-draft id this turn owns, or 0 when it owns no draft.
++        draft_id: u64 = 0,
++    };
++
++    pub fn startTypingTurn(self: *TelegramChannel, chat_id: []const u8) !TypingTurn {
++        if (chat_id.len == 0) return .{};
++
++        const wants_draft = self.streaming_enabled and self.draft_previews_enabled and supportsDraftPreviewTarget(chat_id);
++
++        // Claim the live draft before touching the typing loop. If another turn
++        // already owns an in-flight draft for this chat, leave it (and its
++        // typing loop) alone: rotating or deleting it here is what dropped the
++        // running turn's streamed reasoning.
++        var draft_id: u64 = 0;
++        if (wants_draft) {
++            draft_id = try self.beginDraftTurn(chat_id);
++            if (draft_id == 0) return .{};
++        }
++        errdefer {
++            if (draft_id != 0) self.finishDraftTurn(chat_id, draft_id) catch {};
++        }
++
++        try self.startTypingLoop(chat_id);
++        return .{ .started = true, .draft_id = draft_id };
++    }
+ 
+-        const draft_id: u64 = if (self.streaming_enabled and self.draft_previews_enabled and supportsDraftPreviewTarget(chat_id)) blk: {
+-            const id = try self.beginDraftTurn(chat_id);
+-            errdefer self.finishDraftTurn(chat_id, id) catch {};
+-            break :blk id;
+-        } else 0;
++    /// Spawn (or restart) the typing-indicator loop for a chat. Does not touch
++    /// the chat's live draft: the draft is owned either by startTypingTurn
++    /// (polling path) or created/released lazily through sendEvent (daemon path).
++    fn startTypingLoop(self: *TelegramChannel, chat_id: []const u8) !void {
++        if (chat_id.len == 0) return;
++
++        try self.stopTyping(chat_id);
+ 
+         const key_copy = try self.allocator.dupe(u8, chat_id);
+         errdefer self.allocator.free(key_copy);
+@@ -1227,7 +1261,6 @@ pub const TelegramChannel = struct {
+         self.typing_mu.lock();
+         defer self.typing_mu.unlock();
+         try self.typing_handles.put(self.allocator, key_copy, task);
+-        return draft_id;
+     }
+ 
+     pub fn stopTyping(self: *TelegramChannel, chat_id: []const u8) !void {
+@@ -3027,7 +3060,14 @@ pub const TelegramChannel = struct {
+         const now_ms = std_compat.time.milliTimestamp();
+         self.draft_mu.lock();
+         defer self.draft_mu.unlock();
++        // A draft still owned by an in-flight turn must not be reset: rotating
++        // its id would make sendDraftChunkForTurn drop every chunk the running
++        // turn keeps streaming. Report "no draft" so this turn starts none.
++        if (self.draft_buffers.getPtr(target)) |existing| {
++            if (existing.active) return 0;
++        }
+         const state = try self.beginDraftStateLocked(target, now_ms);
++        state.active = true;
+         return state.draft_id;
+     }
+ 
+@@ -3042,6 +3082,16 @@ pub const TelegramChannel = struct {
+         telegram_draft_presenter.clearDraftForTarget(self.allocator, &self.draft_buffers, target);
+     }
+ 
++    /// Drop the chat's live draft slot on a turn-final delivery. Safe to call
++    /// when no draft exists; used by the daemon path, which does not go through
++    /// finishDraftTurn.
++    fn clearLiveDraft(self: *TelegramChannel, target: []const u8) void {
++        if (target.len == 0) return;
++        self.draft_mu.lock();
++        defer self.draft_mu.unlock();
++        telegram_draft_presenter.clearDraftForTarget(self.allocator, &self.draft_buffers, target);
++    }
++
+     fn sendDraftChunkForTurn(self: *TelegramChannel, target: []const u8, draft_id: u64, message: []const u8) !void {
+         if (!self.streaming_enabled or !self.draft_previews_enabled or draft_id == 0 or message.len == 0 or !supportsDraftPreviewTarget(target)) return;
+ 
+@@ -3299,11 +3349,7 @@ pub const TelegramChannel = struct {
+                 }
+             },
+             .final => {
+-                {
+-                    self.draft_mu.lock();
+-                    defer self.draft_mu.unlock();
+-                    telegram_draft_presenter.clearDraftForTarget(self.allocator, &self.draft_buffers, target);
+-                }
++                self.clearLiveDraft(target);
+                 // Forward the final message through the normal send path.
+                 // Once sendEvent is set in the vtable, the Channel wrapper no
+                 // longer falls through to send(), so we must deliver it here.
+@@ -3323,6 +3369,9 @@ pub const TelegramChannel = struct {
+ 
+     fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
+         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
++        // A rich outbound is a turn-final delivery (a reply carrying inline
++        // choices): release the chat's live draft so the next turn starts clean.
++        self.clearLiveDraft(target);
+         try self.sendRichMessageWithReply(target, "", false, payload, null);
+     }
+ 
+@@ -3353,6 +3402,9 @@ pub const TelegramChannel = struct {
+ 
+     fn vtableEditMessage(ptr: *anyopaque, edit: root.Channel.MessageEdit) anyerror!void {
+         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
++        // Editing a message in place finalizes replace_message turns: release
++        // the chat's live draft so the next turn starts clean.
++        self.clearLiveDraft(edit.target);
+         try self.editRichMessage(edit);
+     }
+ 
+@@ -5918,6 +5970,119 @@ test "sendDraftChunkForTurn ignores stale draft turn" {
+     try std.testing.expectEqualStrings("fresh", ch.draft_buffers.get("12345").?.buffer.items);
+ }
+ 
++test "startTypingTurn refuses to clobber a draft owned by a running turn" {
++    const allocator = std.testing.allocator;
++    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
++    defer ch.channel().stop();
++
++    // The running turn claims the live draft and streams reasoning into it.
++    const owner = try ch.startTypingTurn("12345");
++    try std.testing.expect(owner.started);
++    try std.testing.expect(owner.draft_id != 0);
++    try ch.sendDraftChunkForTurn("12345", owner.draft_id, "<think>reasoning</think>");
++
++    // A second inbound message (or interactive callback) arrives mid-turn. It
++    // must not rotate or delete the draft the running turn still owns.
++    const second = try ch.startTypingTurn("12345");
++    try std.testing.expect(!second.started);
++    try std.testing.expectEqual(@as(u64, 0), second.draft_id);
++
++    ch.draft_mu.lock();
++    try std.testing.expectEqual(owner.draft_id, ch.draft_buffers.get("12345").?.draft_id);
++    ch.draft_mu.unlock();
++
++    // The owner's later chunks still land: the draft was not reset.
++    try ch.sendDraftChunkForTurn("12345", owner.draft_id, " and more");
++    ch.draft_mu.lock();
++    try std.testing.expectEqualStrings(
++        "<think>reasoning</think> and more",
++        ch.draft_buffers.get("12345").?.buffer.items,
++    );
++    ch.draft_mu.unlock();
++
++    // The second turn's cleanup (no draft id) is a no-op and leaves the owner's
++    // draft intact.
++    try ch.finishDraftTurn("12345", second.draft_id);
++    ch.draft_mu.lock();
++    try std.testing.expect(ch.draft_buffers.get("12345") != null);
++    ch.draft_mu.unlock();
++
++    // Once the owner finishes, its draft is cleared and the next turn gets a
++    // fresh one.
++    try ch.finishDraftTurn("12345", owner.draft_id);
++    ch.draft_mu.lock();
++    try std.testing.expect(ch.draft_buffers.get("12345") == null);
++    ch.draft_mu.unlock();
++
++    const fresh = try ch.startTypingTurn("12345");
++    try std.testing.expect(fresh.started);
++    try std.testing.expect(fresh.draft_id != 0);
++    try std.testing.expect(fresh.draft_id != owner.draft_id);
++}
++
++test "startTyping (daemon indicator) does not claim the live draft" {
++    const allocator = std.testing.allocator;
++    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
++    defer ch.channel().stop();
++
++    try ch.startTyping("12345");
++
++    ch.draft_mu.lock();
++    defer ch.draft_mu.unlock();
++    try std.testing.expect(ch.draft_buffers.get("12345") == null);
++}
++
++test "daemon turn ending with inline choices releases the live draft" {
++    const allocator = std.testing.allocator;
++    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
++    defer ch.channel().stop();
++
++    // Turn 1: the daemon indicator starts typing (no draft claim), then streamed
++    // chunks create the live draft through sendEvent(.chunk).
++    try ch.startTyping("12345");
++    try ch.channel().sendEvent("12345", "reasoning", &.{}, .chunk);
++    ch.draft_mu.lock();
++    try std.testing.expect(ch.draft_buffers.get("12345") != null);
++    ch.draft_mu.unlock();
++
++    // The turn finalizes with inline choices, delivered through sendRich rather
++    // than sendEvent(.final); that must still release the draft.
++    try ch.channel().sendRich("12345", .{});
++
++    ch.draft_mu.lock();
++    try std.testing.expect(ch.draft_buffers.get("12345") == null);
++    ch.draft_mu.unlock();
++
++    // A later polling turn can still claim a fresh draft.
++    const turn = try ch.startTypingTurn("12345");
++    try std.testing.expect(turn.started);
++    try std.testing.expect(turn.draft_id != 0);
++    try ch.finishDraftTurn("12345", turn.draft_id);
++}
++
++test "replace_message edit releases the live draft" {
++    const allocator = std.testing.allocator;
++    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
++    defer ch.channel().stop();
++
++    try ch.channel().sendEvent("12345", "reasoning", &.{}, .chunk);
++    ch.draft_mu.lock();
++    try std.testing.expect(ch.draft_buffers.get("12345") != null);
++    ch.draft_mu.unlock();
++
++    // An invalid message id makes the edit fail before any network call; the
++    // draft must be released regardless of the edit outcome.
++    ch.channel().editMessage(.{
++        .target = "12345",
++        .message_id = "not-a-number",
++        .payload = .{ .text = "final" },
++    }) catch {};
++
++    ch.draft_mu.lock();
++    defer ch.draft_mu.unlock();
++    try std.testing.expect(ch.draft_buffers.get("12345") == null);
++}
++
+ test "nextAdaptiveSplitLimit halves toward minimum threshold" {
+     try std.testing.expectEqual(@as(usize, 512), TelegramChannel.nextAdaptiveSplitLimit(1024, 5000));
+     try std.testing.expectEqual(@as(usize, 256), TelegramChannel.nextAdaptiveSplitLimit(400, 5000));
+diff --git a/src/channels/telegram_draft_presenter.zig b/src/channels/telegram_draft_presenter.zig
+index 3132d98..02c955c 100644
+--- a/src/channels/telegram_draft_presenter.zig
++++ b/src/channels/telegram_draft_presenter.zig
+@@ -16,6 +16,10 @@ const DRAFT_PROGRESS_HEARTBEAT_ONLY = "Interim result is still being prepared.";
+ 
+ pub const DraftState = struct {
+     draft_id: u64,
++    /// True while a turn still owns this draft (it has begun a draft turn and
++    /// has not finished it). A later inbound message must not reset/rotate a
++    /// draft another turn is still streaming into.
++    active: bool = false,
+     buffer: std.ArrayListUnmanaged(u8) = .empty,
+     last_flush_len: usize = 0,
+     last_flush_time: i64 = 0,
+-- 
+2.56.0
+

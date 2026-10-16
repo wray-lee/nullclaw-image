@@ -1,7 +1,7 @@
-From c55671b1af9d6d4275b337b83709cb17fcfe2655 Mon Sep 17 00:00:00 2001
+From 76fbb3f70152dbc7d5bf5b4dc54af8b02c05616d Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 22:28:47 +0900
-Subject: [PATCH 12/12] fix(agent): stop runaway turns, honor /stop, and bound
+Subject: [PATCH 12/15] fix(agent): stop runaway turns, honor /stop, and bound
  tool batches
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -54,18 +54,17 @@ Regression tests cover each change.
  src/agent/root.zig           | 530 ++++++++++++++++++++++++++++++++++-
  src/daemon.zig               | 147 +++++++++-
  src/http_util.zig            |   6 +-
- src/logging.zig              | 189 +++++++++++++
+ src/logging.zig              | 263 +++++++++++++++++
  src/main.zig                 |   7 +
  src/providers/anthropic.zig  |  43 +++
  src/providers/compatible.zig |  93 ++++++
  src/providers/gemini.zig     |  57 +++-
  src/providers/openai.zig     |  28 ++
  src/providers/openrouter.zig |  32 +++
- src/providers/root.zig       |  46 +++
  src/providers/sse.zig        | 247 +++++++++++++++-
  src/root.zig                 |   1 +
  src/session.zig              |  55 ++++
- 14 files changed, 1447 insertions(+), 34 deletions(-)
+ 13 files changed, 1475 insertions(+), 34 deletions(-)
  create mode 100644 src/logging.zig
 
 diff --git a/src/agent/root.zig b/src/agent/root.zig
@@ -674,7 +673,7 @@ index bcabe4f..5eed4b5 100644
      // Regression: priority hints must not be persisted as user text in history/memory/cache.
      const allocator = std.testing.allocator;
 diff --git a/src/daemon.zig b/src/daemon.zig
-index b87e69d..7bcdd4e 100644
+index 35f200d..8abc923 100644
 --- a/src/daemon.zig
 +++ b/src/daemon.zig
 @@ -37,6 +37,7 @@ const thread_stacks = @import("thread_stacks.zig");
@@ -766,7 +765,7 @@ index b87e69d..7bcdd4e 100644
  fn publishInboundToWorkerQueue(
      allocator: std.mem.Allocator,
      config: *const Config,
-@@ -1576,6 +1615,10 @@ fn inboundDispatcherThread(
+@@ -1577,6 +1616,10 @@ fn inboundDispatcherThread(
  
          while (ready_messages.items.len > 0) {
              var msg = ready_messages.orderedRemove(0);
@@ -777,7 +776,7 @@ index b87e69d..7bcdd4e 100644
              if (worker_count > 0) {
                  publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch |err| {
                      msg.deinit(allocator);
-@@ -1592,6 +1635,10 @@ fn inboundDispatcherThread(
+@@ -1593,6 +1636,10 @@ fn inboundDispatcherThread(
      debouncer.flushAll(&ready_messages) catch {};
      while (ready_messages.items.len > 0) {
          var msg = ready_messages.orderedRemove(0);
@@ -788,7 +787,7 @@ index b87e69d..7bcdd4e 100644
          if (worker_count > 0) {
              publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch {
                  msg.deinit(allocator);
-@@ -1648,6 +1695,12 @@ fn startConfiguredTunnel(
+@@ -1649,6 +1696,12 @@ fn startConfiguredTunnel(
  /// shutdown is requested (Ctrl+C signal or explicit request).
  /// `host` and `port` are CLI-parsed values that override `config.gateway`.
  pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
@@ -801,7 +800,7 @@ index b87e69d..7bcdd4e 100644
      // Ensure lifecycle parity: workspace bootstrap files must exist
      // even when users skip onboard and start runtime directly.
      try onboard.scaffoldWorkspaceForConfig(allocator, config, &onboard.ProjectContext{});
-@@ -2144,6 +2197,78 @@ test "inboundDispatchShardIndex keeps routed session on same worker" {
+@@ -2151,6 +2204,78 @@ test "inboundDispatchShardIndex keeps routed session on same worker" {
      try std.testing.expectEqual(expected_shard, inboundDispatchShardIndex(allocator, &config, &second, worker_count));
  }
  
@@ -911,10 +910,10 @@ index 3fe3a1e..a44b90d 100644
          thread.join();
 diff --git a/src/logging.zig b/src/logging.zig
 new file mode 100644
-index 0000000..9b4d370
+index 0000000..ae5df89
 --- /dev/null
 +++ b/src/logging.zig
-@@ -0,0 +1,189 @@
+@@ -0,0 +1,263 @@
 +//! Non-blocking logging for the gateway.
 +//!
 +//! Zig's default `std.log` implementation formats straight to stderr while
@@ -925,24 +924,45 @@ index 0000000..9b4d370
 +//! a stalled log driver) then parks every logging thread in `futex_do_wait`
 +//! with the CPU idle — the incident signature.
 +//!
-+//! `logFn` instead formats into a fixed record and hands it to a bounded ring
-+//! drained by one dedicated thread. Producers never block: if the ring lock is
-+//! busy or the ring is full the line is dropped and counted. Only the drain
-+//! thread can block on stderr, so a stuck log sink can no longer wedge a turn.
++//! `logFn` formats the line into a fixed stack buffer and hands it to `emit`, a
++//! single non-generic (`noinline`) function. After `start()` `emit` enqueues
++//! into a bounded ring drained by one dedicated thread; producers never block:
++//! if the ring lock is busy or the ring is full the line is dropped and counted.
++//! Only the drain thread can block on stderr, so a stuck log sink can no longer
++//! wedge a turn.
++//!
++//! Formatting stays generic (it must, to type-check `format`/`args` per call
++//! site), but the fallback no longer reaches `std.log.defaultLog`: calling it
++//! instantiated the whole `defaultLog`/`defaultLogFileTerminal` body — with its
++//! own per-call-site formatting — at every log call site, roughly doubling the
++//! formatting code and adding ~300 KB to a ReleaseSmall musl binary. `emit` is
++//! one out-of-line function instead.
 +//!
 +//! Install with `pub const std_options: std.Options = .{ .logFn = logging.logFn };`
 +//! in the executable root, and call `start()` from the gateway. Until `start()`
-+//! runs (other CLI commands, tests) logging forwards to `std.log.defaultLog`.
++//! runs (other CLI commands, tests) `emit` writes the already-formatted line to
++//! stderr itself: the same `level(scope): message` prefix as `std.log.defaultLog`,
++//! but plain monochrome text — it does not emit the ANSI color sequences
++//! `defaultLogFileTerminal` uses on a TTY, and (like the ring) it bounds the
++//! line to `MAX_LINE` and keeps it newline-terminated.
 +
 +const std = @import("std");
 +const std_compat = @import("compat");
 +
-+/// Longest line kept. Lines are truncated to this so a record is a single
-+/// bounded write and the ring's memory is fixed regardless of message size.
-+const MAX_LINE = 2048;
++/// Longest record, including the terminating newline. The formatted line is
++/// truncated to `MAX_LINE - 1` bytes at a UTF-8 boundary so the reserved last
++/// byte can hold `'\n'`; a record is therefore always a single newline-
++/// terminated, bounded write.
++const MAX_LINE = 1024;
 +
 +/// Number of queued records. When full, producers drop rather than block.
-+const RING_CAPACITY = 512;
++///
++/// 256 × 1 KiB = 256 KiB of BSS, down from the original 512 × 2 KiB = 1 MiB.
++/// The ring only has to absorb the burst that arrives between two drain cycles
++/// (the drain thread empties it continuously) and overflow is a counted drop,
++/// never a block, so a shallower ring costs nothing in correctness while it
++/// removes 768 KiB of BSS that only becomes resident once the ring cycles.
++const RING_CAPACITY = 256;
 +
 +const Record = struct {
 +    len: u16,
@@ -982,15 +1002,34 @@ index 0000000..9b4d370
 +    };
 +}
 +
-+/// std_options.logFn: format into a ring record without ever blocking.
++/// std_options.logFn: format one line into a fixed stack buffer, then hand the
++/// bytes to the single non-generic `emit`. Keeping only the formatting generic
++/// (it must type-check `format`/`args` per call site) is what avoids a per-call-
++/// site copy of `std.log.defaultLog`.
 +pub fn logFn(
 +    comptime level: std.log.Level,
 +    comptime scope: @EnumLiteral(),
 +    comptime format: []const u8,
 +    args: anytype,
 +) void {
++    var buf: [MAX_LINE]u8 = undefined;
++    var w = std.Io.Writer.fixed(&buf);
++    w.print("{s}", .{level.asText()}) catch {};
++    if (scope != .default) w.print("({t})", .{scope}) catch {};
++    w.print(": " ++ format ++ "\n", args) catch {};
++    emit(buf[0..w.end]);
++}
++
++/// The one non-generic logging function: either enqueue the line for the drain
++/// thread, or — before `start()` — write it to stderr directly. Never blocks a
++/// producer on the log sink. `noinline` keeps this a single out-of-line copy so
++/// the ring/stderr logic is not duplicated into every generic `logFn` call site.
++noinline fn emit(line: []const u8) void {
 +    if (!running.load(.acquire)) {
-+        std.log.defaultLog(level, scope, format, args);
++        const stderr = std_compat.fs.File.stderr();
++        const shown = clampToRecord(line);
++        stderr.writeAll(shown) catch {};
++        if (shown.len < line.len) stderr.writeAll("\n") catch {};
 +        return;
 +    }
 +
@@ -1008,23 +1047,29 @@ index 0000000..9b4d370
 +    }
 +
 +    const rec = &ring[head];
-+    rec.len = @intCast(writeLine(&rec.buf, level, scope, format, args));
++    const shown = clampToRecord(line);
++    @memcpy(rec.buf[0..shown.len], shown);
++    if (shown.len < line.len) {
++        // clampToRecord cut before the formatter's trailing newline; put one in
++        // the byte it reserved so the drained line stays newline-terminated.
++        rec.buf[shown.len] = '\n';
++        rec.len = @intCast(shown.len + 1);
++    } else {
++        rec.len = @intCast(shown.len);
++    }
 +    head = next;
 +    not_empty.signal();
 +}
 +
-+fn writeLine(
-+    buf: []u8,
-+    comptime level: std.log.Level,
-+    comptime scope: @EnumLiteral(),
-+    comptime format: []const u8,
-+    args: anytype,
-+) usize {
-+    var w = std.Io.Writer.fixed(buf);
-+    w.print("{s}", .{level.asText()}) catch {};
-+    if (scope != .default) w.print("({t})", .{scope}) catch {};
-+    w.print(": " ++ format ++ "\n", args) catch {};
-+    return w.end;
++/// Truncate `line` to at most `MAX_LINE - 1` bytes without splitting a UTF-8
++/// sequence, leaving the last byte of a record for the terminating newline.
++fn clampToRecord(line: []const u8) []const u8 {
++    if (line.len <= MAX_LINE - 1) return line;
++    var end: usize = MAX_LINE - 1;
++    // Walk back over UTF-8 continuation bytes (0b10xxxxxx) so the cut lands on
++    // the start of a code point rather than inside one.
++    while (end > 0 and (line[end] & 0xC0) == 0x80) end -= 1;
++    return line[0..end];
 +}
 +
 +fn drainMain() void {
@@ -1056,7 +1101,7 @@ index 0000000..9b4d370
 +    running.store(false, .release);
 +}
 +
-+test "logFn formats and enqueues a line into the ring" {
++test "logFn formats and enqueues a newline-terminated line into the ring" {
 +    resetForTest();
 +    defer resetForTest();
 +    running.store(true, .release);
@@ -1071,6 +1116,7 @@ index 0000000..9b4d370
 +    try std.testing.expectEqual(@as(usize, 1), count);
 +    try std.testing.expect(std.mem.startsWith(u8, rec.buf[0..rec.len], "warning(test_scope): "));
 +    try std.testing.expect(std.mem.indexOf(u8, rec.buf[0..rec.len], "value=42") != null);
++    try std.testing.expectEqual(@as(u8, '\n'), rec.buf[rec.len - 1]);
 +}
 +
 +test "logFn drops instead of blocking when the ring lock is held" {
@@ -1103,6 +1149,33 @@ index 0000000..9b4d370
 +
 +    logFn(.info, .test_scope, "overflow", .{});
 +    try std.testing.expectEqual(@as(usize, 1), dropped.load(.monotonic));
++}
++
++test "clampToRecord truncates at a UTF-8 boundary and reserves the newline" {
++    resetForTest();
++    defer resetForTest();
++    running.store(true, .release);
++
++    // U+1F600 is four bytes, and MAX_LINE - 1 == 1023 is not a multiple of 4
++    // (1023 % 4 == 3), so a naive `line[0 .. MAX_LINE - 1]` bisects a character
++    // and the walk-back over continuation bytes is what makes the cut valid.
++    const emoji = "\xf0\x9f\x98\x80";
++    var line: [2100]u8 = undefined;
++    var i: usize = 0;
++    while (i < line.len) : (i += 4) @memcpy(line[i..][0..4], emoji);
++
++    const clamped = clampToRecord(&line);
++    try std.testing.expectEqual(@as(usize, 1020), clamped.len);
++    try std.testing.expectEqual(@as(usize, 0), clamped.len % 4);
++    try std.testing.expectEqualSlices(u8, emoji, clamped[clamped.len - 4 ..]);
++
++    // emit must turn the truncated record into a newline-terminated one.
++    emit(&line);
++    mutex.lock();
++    const rec = ring[0];
++    mutex.unlock();
++    try std.testing.expectEqual(@as(usize, 1021), rec.len);
++    try std.testing.expectEqual(@as(u8, '\n'), rec.buf[rec.len - 1]);
 +}
 diff --git a/src/main.zig b/src/main.zig
 index b227f7e..6211a1c 100644
@@ -1566,90 +1639,6 @@ index 6cdd770..1c0a87b 100644
 +    }
 +    try std.testing.expect(!response.truncated);
 +}
-diff --git a/src/providers/root.zig b/src/providers/root.zig
-index f68156f..e5aea13 100644
---- a/src/providers/root.zig
-+++ b/src/providers/root.zig
-@@ -210,6 +210,11 @@ pub const ChatResponse = struct {
-     model: []const u8 = "",
-     /// Optional reasoning/thinking content from models that support it (e.g. Claude extended thinking).
-     reasoning_content: ?[]const u8 = null,
-+    /// True when the provider response ended before a natural stop: a cut
-+    /// stream (abnormal termination, timeout) or a max_tokens hit
-+    /// (`finish_reason == "length"`). Tool calls salvaged from such a response
-+    /// must never be executed.
-+    truncated: bool = false,
- 
-     /// True when the LLM wants to invoke at least one tool.
-     pub fn hasToolCalls(self: ChatResponse) bool {
-@@ -280,12 +285,25 @@ pub const StreamChatResult = struct {
-     tool_calls: []const ToolCall = &.{},
-     usage: TokenUsage = .{},
-     model: []const u8 = "",
-+    /// See `ChatResponse.truncated`.
-+    truncated: bool = false,
- };
- 
- pub fn shouldRecoverPartialStream(accumulated_len: usize, saw_done: bool) bool {
-     return saw_done or accumulated_len > 0;
- }
- 
-+/// True when an OpenAI-style `choices[]` entry ended because the model hit its
-+/// token budget (`finish_reason == "length"`) rather than stopping naturally. A
-+/// response that stopped this way is a truncated prefix, so any tool call
-+/// salvaged from its text must not be executed. Shared by the OpenAI,
-+/// OpenRouter, and OpenAI-compatible non-streaming parsers.
-+pub fn choiceReportsLengthFinish(choice: std.json.Value) bool {
-+    if (choice != .object) return false;
-+    const finish_reason = choice.object.get("finish_reason") orelse return false;
-+    return finish_reason == .string and std.mem.eql(u8, finish_reason.string, "length");
-+}
-+
- /// Free every owned field of a `ChatResponse` and reset it. Use this when the
- /// whole response is being discarded (capability probes, throw-away calls).
- /// Contrast with `freeStreamUnusedChatResponseFields`, which deliberately
-@@ -347,6 +365,10 @@ pub fn emitChatResponseAsStream(
-         .tool_calls = tool_calls,
-         .usage = response.usage,
-         .model = response.model,
-+        // Propagate the cut/max_tokens flag: every non-streaming fallback
-+        // (api_mode == .responses, large-prompt skip, curl fallback) returns
-+        // through here, and dropping it let truncated tool calls execute.
-+        .truncated = response.truncated,
-     };
- }
- 
-@@ -1000,6 +1022,30 @@ test "emitChatResponseAsStream frees unused chat response fields" {
-     try std.testing.expectEqualStrings("{\"path\":\"README.md\"}", result.tool_calls[0].arguments);
- }
- 
-+test "emitChatResponseAsStream propagates the truncated flag" {
-+    const allocator = std.testing.allocator;
-+
-+    var response = ChatResponse{
-+        .content = try allocator.dupe(u8, "partial answer"),
-+        .model = try allocator.dupe(u8, "test-model"),
-+        .truncated = true,
-+    };
-+
-+    const CallbackCtx = struct {
-+        fn onChunk(_: *anyopaque, _: StreamChunk) void {}
-+    };
-+    var ctx: u8 = 0;
-+    const result = emitChatResponseAsStream(allocator, &response, CallbackCtx.onChunk, @ptrCast(&ctx));
-+    defer if (result.content) |content| allocator.free(content);
-+    defer if (result.model.len > 0) allocator.free(result.model);
-+
-+    // Regression: every non-streaming fallback returns through this function;
-+    // dropping the flag left the agent unable to tell the calls came from a cut
-+    // response, so it executed them.
-+    try std.testing.expect(result.truncated);
-+    try std.testing.expectEqualStrings("partial answer", result.content.?);
-+}
-+
- test "Provider.streamChat fallback emits single chunk and final" {
-     const TestCtx = struct {
-         chunks_count: usize = 0,
 diff --git a/src/providers/sse.zig b/src/providers/sse.zig
 index 074c152..bd8b216 100644
 --- a/src/providers/sse.zig

@@ -1,7 +1,7 @@
 From 2af5b3e3424e386c270f985564e51de06d7b2c8e Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 07:09:35 +0900
-Subject: [PATCH] feat(slack): show the task lifecycle as reactions
+Subject: [PATCH 05/15] feat(slack): show the task lifecycle as reactions
 
 Slack had no reaction support at all: `status_reactions` and
 `reaction_emojis` existed only on Telegram, and the lifecycle hooks that

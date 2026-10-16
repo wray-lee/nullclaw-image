@@ -1,7 +1,7 @@
 From f8bdcacd2578044d0cc9d4eb6d40ba939fb15ea5 Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 05:44:56 +0900
-Subject: [PATCH 1/2] feat(slack): stream outbound replies while they are
+Subject: [PATCH 03/15] feat(slack): stream outbound replies while they are
  generated
 
 Slack was the only streaming-capable channel without an outbound stream
@@ -2434,11 +2434,10 @@ index 0f33338..314cae9 100644
 -- 
 2.56.0
 
-
 From 8a1c93d5cdae49c1c7333ebf3e918627bcfb8847 Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 07:01:11 +0900
-Subject: [PATCH 2/2] fix(channels): actually show live reasoning, and strip
+Subject: [PATCH 04/15] fix(channels): actually show live reasoning, and strip
  provider tool markup
 
 The live-reasoning path added with the Slack outbound stream only worked

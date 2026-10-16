@@ -1,7 +1,7 @@
 From 4f7e086e1af01fa5ef9b693f162cdb30a96ffa8d Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 14:16:04 +0900
-Subject: [PATCH] feat(security): per-agent autonomy for named agents
+Subject: [PATCH 08/15] feat(security): per-agent autonomy for named agents
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit

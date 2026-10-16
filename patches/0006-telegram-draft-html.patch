@@ -1,7 +1,7 @@
 From ce7cc6c5eacec51098a04fc84b168bf31825b389 Mon Sep 17 00:00:00 2001
 From: wray-lee <wray-lee@outlook.com>
 Date: Thu, 15 Oct 2026 13:13:37 +0900
-Subject: [PATCH] feat(telegram): render live drafts with HTML parse mode
+Subject: [PATCH 07/15] feat(telegram): render live drafts with HTML parse mode
 
 Live drafts were sent through sendMessageDraft as plain text, while the
 finalized reply goes through markdownToTelegramHtml with parse_mode HTML.

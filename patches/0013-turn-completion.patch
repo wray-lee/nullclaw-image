@@ -1,0 +1,889 @@
+From bac94bd3246d88bba584201fdf205e4481306aa1 Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Fri, 16 Oct 2026 01:44:26 +0900
+Subject: [PATCH 14/15] fix(agent): guard structural turn-completion stalls
+
+A model can end a turn with prose announcing its next action and no tool
+call, silently stopping the task. The existing English/Russian phrase list
+does not generalise to languages without tense/modals (Chinese), so port
+OpenClaw's structural, language-independent guards instead.
+
+- prompt: emit an "EXECUTION BIAS" block in writeToolInstructionsSection
+  when tools are enabled, so a turn that only promises future work takes
+  the next action in the same turn. Guarded on tools.len > 0 so tool-less
+  prompts are untouched.
+- providers: record finish_reason=="tool_calls" (OpenAI-compatible) and
+  stop_reason=="tool_use" (Anthropic) as ChatResponse.finish_tool_use,
+  read from provider output structure, never assistant prose.
+- providers/sse: on the streaming path (native tool calls while streaming,
+  #971) set StreamChatResult.finish_tool_use from a streamed finish_reason
+  "tool_calls", scanned textually as the twin of sseLineReportsLengthFinish
+  so a >16 KB data line cannot hide it. It is set only when the calls were
+  trusted (the stream ended cleanly) and the stream was not truncated, so a
+  call cut mid-flight or a max_tokens cut never reports a tool stop.
+- agent: when finish_tool_use is set but no call was parsed, nudge once
+  and then fail with error.NoResponseContent (already user-visible) rather
+  than returning nothing. The streamed flag reaches the same branch, so a
+  streaming tool stop is guarded identically to the non-streaming parsers.
+  Also pick targeted nudges for settled-tools-with-no-answer and
+  reasoning-only empty turns (cap 2) instead of the web-search text,
+  reusing the existing empty-response retry budget.
+
+The English/Russian shouldForceActionFollowThrough list is unchanged.
+---
+ src/agent/prompt.zig         |  53 +++++
+ src/agent/root.zig           | 366 ++++++++++++++++++++++++++++++++++-
+ src/providers/anthropic.zig  |  34 ++++
+ src/providers/compatible.zig |  43 +++-
+ src/providers/root.zig       |   9 +
+ src/providers/sse.zig        | 103 +++++++++-
+ 6 files changed, 597 insertions(+), 11 deletions(-)
+
+diff --git a/src/agent/prompt.zig b/src/agent/prompt.zig
+index ea3106b..b8e1527 100644
+--- a/src/agent/prompt.zig
++++ b/src/agent/prompt.zig
+@@ -804,6 +804,13 @@ fn writeToolInstructionsSection(w: anytype, tools: anytype, ctx: PromptContext)
+     try w.writeAll("You may use multiple tool calls in a single response. ");
+     try w.writeAll("After tool execution, results appear in <tool_result> tags. ");
+     try w.writeAll("Continue reasoning with the results until you can give a final answer.\n\n");
++    if (tools.len > 0) {
++        try w.writeAll("EXECUTION BIAS:\n");
++        try w.writeAll("- If the request needs a tool, call it in this turn; do not describe the action you are about to take.\n");
++        try w.writeAll("- Saying you are checking, fetching, or fixing something is a progress update, not a final answer. Take the next available action in the same turn.\n");
++        try w.writeAll("- Never end a turn with only a promise of future work when a tool can perform it now.\n");
++        try w.writeAll("- Continue until the task is done or you hit a real blocker; report the blocker instead of promising to continue later.\n\n");
++    }
+     try w.writeAll("Prefer memory tools (memory_recall, memory_list, memory_store, memory_forget) for assistant memory tasks instead of shell/sqlite commands.\n\n");
+     try w.writeAll("If the user asks you to remember something across sessions, use `memory_store` before claiming it was saved.\n");
+     try w.writeAll("Do not promise persistent recall unless the memory tool succeeded. If storage fails or is unavailable, say so plainly.\n\n");
+@@ -1270,6 +1277,52 @@ test "buildToolInstructions includes Parameters when native tools disabled" {
+     try std.testing.expect(std.mem.indexOf(u8, instructions, "Parameters: `{\"value\":\"string\"}`") != null);
+ }
+ 
++test "writeToolInstructionsSection emits EXECUTION BIAS only when tools are present" {
++    const allocator = std.testing.allocator;
++    const MockTool = struct {
++        fn name(_: @This()) []const u8 {
++            return "mock";
++        }
++        fn description(_: @This()) []const u8 {
++            return "A mock tool";
++        }
++        fn parametersJson(_: @This()) []const u8 {
++            return "{}";
++        }
++    };
++    const tools = [_]MockTool{.{}};
++
++    var buf: std.ArrayListUnmanaged(u8) = .empty;
++    defer buf.deinit(allocator);
++    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
++    try writeToolInstructionsSection(&buf_writer.writer, &tools, .{ .workspace_dir = "", .model_name = "", .tools = &.{} });
++    buf = buf_writer.toArrayList();
++    const with_tools = try buf.toOwnedSlice(allocator);
++    defer allocator.free(with_tools);
++    try std.testing.expect(std.mem.indexOf(u8, with_tools, "EXECUTION BIAS:") != null);
++    try std.testing.expect(std.mem.indexOf(u8, with_tools, "progress update, not a final answer") != null);
++
++    var buf2: std.ArrayListUnmanaged(u8) = .empty;
++    defer buf2.deinit(allocator);
++    var buf_writer2: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf2);
++    try writeToolInstructionsSection(&buf_writer2.writer, &[_]MockTool{}, .{ .workspace_dir = "", .model_name = "", .tools = &.{} });
++    buf2 = buf_writer2.toArrayList();
++    const without_tools = try buf2.toOwnedSlice(allocator);
++    defer allocator.free(without_tools);
++    try std.testing.expect(std.mem.indexOf(u8, without_tools, "EXECUTION BIAS:") == null);
++}
++
++test "buildSystemPrompt omits EXECUTION BIAS when no tools are configured" {
++    const allocator = std.testing.allocator;
++    const prompt = try buildSystemPrompt(allocator, .{
++        .workspace_dir = "/tmp/nonexistent",
++        .model_name = "test-model",
++        .tools = &.{},
++    });
++    defer allocator.free(prompt);
++    try std.testing.expect(std.mem.indexOf(u8, prompt, "EXECUTION BIAS:") == null);
++}
++
+ test "buildSystemPrompt includes core sections" {
+     const allocator = std.testing.allocator;
+     const prompt = try buildSystemPrompt(allocator, .{
+diff --git a/src/agent/root.zig b/src/agent/root.zig
+index 5eed4b5..6e8447a 100644
+--- a/src/agent/root.zig
++++ b/src/agent/root.zig
+@@ -955,6 +955,37 @@ pub const Agent = struct {
+         return response_text;
+     }
+ 
++    /// Nudge texts and classification for structural turn-completion stalls.
++    /// These guards key on provider output structure (finish_reason/stop_reason,
++    /// empty content, reasoning-only payloads), never on assistant prose, so
++    /// they are language-independent. The prose-shaped case ("I'll check now")
++    /// is covered by the EXECUTION BIAS prompt rule instead.
++    const TOOL_USE_WITHOUT_CALL_NUDGE = "SYSTEM: The previous turn stopped for tool use but contained no tool call, so nothing ran. Continue from the current state: call the tool you need through the tool interface instead of writing the call as text, or produce the visible answer now. Do not restart from scratch.";
++    const SETTLED_TOOLS_NO_ANSWER_NUDGE = "SYSTEM: The previous assistant turn completed its tool calls but did not produce a user-visible answer. Continue from the current transcript and produce the final user-visible answer now. Do not repeat completed tool calls or restart from scratch.";
++    const REASONING_ONLY_NUDGE = "SYSTEM: The previous assistant turn recorded reasoning but did not produce a user-visible answer. Continue from that partial turn and produce the visible answer now. Do not restate the reasoning or restart from scratch.";
++
++    const EmptyResponseNudge = enum { generic, settled_tools, reasoning_only };
++
++    fn classifyEmptyResponseNudge(has_hidden_reasoning: bool, tools_ran_this_turn: bool) EmptyResponseNudge {
++        if (has_hidden_reasoning) return .reasoning_only;
++        if (tools_ran_this_turn) return .settled_tools;
++        return .generic;
++    }
++
++    fn emptyResponseNudgeCap(kind: EmptyResponseNudge) u32 {
++        // Mirrors OpenClaw: DEFAULT_REASONING_ONLY_RETRY_LIMIT = 2,
++        // DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT = 1 (settled-tools reuses it).
++        return if (kind == .reasoning_only) 2 else 1;
++    }
++
++    fn emptyResponseNudgeText(kind: EmptyResponseNudge) []const u8 {
++        return switch (kind) {
++            .generic => "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response. - If the user asks for information from the internet, web, or external sources (for example: recipes, news, latest documentation), you SHOULD use the `web_search` tool immediately.\n- Do not merely state that you can find the information; execute the tool call in the same turn.\n- NEVER respond with just 'I will search' or 'Let me check' without actually calling the tool in the same response.\n- If the user's intent implies a need for fresh data or external verification, default to using `web_search`.\n\n",
++            .settled_tools => SETTLED_TOOLS_NO_ANSWER_NUDGE,
++            .reasoning_only => REASONING_ONLY_NUDGE,
++        };
++    }
++
+     fn shouldForceActionFollowThrough(text: []const u8) bool {
+         // Specific "let me <action-verb>" and "i'll/i will <action-verb>" phrases.
+         // Kept as explicit verb+phrase pairs to avoid false-positives on conclusory
+@@ -2186,6 +2217,8 @@ pub const Agent = struct {
+         var injection_followups: u32 = 0;
+         var forced_follow_through_count: u32 = 0;
+         var empty_response_retry_count: u32 = 0;
++        var tool_use_retry_count: u32 = 0;
++        var tools_ran_this_turn: bool = false;
+         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
+         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
+         while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
+@@ -2320,6 +2353,11 @@ pub const Agent = struct {
+                     .usage = stream_result.usage,
+                     .model = stream_result.model,
+                     .truncated = stream_result.truncated,
++                    // Streamed tool calls (native tool use while streaming) reach
++                    // the same structural guard as the non-streaming parsers: the
++                    // provider reported finish_reason "tool_calls" and the calls
++                    // were trusted (clean, untruncated stream).
++                    .finish_tool_use = stream_result.finish_tool_use,
+                 };
+             } else {
+                 self.recordLlmRequestEvent(turn_model_name, messages);
+@@ -2636,12 +2674,36 @@ pub const Agent = struct {
+             if (parsed_calls.len == 0) {
+                 const trimmed_display_text = std.mem.trim(u8, display_text, " \t\r\n");
+ 
++                // Structural stall signal: the provider stopped for tool use
++                // (finish_reason "tool_calls" / stop_reason "tool_use") but no
++                // call was parsed. Nudge once, then fail explicitly instead of
++                // returning nothing (or leaking prose) as the final answer.
++                if (response.finish_tool_use) {
++                    self.freeResponseFields(&response);
++                    if (tool_use_retry_count < 1 and
++                        iteration + 1 < self.max_tool_iterations)
++                    {
++                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, TOOL_USE_WITHOUT_CALL_NUDGE) });
++                        self.trimHistory();
++                        tool_use_retry_count += 1;
++                        continue;
++                    }
++                    return error.NoResponseContent;
++                }
++
+                 if (trimmed_display_text.len == 0) {
++                    // Reasoning-only replies (content absent, reasoning present)
++                    // are only a stall when reasoning is not surfaced as the
++                    // answer (reasoning_mode == .off).
++                    const has_hidden_reasoning = self.reasoning_mode == .off and
++                        response.reasoning_content != null and
++                        response.reasoning_content.?.len > 0;
++                    const nudge_kind = classifyEmptyResponseNudge(has_hidden_reasoning, tools_ran_this_turn);
+                     self.freeResponseFields(&response);
+-                    if (empty_response_retry_count < 1 and
++                    if (empty_response_retry_count < emptyResponseNudgeCap(nudge_kind) and
+                         iteration + 1 < self.max_tool_iterations)
+                     {
+-                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response. - If the user asks for information from the internet, web, or external sources (for example: recipes, news, latest documentation), you SHOULD use the `web_search` tool immediately.\n- Do not merely state that you can find the information; execute the tool call in the same turn.\n- NEVER respond with just 'I will search' or 'Let me check' without actually calling the tool in the same response.\n- If the user's intent implies a need for fresh data or external verification, default to using `web_search`.\n\n") });
++                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, emptyResponseNudgeText(nudge_kind)) });
+                         self.trimHistory();
+                         empty_response_retry_count += 1;
+                         continue;
+@@ -2790,6 +2852,7 @@ pub const Agent = struct {
+             try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = safe_assistant_content });
+ 
+             // Execute each tool call
++            tools_ran_this_turn = true;
+             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
+             defer results_buf.deinit(self.allocator);
+             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
+@@ -13271,3 +13334,302 @@ test "Agent: redactor scrubs PII in system prompt" {
+     try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
+     try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+ }
++
++// ═══════════════════════════════════════════════════════════════════════════
++// Turn-completion stall guards
++// ═══════════════════════════════════════════════════════════════════════════
++
++/// One scripted provider response for the turn-completion tests.
++const TurnScript = union(enum) {
++    text: []const u8,
++    empty,
++    tool_call: struct { name: []const u8, args: []const u8, content: []const u8 },
++    finish_tool_use: []const u8,
++    reasoning_only: []const u8,
++};
++
++/// Provider that replays a fixed script of responses by call index.
++const ScriptedTurnProvider = struct {
++    scripts: []const TurnScript,
++    idx: usize = 0,
++
++    fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++        return allocator.dupe(u8, "");
++    }
++
++    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++        const self: *@This() = @ptrCast(@alignCast(ptr));
++        const script: TurnScript = if (self.idx < self.scripts.len) self.scripts[self.idx] else TurnScript{ .text = "done" };
++        self.idx += 1;
++        return switch (script) {
++            .text => |t| .{ .content = try allocator.dupe(u8, t), .model = try allocator.dupe(u8, "test-model") },
++            .empty => .{ .model = try allocator.dupe(u8, "test-model") },
++            .finish_tool_use => |t| .{
++                .content = if (t.len > 0) try allocator.dupe(u8, t) else null,
++                .finish_tool_use = true,
++                .model = try allocator.dupe(u8, "test-model"),
++            },
++            .reasoning_only => |r| .{
++                .reasoning_content = try allocator.dupe(u8, r),
++                .model = try allocator.dupe(u8, "test-model"),
++            },
++            .tool_call => |tc| blk: {
++                const calls = try allocator.alloc(providers.ToolCall, 1);
++                calls[0] = .{
++                    .id = try allocator.dupe(u8, "call-1"),
++                    .name = try allocator.dupe(u8, tc.name),
++                    .arguments = try allocator.dupe(u8, tc.args),
++                };
++                break :blk .{
++                    .content = if (tc.content.len > 0) try allocator.dupe(u8, tc.content) else null,
++                    .tool_calls = calls,
++                    .model = try allocator.dupe(u8, "test-model"),
++                };
++            },
++        };
++    }
++
++    fn supportsNativeTools(_: *anyopaque) bool {
++        return true;
++    }
++    fn getName(_: *anyopaque) []const u8 {
++        return "scripted-turn-provider";
++    }
++    fn deinitFn(_: *anyopaque) void {}
++};
++
++fn scriptedProvider(state: *ScriptedTurnProvider) Provider {
++    const vtable = Provider.VTable{
++        .chatWithSystem = ScriptedTurnProvider.chatWithSystem,
++        .chat = ScriptedTurnProvider.chat,
++        .supportsNativeTools = ScriptedTurnProvider.supportsNativeTools,
++        .getName = ScriptedTurnProvider.getName,
++        .deinit = ScriptedTurnProvider.deinitFn,
++    };
++    return Provider{ .ptr = @ptrCast(state), .vtable = &vtable };
++}
++
++fn makeTurnAgent(
++    allocator: std.mem.Allocator,
++    provider: Provider,
++    tools: []const Tool,
++    specs: []ToolSpec,
++    observer: observability.Observer,
++) Agent {
++    return Agent{
++        .allocator = allocator,
++        .provider = provider,
++        .tools = tools,
++        .tool_specs = specs,
++        .mem = null,
++        .observer = observer,
++        .model_name = "test-model",
++        .temperature = 0.7,
++        .workspace_dir = "/tmp",
++        .max_tool_iterations = 5,
++        .max_history_messages = 50,
++        .auto_save = false,
++        .history = .empty,
++        .total_tokens = 0,
++        .has_system_prompt = false,
++    };
++}
++
++test "classifyEmptyResponseNudge prefers reasoning-only then settled-tools then generic" {
++    try std.testing.expectEqual(Agent.EmptyResponseNudge.reasoning_only, Agent.classifyEmptyResponseNudge(true, true));
++    try std.testing.expectEqual(Agent.EmptyResponseNudge.reasoning_only, Agent.classifyEmptyResponseNudge(true, false));
++    try std.testing.expectEqual(Agent.EmptyResponseNudge.settled_tools, Agent.classifyEmptyResponseNudge(false, true));
++    try std.testing.expectEqual(Agent.EmptyResponseNudge.generic, Agent.classifyEmptyResponseNudge(false, false));
++}
++
++test "emptyResponseNudgeCap allows two reasoning-only retries and one otherwise" {
++    try std.testing.expectEqual(@as(u32, 2), Agent.emptyResponseNudgeCap(.reasoning_only));
++    try std.testing.expectEqual(@as(u32, 1), Agent.emptyResponseNudgeCap(.settled_tools));
++    try std.testing.expectEqual(@as(u32, 1), Agent.emptyResponseNudgeCap(.generic));
++}
++
++test "Agent turn nudges once then fails on finish_tool_use without a tool call" {
++    const allocator = std.testing.allocator;
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .finish_tool_use = "" },
++        .{ .finish_tool_use = "" },
++        .{ .text = "done" },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    try std.testing.expectError(error.NoResponseContent, agent.turn("go"));
++    try std.testing.expectEqual(@as(usize, 2), state.idx);
++}
++
++test "Agent turn recovers when finish_tool_use is followed by a real answer" {
++    const allocator = std.testing.allocator;
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .finish_tool_use = "I will do that now" },
++        .{ .text = "done" },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("go");
++    defer allocator.free(response);
++    try std.testing.expectEqualStrings("done", response);
++    try std.testing.expectEqual(@as(usize, 2), state.idx);
++}
++
++test "Agent turn uses settled-tools nudge and recovers after tools ran" {
++    const ProbeTool = struct {
++        const Self = @This();
++        count: *usize,
++        pub const tool_name = "probe";
++        pub const tool_description = "probe";
++        pub const tool_params =
++            \\{"type":"object","properties":{"value":{"type":"number"}},"required":["value"]}
++        ;
++        pub const vtable = tools_mod.ToolVTable(Self);
++
++        fn tool(self: *Self) Tool {
++            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
++        }
++
++        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
++            self.count.* += 1;
++            return .{ .success = true, .output = "probe ok" };
++        }
++    };
++
++    const allocator = std.testing.allocator;
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .tool_call = .{ .name = "probe", .args = "{\"value\":1}", .content = "" } },
++        .{ .empty = {} },
++        .{ .text = "final answer" },
++    } };
++    const provider = scriptedProvider(&state);
++
++    var probe_count: usize = 0;
++    var probe_impl = ProbeTool{ .count = &probe_count };
++    const tool_list = [_]Tool{probe_impl.tool()};
++    var specs = try allocator.alloc(ToolSpec, tool_list.len);
++    for (tool_list, 0..) |t, i| {
++        specs[i] = .{
++            .name = t.name(),
++            .description = t.description(),
++            .parameters_json = t.parametersJson(),
++        };
++    }
++
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &tool_list, specs, noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("run probe");
++    defer allocator.free(response);
++    try std.testing.expectEqualStrings("final answer", response);
++    try std.testing.expectEqual(@as(usize, 1), probe_count);
++    try std.testing.expectEqual(@as(usize, 3), state.idx);
++}
++
++test "Agent turn fails after the settled-tools nudge is exhausted" {
++    const ProbeTool = struct {
++        const Self = @This();
++        pub const tool_name = "probe";
++        pub const tool_description = "probe";
++        pub const tool_params =
++            \\{"type":"object","properties":{"value":{"type":"number"}},"required":["value"]}
++        ;
++        pub const vtable = tools_mod.ToolVTable(Self);
++
++        fn tool(self: *Self) Tool {
++            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
++        }
++
++        pub fn execute(_: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
++            return .{ .success = true, .output = "probe ok" };
++        }
++    };
++
++    const allocator = std.testing.allocator;
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .tool_call = .{ .name = "probe", .args = "{\"value\":1}", .content = "" } },
++        .{ .empty = {} },
++        .{ .empty = {} },
++        .{ .text = "final answer" },
++    } };
++    const provider = scriptedProvider(&state);
++
++    var probe_impl = ProbeTool{};
++    const tool_list = [_]Tool{probe_impl.tool()};
++    var specs = try allocator.alloc(ToolSpec, tool_list.len);
++    for (tool_list, 0..) |t, i| {
++        specs[i] = .{
++            .name = t.name(),
++            .description = t.description(),
++            .parameters_json = t.parametersJson(),
++        };
++    }
++
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &tool_list, specs, noop.observer());
++    defer agent.deinit();
++
++    try std.testing.expectError(error.NoResponseContent, agent.turn("run probe"));
++    try std.testing.expectEqual(@as(usize, 3), state.idx);
++}
++
++test "Agent turn retries reasoning-only replies up to two times" {
++    const allocator = std.testing.allocator;
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .reasoning_only = "thinking a" },
++        .{ .reasoning_only = "thinking b" },
++        .{ .text = "done" },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("go");
++    defer allocator.free(response);
++    try std.testing.expectEqualStrings("done", response);
++    try std.testing.expectEqual(@as(usize, 3), state.idx);
++}
++
++test "Agent turn fails after two reasoning-only retries" {
++    const allocator = std.testing.allocator;
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .reasoning_only = "thinking a" },
++        .{ .reasoning_only = "thinking b" },
++        .{ .reasoning_only = "thinking c" },
++        .{ .text = "done" },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    try std.testing.expectError(error.NoResponseContent, agent.turn("go"));
++    try std.testing.expectEqual(@as(usize, 3), state.idx);
++}
++
++test "Agent turn returns announcing prose without a structural retry (step-5 shape)" {
++    // finish_reason is "stop" (finish_tool_use=false) and the reply is Chinese
++    // prose announcing an action with no tool call. No structural signal fires;
++    // this shape is handled by the EXECUTION BIAS prompt rule, not the guards.
++    const allocator = std.testing.allocator;
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .text = "先把 key 拿出来，改脚本重测。" },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("继续");
++    defer allocator.free(response);
++    try std.testing.expectEqualStrings("先把 key 拿出来，改脚本重测。", response);
++    try std.testing.expectEqual(@as(usize, 1), state.idx);
++}
+diff --git a/src/providers/anthropic.zig b/src/providers/anthropic.zig
+index 00bfb42..7365412 100644
+--- a/src/providers/anthropic.zig
++++ b/src/providers/anthropic.zig
+@@ -223,6 +223,13 @@ pub const AnthropicProvider = struct {
+             }
+         }
+ 
++        // Structural stall signal: the provider stopped to invoke a tool.
++        // Read from provider output structure, never assistant prose.
++        const finish_tool_use = if (root_obj.get("stop_reason")) |sr|
++            (sr == .string and std.mem.eql(u8, sr.string, "tool_use"))
++        else
++            false;
++
+         // Parse usage if present
+         var usage = TokenUsage{};
+         if (root_obj.get("usage")) |usage_obj| {
+@@ -254,6 +261,7 @@ pub const AnthropicProvider = struct {
+             .usage = usage,
+             .model = try allocator.dupe(u8, model_str),
+             .truncated = truncated,
++            .finish_tool_use = finish_tool_use,
+         };
+     }
+ 
+@@ -796,6 +804,32 @@ test "parseTextResponse classifies rate-limit errors" {
+     try std.testing.expectError(error.RateLimited, AnthropicProvider.parseTextResponse(std.testing.allocator, body));
+ }
+ 
++test "parseNativeResponse records finish_tool_use for stop_reason tool_use" {
++    const body =
++        \\{"content":[{"type":"text","text":"Let me check"}],"stop_reason":"tool_use","model":"claude-3-opus"}
++    ;
++    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
++    defer {
++        if (response.content) |c| std.testing.allocator.free(c);
++        std.testing.allocator.free(response.tool_calls);
++        std.testing.allocator.free(response.model);
++    }
++    try std.testing.expect(response.finish_tool_use);
++}
++
++test "parseNativeResponse leaves finish_tool_use false for stop_reason end_turn" {
++    const body =
++        \\{"content":[{"type":"text","text":"Done"}],"stop_reason":"end_turn","model":"claude-3-opus"}
++    ;
++    const response = try AnthropicProvider.parseNativeResponse(std.testing.allocator, body);
++    defer {
++        if (response.content) |c| std.testing.allocator.free(c);
++        std.testing.allocator.free(response.tool_calls);
++        std.testing.allocator.free(response.model);
++    }
++    try std.testing.expect(!response.finish_tool_use);
++}
++
+ test "parseNativeResponse with text and tool_use" {
+     const body =
+         \\{"content":[{"type":"text","text":"Let me check"},{"type":"tool_use","id":"call_1","name":"shell","input":{"cmd":"ls"}}],"usage":{"input_tokens":10,"output_tokens":20},"model":"claude-3-opus"}
+diff --git a/src/providers/compatible.zig b/src/providers/compatible.zig
+index 187eeea..8e26753 100644
+--- a/src/providers/compatible.zig
++++ b/src/providers/compatible.zig
+@@ -1051,9 +1051,16 @@ pub const OpenAiCompatibleProvider = struct {
+ 
+         if (root_obj.get("choices")) |choices| {
+             if (choices == .array and choices.array.items.len > 0) {
+-                const msg = choices.array.items[0].object.get("message") orelse return error.NoResponseContent;
++                const choice_obj = choices.array.items[0].object;
++                const msg = choice_obj.get("message") orelse return error.NoResponseContent;
+                 const msg_obj = msg.object;
+                 const truncated = root.choiceReportsLengthFinish(choices.array.items[0]);
++                // Structural stall signal: the provider stopped to invoke a tool.
++                // Read from provider output structure, never assistant prose.
++                const finish_tool_use = if (choice_obj.get("finish_reason")) |fr|
++                    (fr == .string and std.mem.eql(u8, fr.string, "tool_calls"))
++                else
++                    false;
+ 
+                 var content: ?[]const u8 = null;
+                 errdefer if (content) |c| if (c.len > 0) allocator.free(c);
+@@ -1166,6 +1173,7 @@ pub const OpenAiCompatibleProvider = struct {
+                     .model = model_str,
+                     .reasoning_content = reasoning_content,
+                     .truncated = truncated,
++                    .finish_tool_use = finish_tool_use,
+                 };
+             }
+         }
+@@ -2068,6 +2076,39 @@ test "parseTextResponse strips think blocks" {
+     try std.testing.expectEqualStrings("Visible answer", result);
+ }
+ 
++test "parseNativeResponse records finish_tool_use for finish_reason tool_calls" {
++    const body =
++        \\{"choices":[{"finish_reason":"tool_calls","message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"shell","arguments":"{}"}}]}}],"model":"glm-5"}
++    ;
++    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
++    defer {
++        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
++        for (result.tool_calls) |tc| {
++            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
++            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
++            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
++        }
++        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
++        if (result.model.len > 0) std.testing.allocator.free(result.model);
++        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
++    }
++    try std.testing.expect(result.finish_tool_use);
++}
++
++test "parseNativeResponse leaves finish_tool_use false for finish_reason stop" {
++    const body =
++        \\{"choices":[{"finish_reason":"stop","message":{"content":"pong"}}],"model":"glm-5"}
++    ;
++    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
++    defer {
++        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
++        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
++        if (result.model.len > 0) std.testing.allocator.free(result.model);
++        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
++    }
++    try std.testing.expect(!result.finish_tool_use);
++}
++
+ test "parseNativeResponse splits think blocks into content and reasoning_content" {
+     const body =
+         \\{"choices":[{"message":{"content":"<think>private chain of thought</think>\nVisible answer"}}],"model":"minimax-m2.5"}
+diff --git a/src/providers/root.zig b/src/providers/root.zig
+index 1563101..1728a10 100644
+--- a/src/providers/root.zig
++++ b/src/providers/root.zig
+@@ -219,6 +219,11 @@ pub const ChatResponse = struct {
+     /// (`finish_reason == "length"`). Tool calls salvaged from such a response
+     /// must never be executed.
+     truncated: bool = false,
++    /// True when the provider signalled it stopped to invoke a tool
++    /// (finish_reason "tool_calls" / stop_reason "tool_use") regardless of
++    /// whether any call could be parsed. Structural stall signal; the agent
++    /// uses it to nudge or fail explicitly instead of returning silently.
++    finish_tool_use: bool = false,
+ 
+     /// True when the LLM wants to invoke at least one tool.
+     pub fn hasToolCalls(self: ChatResponse) bool {
+@@ -291,6 +296,10 @@ pub const StreamChatResult = struct {
+     model: []const u8 = "",
+     /// See `ChatResponse.truncated`.
+     truncated: bool = false,
++    /// True when the stream reported a `finish_reason` of "tool_calls" and the
++    /// calls were trusted (the stream ended cleanly and was not truncated), so
++    /// the provider stopped to invoke a tool. See `ChatResponse.finish_tool_use`.
++    finish_tool_use: bool = false,
+ };
+ 
+ pub fn shouldRecoverPartialStream(accumulated_len: usize, saw_done: bool) bool {
+diff --git a/src/providers/sse.zig b/src/providers/sse.zig
+index bd8b216..6c731cb 100644
+--- a/src/providers/sse.zig
++++ b/src/providers/sse.zig
+@@ -242,6 +242,10 @@ fn finalizeStreamResultWithToolCalls(
+     /// of "length". Propagated to the agent so it refuses to execute tool
+     /// calls parsed from the partial text.
+     truncated: bool,
++    /// Whether the stream reported a `finish_reason` of "tool_calls": the
++    /// provider stopped to invoke a tool. Only trusted (with a clean,
++    /// untruncated stream) so a cut call never reports a structural tool stop.
++    finish_tool_use: bool,
+ ) !root.StreamChatResult {
+     var result = try finalizeStreamResult(allocator, accumulated, stream_usage);
+     errdefer {
+@@ -257,6 +261,10 @@ fn finalizeStreamResultWithToolCalls(
+     }
+ 
+     result.truncated = truncated;
++    // Only a clean, untruncated stream that signalled tool use is a structural
++    // tool stop the agent can act on: a call cut mid-flight (untrusted) or a
++    // truncated response must never report one.
++    result.finish_tool_use = tool_calls_trusted and finish_tool_use and !truncated;
+     if (tool_calls_trusted) {
+         result.tool_calls = try tool_call_accumulator.toOwnedToolCalls(allocator);
+     }
+@@ -569,6 +577,19 @@ fn isJsonWhitespace(c: u8) bool {
+ /// cut was never flagged. The field is only matched at a JSON value position
+ /// (after `{` or `,`) so a quoted mention inside a content string is ignored.
+ fn sseLineReportsLengthFinish(line: []const u8) bool {
++    return sseLineReportsFinishReason(line, "length");
++}
++
++/// True when the SSE line's JSON payload has a top-level `finish_reason` of
++/// `want` (e.g. "tool_calls"). Mirrors `sseLineReportsLengthFinish`: the scan is
++/// textual so a >16 KB data line cannot hide the signal behind a size-limited
++/// JSON parse, and a quoted mention inside a content string is ignored because
++/// the key must be preceded by `{` or `,`.
++fn sseLineReportsToolCallsFinish(line: []const u8) bool {
++    return sseLineReportsFinishReason(line, "tool_calls");
++}
++
++fn sseLineReportsFinishReason(line: []const u8, want: []const u8) bool {
+     const data = extractSseDataPayload(line) orelse return false;
+     if (data.len == 0 or std.mem.eql(u8, data, "[DONE]")) return false;
+ 
+@@ -591,7 +612,7 @@ fn sseLineReportsLengthFinish(line: []const u8) bool {
+         if (i >= data.len or data[i] != '"') continue;
+         const value_start = i + 1;
+         const value_end = std.mem.indexOfScalarPos(u8, data, value_start, '"') orelse continue;
+-        if (std.mem.eql(u8, data[value_start..value_end], "length")) return true;
++        if (std.mem.eql(u8, data[value_start..value_end], want)) return true;
+     }
+     return false;
+ }
+@@ -783,6 +804,7 @@ pub fn curlStream(
+     var read_buf: [4096]u8 = undefined;
+     var saw_done = false;
+     var saw_length_finish = false;
++    var saw_tool_calls_finish = false;
+     var total_stdout: usize = 0;
+     var stream_usage: ?root.TokenUsage = null;
+     var in_reasoning = false;
+@@ -848,6 +870,7 @@ pub fn curlStream(
+                 }
+                 try accumulateToolCallsFromSseLine(&tool_call_accumulator, allocator, line_buf.items);
+                 if (!saw_length_finish and sseLineReportsLengthFinish(line_buf.items)) saw_length_finish = true;
++                if (!saw_tool_calls_finish and sseLineReportsToolCallsFinish(line_buf.items)) saw_tool_calls_finish = true;
+                 const result = parseSseLine(allocator, line_buf.items) catch {
+                     line_buf.clearRetainingCapacity();
+                     continue;
+@@ -934,7 +957,7 @@ pub fn curlStream(
+             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
+             try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+             callback(ctx, root.StreamChunk.finalChunk());
+-            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
++            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true, false);
+         }
+         return error.CurlWaitError;
+     };
+@@ -947,7 +970,7 @@ pub fn curlStream(
+                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
+                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+                 callback(ctx, root.StreamChunk.finalChunk());
+-                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
++                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true, false);
+             }
+             return error.CurlFailed;
+         },
+@@ -956,7 +979,7 @@ pub fn curlStream(
+                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
+                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+                 callback(ctx, root.StreamChunk.finalChunk());
+-                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
++                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true, false);
+             }
+             return error.CurlFailed;
+         },
+@@ -965,7 +988,7 @@ pub fn curlStream(
+     // Signal stream completion only after curl exits successfully.
+     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
+     callback(ctx, root.StreamChunk.finalChunk());
+-    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, true, saw_length_finish);
++    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, true, saw_length_finish, saw_tool_calls_finish);
+ }
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+@@ -1513,7 +1536,7 @@ test "finalizeStreamResultWithToolCalls flags a cut stream as truncated" {
+ 
+     // Recovery path: the stream was cut, so tool_calls_trusted=false and
+     // truncated=true. The partial text is kept but no tool call is exposed.
+-    const result = try finalizeStreamResultWithToolCalls(allocator, "partial answer", null, &accumulator, false, true);
++    const result = try finalizeStreamResultWithToolCalls(allocator, "partial answer", null, &accumulator, false, true, false);
+     defer {
+         if (result.content) |content| allocator.free(content);
+         if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+@@ -1573,7 +1596,7 @@ test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
+         \\{"choices":[{"delta":{"content":"ignored","tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
+     );
+ 
+-    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator, true, false);
++    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator, true, false, false);
+     defer {
+         if (result.content) |content| allocator.free(content);
+         if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+@@ -1592,6 +1615,70 @@ test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
+     try std.testing.expectEqualStrings("{}", result.tool_calls[0].arguments);
+ }
+ 
++test "sseLineReportsToolCallsFinish detects a tool_calls finish" {
++    try std.testing.expect(sseLineReportsToolCallsFinish(
++        \\data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
++    ));
++    try std.testing.expect(!sseLineReportsToolCallsFinish(
++        \\data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
++    ));
++    // The two scanners must not cross-match.
++    try std.testing.expect(!sseLineReportsToolCallsFinish(
++        \\data: {"choices":[{"delta":{},"finish_reason":"length"}]}
++    ));
++    try std.testing.expect(!sseLineReportsLengthFinish(
++        \\data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
++    ));
++    try std.testing.expect(!sseLineReportsToolCallsFinish("data: [DONE]"));
++    try std.testing.expect(!sseLineReportsToolCallsFinish(": keep-alive"));
++    // A quoted mention inside content is not the real finish_reason.
++    try std.testing.expect(!sseLineReportsToolCallsFinish(
++        \\data: {"choices":[{"delta":{"content":"say \"finish_reason\":\"tool_calls\" now"}}]}
++    ));
++}
++
++test "finalizeStreamResultWithToolCalls sets finish_tool_use only for trusted untruncated calls" {
++    const allocator = std.testing.allocator;
++
++    const Case = struct { trusted: bool, truncated: bool, finish: bool, want: bool };
++    const cases = [_]Case{
++        .{ .trusted = true, .truncated = false, .finish = true, .want = true },
++        .{ .trusted = true, .truncated = true, .finish = true, .want = false },
++        .{ .trusted = false, .truncated = false, .finish = true, .want = false },
++        .{ .trusted = true, .truncated = false, .finish = false, .want = false },
++    };
++
++    for (cases) |case| {
++        var accumulator = ToolCallAccumulator{};
++        defer accumulator.deinit(allocator);
++        try accumulator.appendFromJsonPayload(allocator,
++            \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
++        );
++
++        const result = try finalizeStreamResultWithToolCalls(
++            allocator,
++            "",
++            null,
++            &accumulator,
++            case.trusted,
++            case.truncated,
++            case.finish,
++        );
++        defer {
++            if (result.content) |content| allocator.free(content);
++            if (result.reasoning_content) |reasoning| allocator.free(reasoning);
++            for (result.tool_calls) |tc| {
++                allocator.free(tc.id);
++                allocator.free(tc.name);
++                allocator.free(tc.arguments);
++            }
++            if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
++        }
++
++        try std.testing.expectEqual(case.want, result.finish_tool_use);
++    }
++}
++
+ test "finalizeStreamResultWithToolCalls supports tool-call-only response" {
+     const allocator = std.testing.allocator;
+     var accumulator = ToolCallAccumulator{};
+@@ -1601,7 +1688,7 @@ test "finalizeStreamResultWithToolCalls supports tool-call-only response" {
+         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
+     );
+ 
+-    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator, true, false);
++    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator, true, false, false);
+     defer {
+         if (result.content) |content| allocator.free(content);
+         if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+-- 
+2.56.0
+
