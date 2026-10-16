@@ -1,0 +1,1090 @@
+From 77b85318a597dcf11e244ae866c825c0e7b30650 Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Sat, 17 Oct 2026 05:17:52 +0900
+Subject: [PATCH] fix(reply): strip orphan tool-call closers, nudge on garbled
+ text tool calls, keep Slack streams under msg_too_long
+
+---
+ src/agent/commands.zig                  |  49 ++++-
+ src/agent/root.zig                      | 183 +++++++++++++++-
+ src/channels/slack.zig                  |  95 +++++++-
+ src/channels/slack_stream_presenter.zig |  82 ++++++-
+ src/providers/helpers.zig               | 274 +++++++++++++++++++++++-
+ src/streaming.zig                       | 111 +++++++++-
+ 6 files changed, 768 insertions(+), 26 deletions(-)
+
+diff --git a/src/agent/commands.zig b/src/agent/commands.zig
+index 10d4ff8..fb304f8 100644
+--- a/src/agent/commands.zig
++++ b/src/agent/commands.zig
+@@ -5428,12 +5428,22 @@ pub fn composeFinalReply(
+     reasoning_content: ?[]const u8,
+     usage: providers.TokenUsage,
+ ) ![]const u8 {
++    // Never deliver tool-call markup to the user. A model can end its reply
++    // with a garbled text tool call (for example a lone `</function>` closer)
++    // that the parser could not turn into an executable call; the streaming
++    // TagFilter hides it from the live preview, but the final reply is
++    // authoritative, so strip it here exactly as the reasoning quote already
++    // is. Code fences and inline spans are preserved: a documented sample is
++    // not markup.
++    const clean_base = try providers.stripToolCallMarkup(self.allocator, base_text);
++    defer self.allocator.free(clean_base);
++
+     // For reasoning_mode == .stream the thinking content is already printed
+     // live during streaming via ThinkPassthroughFilter, so we must not
+     // prepend it again here. Only .on mode shows the post-turn block.
+     const show_reasoning = self.reasoning_mode == .on and reasoning_content != null and reasoning_content.?.len > 0;
+     if (!show_reasoning and self.usage_mode == .off) {
+-        return try self.allocator.dupe(u8, base_text);
++        return try self.allocator.dupe(u8, clean_base);
+     }
+ 
+     var out: std.ArrayListUnmanaged(u8) = .empty;
+@@ -5456,7 +5466,7 @@ pub fn composeFinalReply(
+         }
+         try w.writeAll("\n\n");
+     }
+-    try w.writeAll(base_text);
++    try w.writeAll(clean_base);
+ 
+     switch (self.usage_mode) {
+         .off => {},
+@@ -5997,6 +6007,41 @@ test "composeFinalReply stream mode does not prepend reasoning block" {
+     try std.testing.expectEqualStrings("Answer", result);
+ }
+ 
++test "composeFinalReply strips a lone orphan tool-call closer from the final answer" {
++    // Prod shape: the model announced one more round of work and then emitted a
++    // lone `</function>`; the parser found no executable call, so this reply was
++    // delivered verbatim (the orphan closer reached the user). It must not.
++    const allocator = std.testing.allocator;
++    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .off };
++    const usage = providers.TokenUsage{};
++    const prod = "核心数据到手了。最后一轮，把对比表和机器参数抠准——电池容量是换算的关键。\n</function>";
++    const result = try composeFinalReply(&agent, prod, null, usage);
++    defer allocator.free(result);
++    try std.testing.expectEqualStrings("核心数据到手了。最后一轮，把对比表和机器参数抠准——电池容量是换算的关键。\n", result);
++    try std.testing.expect(std.mem.indexOf(u8, result, "</function") == null);
++}
++
++test "composeFinalReply strips the orphan closer even with a usage footer" {
++    const allocator = std.testing.allocator;
++    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .off, .usage_mode = .tokens };
++    const usage = providers.TokenUsage{ .total_tokens = 7 };
++    const result = try composeFinalReply(&agent, "答案。\n</function>", null, usage);
++    defer allocator.free(result);
++    try std.testing.expect(std.mem.indexOf(u8, result, "</function") == null);
++    try std.testing.expect(std.mem.indexOf(u8, result, "total_tokens=7") != null);
++    try std.testing.expect(std.mem.startsWith(u8, result, "答案。\n"));
++}
++
++test "composeFinalReply keeps a tool-call sample inside a code fence" {
++    const allocator = std.testing.allocator;
++    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .off };
++    const usage = providers.TokenUsage{};
++    const doc = "Example:\n```xml\n<function_calls></function_calls>\n```\ndone";
++    const result = try composeFinalReply(&agent, doc, null, usage);
++    defer allocator.free(result);
++    try std.testing.expect(std.mem.indexOf(u8, result, "<function_calls>") != null);
++}
++
+ test "composeFinalReply on mode strips tool-call markup from the reasoning quote" {
+     const allocator = std.testing.allocator;
+     var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .on };
+diff --git a/src/agent/root.zig b/src/agent/root.zig
+index 119f698..7db83f5 100644
+--- a/src/agent/root.zig
++++ b/src/agent/root.zig
+@@ -971,6 +971,7 @@ pub const Agent = struct {
+     const TOOL_USE_WITHOUT_CALL_NUDGE = "SYSTEM: The previous turn stopped for tool use but contained no tool call, so nothing ran. Continue from the current state: call the tool you need through the tool interface instead of writing the call as text, or produce the visible answer now. Do not restart from scratch.";
+     const SETTLED_TOOLS_NO_ANSWER_NUDGE = "SYSTEM: The previous assistant turn completed its tool calls but did not produce a user-visible answer. Continue from the current transcript and produce the final user-visible answer now. Do not repeat completed tool calls or restart from scratch.";
+     const REASONING_ONLY_NUDGE = "SYSTEM: The previous assistant turn recorded reasoning but did not produce a user-visible answer. Continue from that partial turn and produce the visible answer now. Do not restate the reasoning or restart from scratch.";
++    const TEXT_TOOL_CALL_NUDGE = "SYSTEM: The previous reply contained tool-call markup (for example a stray </function> closer) but no executable tool call was parsed, so nothing ran for that call. Continue from the current state: call the tool you need through the tool interface, or produce the final user-visible answer now. Do not print tool-call markup.";
+ 
+     const EmptyResponseNudge = enum { generic, settled_tools, reasoning_only };
+ 
+@@ -2226,6 +2227,7 @@ pub const Agent = struct {
+         var forced_follow_through_count: u32 = 0;
+         var empty_response_retry_count: u32 = 0;
+         var tool_use_retry_count: u32 = 0;
++        var text_tool_call_retry_count: u32 = 0;
+         var tools_ran_this_turn: bool = false;
+         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
+         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
+@@ -2731,6 +2733,31 @@ pub const Agent = struct {
+                     return error.NoResponseContent;
+                 }
+ 
++                // A reply whose visible text still carries a dangling tool-call
++                // closer (a garbled text tool call: the prod reply announced one
++                // more round and then emitted a lone `</function>`) is an
++                // incomplete turn, not an answer. The signal is structural, so
++                // it works for a reply the prose phrase list below cannot match.
++                // Nudge once with the same bounded machinery as the other
++                // stalls; if it recurs the reply is delivered with the markup
++                // stripped (composeFinalReply), never verbatim.
++                if (text_tool_call_retry_count < 1 and
++                    iteration + 1 < self.max_tool_iterations and
++                    (try providers.helpers.hasOrphanToolCallClose(self.allocator, display_text)))
++                {
++                    // Store the markup-free text so no re-render of history leaks
++                    // the closer and the model does not re-read its own garbled
++                    // text tool call.
++                    const nudge_text = try providers.stripToolCallMarkup(self.allocator, display_text);
++                    defer self.allocator.free(nudge_text);
++                    try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = try self.dupeForHistory(nudge_text) });
++                    try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, TEXT_TOOL_CALL_NUDGE) });
++                    self.trimHistory();
++                    self.freeResponseFields(&response);
++                    text_tool_call_retry_count += 1;
++                    continue;
++                }
++
+                 // Guardrail: if the model promises "I'll try/check now" but emits no
+                 // tool call, force one follow-up completion to either act now or
+                 // explicitly state the limitation without deferred promises.
+@@ -2778,10 +2805,15 @@ pub const Agent = struct {
+                 const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
+                 errdefer self.allocator.free(final_text);
+ 
+-                // Dupe from display_text directly (not from final_text) to avoid double-dupe
++                // Store the same markup-free text the user saw: composeFinalReply
++                // strips tool-call markup for delivery, so history must match it
++                // (a re-render of history must not leak the closer, and the model
++                // must not re-read its own garbled text tool call next turn).
++                const history_text = try providers.stripToolCallMarkup(self.allocator, display_text);
++                defer self.allocator.free(history_text);
+                 try self.history.append(self.allocator, .{
+                     .role = .assistant,
+-                    .content = try self.dupeForHistory(display_text),
++                    .content = try self.dupeForHistory(history_text),
+                 });
+ 
+                 // Auto-compaction before hard trimming to preserve context.
+@@ -13799,3 +13831,150 @@ test "Agent turn returns announcing prose without a structural retry (step-5 sha
+     try std.testing.expectEqualStrings("先把 key 拿出来，改脚本重测。", response);
+     try std.testing.expectEqual(@as(usize, 1), state.idx);
+ }
++
++test "Agent turn nudges once on a garbled text tool call and delivers the clean retry" {
++    // Prod shape: announcing prose followed by a lone orphan `</function>`
++    // closer and no executable call. The guard retries once; the retry's real
++    // answer is delivered with no markup.
++    const allocator = std.testing.allocator;
++    const garbled = "核心数据到手了。最后一轮，把对比表和机器参数抠准——电池容量是换算的关键。\n</function>";
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .text = garbled },
++        .{ .text = "最终答案：电池容量 5000mAh。" },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("继续");
++    defer allocator.free(response);
++    try std.testing.expectEqualStrings("最终答案：电池容量 5000mAh。", response);
++    try std.testing.expectEqual(@as(usize, 2), state.idx);
++}
++
++test "Agent turn delivers the stripped answer when the text tool call recurs" {
++    const allocator = std.testing.allocator;
++    const garbled = "核心数据到手了。最后一轮，把对比表和机器参数抠准——电池容量是换算的关键。\n</function>";
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .text = garbled },
++        .{ .text = garbled },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("继续");
++    defer allocator.free(response);
++    // The bounded retry is exhausted, so the reply is delivered with the markup
++    // stripped — never verbatim.
++    try std.testing.expectEqualStrings("核心数据到手了。最后一轮，把对比表和机器参数抠准——电池容量是换算的关键。\n", response);
++    try std.testing.expect(std.mem.indexOf(u8, response, "</function") == null);
++    try std.testing.expectEqual(@as(usize, 2), state.idx);
++}
++
++test "Agent turn does not retry a balanced function-markup answer" {
++    // A balanced pair outside a code fence is prose, not a garbled call, so the
++    // structural guard does not fire.
++    const allocator = std.testing.allocator;
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .text = "Use <function name=\"read\">body</function> in the docs." },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("hi");
++    defer allocator.free(response);
++    try std.testing.expectEqual(@as(usize, 1), state.idx);
++    try std.testing.expect(std.mem.indexOf(u8, response, "in the docs.") != null);
++    try std.testing.expect(std.mem.indexOf(u8, response, "</function") == null);
++}
++
++test "Agent turn nudges once on a truncated function= text tool call" {
++    // OpenAI `=` dialect: the model announces a search and emits a bare
++    // `<function=web_search>` with no close. It is a garbled text tool call, so
++    // the guard retries once and the clean retry is delivered.
++    const allocator = std.testing.allocator;
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .text = "先查一下。\n<function=web_search>" },
++        .{ .text = "最终答案。" },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("查");
++    defer allocator.free(response);
++    try std.testing.expectEqualStrings("最终答案。", response);
++    try std.testing.expectEqual(@as(usize, 2), state.idx);
++}
++
++test "Agent turn delivers the stripped answer when the function= call recurs" {
++    const allocator = std.testing.allocator;
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .text = "先查一下。\n<function=web_search>" },
++        .{ .text = "先查一下。\n<function=web_search>" },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("查");
++    defer allocator.free(response);
++    // The bounded retry is exhausted, so the reply is delivered with the markup
++    // stripped, never verbatim.
++    try std.testing.expectEqualStrings("先查一下。\n", response);
++    try std.testing.expect(std.mem.indexOf(u8, response, "<function=") == null);
++    try std.testing.expectEqual(@as(usize, 2), state.idx);
++}
++
++test "Agent turn stores the history reply free of tool-call markup" {
++    // The delivered reply is stripped, and so is every stored assistant entry:
++    // a re-render of history must not leak the closer, and the model must not
++    // re-read its own garbled text tool call.
++    const allocator = std.testing.allocator;
++    const garbled = "核心数据到手了。\n</function>";
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .text = garbled },
++        .{ .text = garbled },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("继续");
++    defer allocator.free(response);
++    try std.testing.expectEqual(@as(usize, 2), state.idx);
++
++    var saw_answer = false;
++    for (agent.history.items) |msg| {
++        if (msg.role != .assistant) continue;
++        try std.testing.expect(std.mem.indexOf(u8, msg.content, "</function") == null);
++        if (std.mem.indexOf(u8, msg.content, "核心数据到手了。") != null) saw_answer = true;
++    }
++    try std.testing.expect(saw_answer);
++}
++
++test "Agent turn nudges on a lone closer after an unclosed fence" {
++    const allocator = std.testing.allocator;
++    const garbled = "好的，对比表如下：\n```\n| 机型 | 电池容量 |\n</function>";
++    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
++        .{ .text = garbled },
++        .{ .text = "最终答案。" },
++    } };
++    const provider = scriptedProvider(&state);
++    var noop = observability.NoopObserver{};
++    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("继续");
++    defer allocator.free(response);
++    try std.testing.expectEqual(@as(usize, 2), state.idx);
++    try std.testing.expectEqualStrings("最终答案。", response);
++}
+diff --git a/src/channels/slack.zig b/src/channels/slack.zig
+index f86a2b7..6af1781 100644
+--- a/src/channels/slack.zig
++++ b/src/channels/slack.zig
+@@ -1967,7 +1967,20 @@ pub const SlackChannel = struct {
+         const parsed = stream_presenter.resolveStreamTarget(target);
+ 
+         if (state.mode == .native) {
+-            if (state.message_ts.len == 0) {
++            if (flush.native_full) {
++                // The accumulated snapshot has outgrown Slack's message cap, so
++                // the next chat.appendStream would answer `msg_too_long` -- a
++                // per-call split cannot prevent a cumulative overflow. Close the
++                // stream and finish on the edited-message transport, whose
++                // chat.update is capped at STREAM_UPDATE_MAX_BYTES and whose
++                // overflow goes out as thread follow-ups.
++                if (state.message_ts.len > 0) {
++                    self.stopNativeStream(parsed, state.message_ts) catch |err| {
++                        log.warn("Slack chat.stopStream failed ({s})", .{@errorName(err)});
++                    };
++                }
++                state.mode = .fallback;
++            } else if (state.message_ts.len == 0) {
+                 self.startNativeStreamLocked(parsed, state, flush.text) catch |err| {
+                     log.warn("Slack chat.startStream failed ({s}); using edited messages", .{@errorName(err)});
+                     state.mode = .fallback;
+@@ -1986,7 +1999,21 @@ pub const SlackChannel = struct {
+                 // Keep the native transport: the streamed message still has to be
+                 // closed with chat.stopStream, and the final reply reconciles it.
+                 self.appendNativeStreamLocked(parsed, state, flush.delta()) catch |err| {
+-                    log.warn("Slack chat.appendStream failed ({s}); continuing without live updates", .{@errorName(err)});
++                    // A failed append — most likely `msg_too_long` once the
++                    // message passes Slack's cumulative cap, which a per-call
++                    // split cannot foresee — leaves the native stream unusable
++                    // for this turn. Close it now rather than only stopping live
++                    // updates: otherwise a turn with no final body can leave the
++                    // message stuck in the streaming state. Finish on the
++                    // edited-message transport, whose chat.update is capped and
++                    // splits, so the final reply is still delivered intact.
++                    log.warn("Slack chat.appendStream failed ({s}); finishing on edited messages", .{@errorName(err)});
++                    if (state.message_ts.len > 0) {
++                        self.stopNativeStream(parsed, state.message_ts) catch |stop_err| {
++                            log.warn("Slack chat.stopStream failed ({s})", .{@errorName(stop_err)});
++                        };
++                    }
++                    state.mode = .fallback;
+                     state.send_failed = true;
+                 };
+             }
+@@ -2183,8 +2210,18 @@ pub const SlackChannel = struct {
+         const parsed = stream_presenter.resolveStreamTarget(target);
+ 
+         if (state.mode == .native) {
+-            const stream_completed = if (stream_presenter.pendingFinalSuffix(message, state.sent)) |suffix| blk: {
+-                self.appendNativeStreamLocked(parsed, state, suffix) catch |err| {
++            const suffix = stream_presenter.pendingFinalSuffix(message, state.sent);
++            // The closing append must respect the same cumulative budget as the
++            // live flushes: when the answer lands inside one throttle window the
++            // whole remainder is appended in a single call, and chat.appendStream
++            // would answer `msg_too_long` past Slack's message cap. Finish on the
++            // edited-message transport instead so the answer is delivered intact.
++            const over_budget = if (suffix) |s|
++                stream_presenter.finalAppendOverflowsBudget(state.sent.len, s.len)
++            else
++                false;
++            const stream_completed = if (suffix != null and !over_budget) blk: {
++                self.appendNativeStreamLocked(parsed, state, suffix.?) catch |err| {
+                     log.warn("Slack chat.appendStream final delta failed ({s})", .{@errorName(err)});
+                     break :blk false;
+                 };
+@@ -2198,8 +2235,10 @@ pub const SlackChannel = struct {
+             // A streamed reasoning quote is deliberately absent from the final
+             // reply, so that turn's snapshot can never be a prefix of it.
+             // Rewrite the stopped message in place rather than leaving the
+-            // thinking behind and posting the reply a second time.
+-            if (state.rendered_reasoning) {
++            // thinking behind and posting the reply a second time. The same
++            // rewrite carries a final message that would overflow the stream
++            // budget.
++            if (state.rendered_reasoning or over_budget) {
+                 return self.deliverFallbackFinal(parsed, state.message_ts, message, media, target);
+             }
+             // When the stream could not be completed the streamed message keeps
+@@ -2524,6 +2563,50 @@ test "slack channel init defaults" {
+     _ = ch.channelName();
+ }
+ 
++test "slack native stream finishes on the fallback transport past the message budget" {
++    // Slack caps the whole streamed message, so a long turn must leave the
++    // native transport before chat.appendStream answers `msg_too_long`; the
++    // edited-message transport (chat.update + thread follow-ups) then carries
++    // the final answer intact.
++    const allocator = std.testing.allocator;
++    const allowed = [_][]const u8{"U123"};
++    var ch = SlackChannel.init(allocator, "xoxb-test", null, "C123", &allowed);
++    defer stream_presenter.deinitStreamStates(allocator, &ch.stream_states);
++
++    const target = "C123:1700000000.000100";
++    const big = "x" ** (stream_presenter.STREAM_TOTAL_MAX_BYTES + 1);
++    ch.streamChunk(target, big);
++
++    const state = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, state.mode);
++    try std.testing.expect(state.message_ts.len > 0);
++}
++
++test "slack native stream leaves for the fallback transport when a later flush crosses the budget" {
++    // Start the native stream with a sub-budget chunk, then cross the cumulative
++    // budget on a later flush: the stream must be closed and the turn finished
++    // on the edited-message transport, with the message ts kept for the rewrite.
++    const allocator = std.testing.allocator;
++    const allowed = [_][]const u8{"U123"};
++    var ch = SlackChannel.init(allocator, "xoxb-test", null, "C123", &allowed);
++    defer stream_presenter.deinitStreamStates(allocator, &ch.stream_states);
++
++    const target = "C123:1700000000.000100";
++    const part = "x" ** 7_000;
++    ch.streamChunk(target, part);
++    const first = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(stream_presenter.StreamMode.native, first.mode);
++    try std.testing.expect(first.message_ts.len > 0);
++
++    // Force the next flush past the coalescing window without waiting a second.
++    first.last_flush_time = 0;
++    ch.streamChunk(target, part);
++
++    const second = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, second.mode);
++    try std.testing.expect(second.message_ts.len > 0);
++}
++
+ test "slack initFromConfig maps pairing dm_policy to allowlist" {
+     const cfg = config_types.SlackConfig{
+         .account_id = "main",
+diff --git a/src/channels/slack_stream_presenter.zig b/src/channels/slack_stream_presenter.zig
+index bd905cf..a898266 100755
+--- a/src/channels/slack_stream_presenter.zig
++++ b/src/channels/slack_stream_presenter.zig
+@@ -16,6 +16,29 @@ pub const STREAM_FLUSH_MIN_DELTA_BYTES: usize = 128;
+ 
+ /// `markdown_text` cap accepted by chat.startStream/chat.appendStream/chat.stopStream.
+ pub const STREAM_MARKDOWN_MAX_BYTES: usize = 12_000;
++/// Cumulative `markdown_text` budget for one streamed turn. Slack caps the whole
++/// streamed message, not just each chat.appendStream call, and answers
++/// `msg_too_long` once the accumulated text passes that undocumented cap, which
++/// a per-call split (STREAM_MARKDOWN_MAX_BYTES) cannot prevent. Past this budget
++/// the native stream is closed and the rest of the turn finishes on the
++/// edited-message transport (chat.update + thread follow-ups).
++///
++/// The value is a conservative proxy: Slack documents the 12,000-char per-call
++/// cap but not the cumulative one, so the per-call cap is reused as the budget
++/// (a lower real cap only means an earlier, safe switch). It is not the sole
++/// trigger — an actual `msg_too_long` from chat.appendStream also closes the
++/// stream (see `publishStreamFlushLocked`), so a wrong constant cannot leak the
++/// error to the user.
++pub const STREAM_TOTAL_MAX_BYTES: usize = STREAM_MARKDOWN_MAX_BYTES;
++
++/// True when appending `suffix_len` more bytes to the already-streamed
++/// `sent_len` would push the native stream past Slack's cumulative message cap.
++/// The caller must then finish on the edited-message transport instead of
++/// issuing a chat.appendStream that would answer `msg_too_long`.
++pub fn finalAppendOverflowsBudget(sent_len: usize, suffix_len: usize) bool {
++    return sent_len + suffix_len > STREAM_TOTAL_MAX_BYTES;
++}
++
+ /// `text` cap accepted by chat.update; Slack answers `msg_too_long` above this.
+ pub const STREAM_UPDATE_MAX_BYTES: usize = 4_000;
+ /// Upper bound on follow-up messages posted when the final reply overflows.
+@@ -130,6 +153,11 @@ pub const StreamFlush = struct {
+     /// Set when an orphan reasoning closer drops the leaked draft from earlier
+     /// bytes, or a late `<think>` rewrite moves them.
+     rewrite: bool = false,
++    /// True when the accumulated snapshot has grown past STREAM_TOTAL_MAX_BYTES,
++    /// so extending the native stream would make Slack answer `msg_too_long`.
++    /// The caller closes the stream and finishes on the edited-message
++    /// transport.
++    native_full: bool = false,
+ 
+     pub fn deinit(self: *StreamFlush, allocator: std.mem.Allocator) void {
+         allocator.free(self.text);
+@@ -217,7 +245,12 @@ pub fn appendStreamChunk(
+     state.sent = sent_copy;
+     state.last_flush_time = now_ms;
+ 
+-    return .{ .text = text, .delta_start = delta_start, .rewrite = rewrite };
++    return .{
++        .text = text,
++        .delta_start = delta_start,
++        .rewrite = rewrite,
++        .native_full = text.len > STREAM_TOTAL_MAX_BYTES,
++    };
+ }
+ 
+ /// Suffix of `final_text` that still has to be streamed so the message content
+@@ -673,6 +706,53 @@ test "appendStreamChunk flags a rewrite when an orphan closer drops the draft" {
+     try std.testing.expect(state.rendered_reasoning);
+ }
+ 
++test "finalAppendOverflowsBudget guards the closing append" {
++    try std.testing.expect(!finalAppendOverflowsBudget(0, STREAM_TOTAL_MAX_BYTES));
++    try std.testing.expect(finalAppendOverflowsBudget(1, STREAM_TOTAL_MAX_BYTES));
++    try std.testing.expect(finalAppendOverflowsBudget(STREAM_TOTAL_MAX_BYTES - 5, 10));
++}
++
++test "appendStreamChunk does not flag a short snapshot full" {
++    var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
++    defer state.deinit(std.testing.allocator);
++
++    var flush = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "hello world",
++        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer flush.deinit(std.testing.allocator);
++    try std.testing.expect(!flush.native_full);
++}
++
++test "appendStreamChunk flags the native stream full once the turn crosses the budget" {
++    var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
++    defer state.deinit(std.testing.allocator);
++
++    // Slack caps the whole streamed message, not each call. Two flushes that
++    // each stay under the per-call cap must trip the flag once their sum does.
++    const part = "x" ** 7_000;
++    var first = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        part,
++        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer first.deinit(std.testing.allocator);
++    try std.testing.expect(!first.native_full);
++
++    var second = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        part,
++        1_000 + 2 * STREAM_FLUSH_MIN_INTERVAL_MS,
++    )) orelse return error.TestUnexpectedResult;
++    defer second.deinit(std.testing.allocator);
++    try std.testing.expect(second.native_full);
++    try std.testing.expectEqual(@as(usize, 14_000), second.text.len);
++}
++
+ test "pendingFinalSuffix returns the unsent remainder for a prefix reply" {
+     try std.testing.expectEqualStrings(" world", pendingFinalSuffix("hello world", "hello").?);
+     try std.testing.expectEqualStrings("", pendingFinalSuffix("hello", "hello").?);
+diff --git a/src/providers/helpers.zig b/src/providers/helpers.zig
+index fc3460a..e6ce3a4 100644
+--- a/src/providers/helpers.zig
++++ b/src/providers/helpers.zig
+@@ -185,6 +185,27 @@ fn codeRunLen(text: []const u8, start: usize) usize {
+ /// a run of three or more at the start of a line) and inline code spans (a
+ /// backtick run closed by an equal run). Caller frees the returned slice.
+ pub fn findCodeRegions(allocator: std.mem.Allocator, text: []const u8) ![]CodeRegion {
++    return findCodeRegionsInternal(allocator, text, true);
++}
++
++/// Like `findCodeRegions` but does not treat a trailing *unterminated* fence as
++/// code. The tool-call-markup scanners use this so a model that opens a fence
++/// and then degenerates into a garbled text tool call (prod: a reply that
++/// promised a comparison table, opened ``` and then emitted a lone `</function>`)
++/// still has that closer scanned as visible text — dropped from the final reply
++/// and flagged by `hasOrphanToolCallClose`. A fence that actually closes is
++/// still code, so a documented sample inside it is preserved. Reasoning-tag
++/// scanning keeps `findCodeRegions`: a `</think>` after an unclosed fence is
++/// still a terminator, not visible text.
++pub fn findCodeRegionsForToolMarkup(allocator: std.mem.Allocator, text: []const u8) ![]CodeRegion {
++    return findCodeRegionsInternal(allocator, text, false);
++}
++
++fn findCodeRegionsInternal(
++    allocator: std.mem.Allocator,
++    text: []const u8,
++    unterminated_fence_is_code: bool,
++) ![]CodeRegion {
+     var regions: std.ArrayListUnmanaged(CodeRegion) = .empty;
+     errdefer regions.deinit(allocator);
+ 
+@@ -248,8 +269,10 @@ pub fn findCodeRegions(allocator: std.mem.Allocator, text: []const u8) ![]CodeRe
+         }
+         i += 1;
+     }
+-    // An unterminated fence runs to the end of the text (mid-stream).
+-    if (fence_ch != 0) {
++    // An unterminated fence runs to the end of the text (mid-stream). Callers
++    // that scan for tool-call markup opt out (see `findCodeRegionsForToolMarkup`)
++    // so an unclosed fence cannot hide a trailing garbled closer.
++    if (fence_ch != 0 and unterminated_fence_is_code) {
+         try regions.append(allocator, .{ .start = fence_start, .end = text.len });
+     }
+     return regions.toOwnedSlice(allocator);
+@@ -313,13 +336,24 @@ const tool_call_open_tags = [_][]const u8{
+     "<|tool_result_begin|",
+     // Anthropic-style text tool markup and OpenAI's XML `function` dialect.
+     // A model that falls back to one of these can degenerate into a loop of
+-    // `</function>` closers; they are tool markup, not an answer (OpenClaw's
+-    // `TOOL_CALL_TAG_NAMES` covers the same set).
++    // `</function>` closers; they are tool markup, not an answer. This is the
++    // same name set OpenClaw's `TOOL_CALL_TAG_NAMES` covers, including the
++    // `function_call`/`function_response` names and the `antml:`/`mm:`
++    // namespaced variants a gateway leaks for a non-OpenAI model.
+     "<function",
+     "<function_calls",
++    "<function_call",
++    "<function_response",
+     "<tool_calls",
+     "<invoke",
+     "<parameter",
++    "<antml:invoke",
++    "<antml:parameter",
++    "<antml:function_calls",
++    "<mm:tool_call",
++    "<mm:function_calls",
++    "<mm:invoke",
++    "<mm:parameter",
+ };
+ // Close tag *names*, without the trailing delimiter. Like the opens above, a
+ // close is matched with either a `>` or a whitespace delimiter, so a model that
+@@ -333,9 +367,18 @@ const tool_call_close_names = [_][]const u8{
+     "<|tool_result_end|",
+     "</function",
+     "</function_calls",
++    "</function_call",
++    "</function_response",
+     "</tool_calls",
+     "</invoke",
+     "</parameter",
++    "</antml:invoke",
++    "</antml:parameter",
++    "</antml:function_calls",
++    "</mm:tool_call",
++    "</mm:function_calls",
++    "</mm:invoke",
++    "</mm:parameter",
+ };
+ const tool_call_standalone_names = [_][]const u8{
+     "<tool_calls_section_begin",
+@@ -382,7 +425,8 @@ fn toolFunctionCloseLenAt(text: []const u8, start: usize) ?usize {
+     // shorter name would match first and then fail its delimiter check (`_`),
+     // hiding the longer name and missing a `</function_calls>` run.
+     const run_names = [_][]const u8{
+-        "</function_calls", "</tool_calls", "</parameter", "</function", "</invoke",
++        "</function_response", "</function_calls", "</function_call", "</tool_calls",
++        "</parameter",         "</function",       "</invoke",
+     };
+     if (text[start] != '<') return null;
+     for (run_names) |name| {
+@@ -422,6 +466,97 @@ pub fn hasRepetitiveToolCloseRun(text: []const u8) bool {
+     return false;
+ }
+ 
++/// True when `name` is one of the two OpenAI XML `function`-dialect tag names,
++/// which bind their argument with `=` (`<function=read>`, `<parameter=path>`)
++/// instead of the `>`/whitespace delimiter of the other dialects.
++fn isFunctionDialectName(name: []const u8) bool {
++    return std.mem.eql(u8, name, "<function") or std.mem.eql(u8, name, "<parameter");
++}
++
++/// True when the byte after a tool-call tag *name* may delimit it: `>` or any
++/// whitespace for the angle dialects, or `=` for OpenAI's `<function=NAME>` /
++/// `<parameter=NAME>` form. Shared with the streaming `TagFilter` so the live
++/// preview and the final reply recognise the same tags.
++pub fn toolTagDelimiterOk(name: []const u8, b: u8) bool {
++    if (b == '>' or std.ascii.isWhitespace(b)) return true;
++    return b == '=' and isFunctionDialectName(name);
++}
++
++/// True when an OpenAI `=`-dialect tag (`<function=NAME>` / `<parameter=NAME>`)
++/// starts at `start`.
++pub fn isFunctionDialectOpenAt(text: []const u8, start: usize) bool {
++    return std.mem.startsWith(u8, text[start..], "<function=") or
++        std.mem.startsWith(u8, text[start..], "<parameter=");
++}
++
++/// Byte offset just past a tool-call open tag starting at `start`, or null when
++/// the bytes there are not one. Mirrors `skipToolCallBlock`'s name match: the
++/// longest name wins, and the tag must end on `>` or a whitespace delimiter (or
++/// `=` for the OpenAI `function`/`parameter` dialect). Shared with the streaming
++/// `TagFilter` so an unterminated opener can be bounded to the tag token itself.
++pub fn matchToolCallOpenTag(text: []const u8, start: usize) ?usize {
++    var open_len: usize = 0;
++    for (tool_call_open_tags) |open| {
++        if (open.len <= open_len) continue;
++        if (!std.mem.startsWith(u8, text[start..], open)) continue;
++        const after = start + open.len;
++        if (after >= text.len) continue;
++        if (!toolTagDelimiterOk(open, text[after])) continue;
++        open_len = open.len;
++    }
++    if (open_len == 0) return null;
++    const after = start + open_len;
++    return if (text[after] == '>') after + 1 else scanTagTokenEnd(text, after);
++}
++
++/// True when `text` holds unbalanced angle-bracket tool-call markup outside any
++/// code fence or inline span: a `</…` close tag with no matching opener, or an
++/// OpenAI `=`-dialect opener (`<function=NAME>` / `<parameter=NAME>`) that never
++/// closes. (The bracket dialect `[/tool_call]` is not scanned here: the
++/// dispatcher's `containsToolCallMarkup` already treats it as markup, so a reply
++/// carrying it is blanked and the empty-response guard nudges instead.) That is
++/// the shape a model degenerates into when it announces more work and then
++/// emits a garbled text tool call (prod: a reply ending in a lone `</function>`;
++/// the `=` dialect: a reply ending in a bare `<function=web_search>`). It is a
++/// structural, language-independent signal, so the turn loop keys its bounded
++/// retry on it instead of on assistant prose. A balanced pair
++/// (`<function>…</function>`) is prose and does not qualify, and neither does
++/// markup inside a code sample.
++pub fn hasOrphanToolCallClose(allocator: std.mem.Allocator, text: []const u8) !bool {
++    if (!hasToolCallMarkup(text)) return false;
++    const code = try findCodeRegionsForToolMarkup(allocator, text);
++    defer allocator.free(code);
++    var depth: usize = 0;
++    // Whether the outermost open tag is the `=` dialect, whose unclosed form is
++    // tool markup rather than a prose mention of a marker name.
++    var function_open = false;
++    var i: usize = 0;
++    while (i < text.len) {
++        if (text[i] != '<' or isInsideCode(code, i)) {
++            i += 1;
++            continue;
++        }
++        if (matchToolCallOpenTag(text, i)) |end| {
++            if (depth == 0 and isFunctionDialectOpenAt(text, i)) function_open = true;
++            depth += 1;
++            i = end;
++            continue;
++        }
++        if (matchToolCallClose(text, i, true)) |end| {
++            if (depth == 0) return true;
++            depth -= 1;
++            // Only the outermost *still-unclosed* opener decides the verdict: a
++            // balanced pair that closes back to depth 0 is prose, so clear the
++            // `=`-dialect flag rather than let it leak into a later plain opener.
++            if (depth == 0) function_open = false;
++            i = end;
++            continue;
++        }
++        i += 1;
++    }
++    return depth > 0 and function_open;
++}
++
+ // The exact open markers the dispatcher's unclosed recovery keys on. A text tool
+ // call the agent would execute can only start with one of these; a payload after
+ // any other opener (attributes, a whitespace delimiter, a `_begin` wrapper) is
+@@ -1512,7 +1647,7 @@ fn skipToolCallBlock(text: []const u8, start: usize, scanner: *CloseScanner) ?us
+         // A delimiter-less open name at the end of the text is an unterminated
+         // token: the remainder is dropped, exactly like the streaming filter.
+         if (after >= text.len) return text.len;
+-        if (text[after] != '>' and !std.ascii.isWhitespace(text[after])) continue;
++        if (!toolTagDelimiterOk(open, text[after])) continue;
+         open_len = open.len;
+     }
+     if (open_len == 0) return null;
+@@ -1783,8 +1918,10 @@ pub fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) ![]co
+     // A `<function>`/`</function>`/`<parameter>` tag inside a code fence or
+     // inline span is a literal sample, not markup (OpenClaw's `isInsideCode`).
+     // The dispatcher's own markers are still stripped inside code: they are
+-    // never prose.
+-    const code = try findCodeRegions(allocator, text);
++    // never prose. An *unterminated* fence does not count as code here
++    // (`findCodeRegionsForToolMarkup`): a garbled closer after an unclosed fence
++    // is markup, not a sample.
++    const code = try findCodeRegionsForToolMarkup(allocator, text);
+     defer allocator.free(code);
+     while (i < text.len) {
+         // A dispatcher-marker block the shared parse swallowed: skip its whole
+@@ -1840,6 +1977,16 @@ pub fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) ![]co
+                 i = end;
+                 continue;
+             }
++            // A `=`-dialect opener (`<function=NAME>` / `<parameter=NAME>`) that
++            // never closes is a garbled text tool call, not prose, so drop the
++            // tag itself. Drop only the opener token, not the rest of the reply:
++            // a model can mention the dialect mid-sentence and the trailing
++            // prose is a real answer, so swallowing it to end-of-text would lose
++            // content. A closed block was already skipped above.
++            if (isFunctionDialectOpenAt(text, i)) {
++                i = matchToolCallOpenTag(text, i) orelse text.len;
++                continue;
++            }
+             if (skipToolCallStandalone(text, i)) |end| {
+                 i = end;
+                 continue;
+@@ -3069,6 +3216,96 @@ test "stripToolCallMarkup drops stray function close tags" {
+     try std.testing.expectEqualStrings("Answer", out);
+ }
+ 
++test "stripToolCallMarkup drops a single stray function close tag" {
++    const a = std.testing.allocator;
++    const out = try stripToolCallMarkup(a, "核心数据到手了。\n</function>");
++    defer a.free(out);
++    try std.testing.expectEqualStrings("核心数据到手了。\n", out);
++}
++
++test "stripToolCallMarkup drops the OpenAI function= dialect block" {
++    const a = std.testing.allocator;
++    const out = try stripToolCallMarkup(a, "prose\n<function=web_search>query</function>\nend");
++    defer a.free(out);
++    try std.testing.expectEqualStrings("prose\n\nend", out);
++}
++
++test "stripToolCallMarkup drops a truncated function= opener" {
++    // Prod-adjacent shape: the model announces a tool call and emits only a bare
++    // `<function=NAME>` with no close. The opener is tool markup, not prose.
++    const a = std.testing.allocator;
++    const out = try stripToolCallMarkup(a, "prose\n<function=web_search>");
++    defer a.free(out);
++    try std.testing.expectEqualStrings("prose\n", out);
++}
++
++test "stripToolCallMarkup drops an orphan tool_call closer" {
++    const a = std.testing.allocator;
++    const out = try stripToolCallMarkup(a, "answer\n</tool_call>");
++    defer a.free(out);
++    try std.testing.expectEqualStrings("answer\n", out);
++}
++
++test "stripToolCallMarkup keeps a function= sample inside a code fence" {
++    const a = std.testing.allocator;
++    const doc = "Example:\n```xml\n<function=read><parameter=path>p</parameter></function>\n```\ndone";
++    const out = try stripToolCallMarkup(a, doc);
++    defer a.free(out);
++    try std.testing.expect(std.mem.indexOf(u8, out, "<function=read>") != null);
++}
++
++test "hasOrphanToolCallClose flags the function= dialect shapes" {
++    const a = std.testing.allocator;
++    try std.testing.expect(try hasOrphanToolCallClose(a, "prose\n<function=web_search>"));
++    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n</tool_call>"));
++    try std.testing.expect(try hasOrphanToolCallClose(a, "核心数据到手了。\n</function>"));
++    // A balanced pair is prose, not a garbled call.
++    try std.testing.expect(!try hasOrphanToolCallClose(a, "Use <function name=\"read\">body</function> in the docs."));
++    // An unclosed plain marker is released as prose, so it is not flagged.
++    try std.testing.expect(!try hasOrphanToolCallClose(a, "the <tool_call> marker"));
++}
++
++test "stripToolCallMarkup drops the function_call/function_response and namespaced closers" {
++    const a = std.testing.allocator;
++    const cases = [_][]const u8{
++        "answer\n</function_call>",
++        "answer\n</function_response>",
++        "answer\n</antml:invoke>",
++        "answer\n</mm:parameter>",
++    };
++    for (cases) |c| {
++        const out = try stripToolCallMarkup(a, c);
++        defer a.free(out);
++        try std.testing.expectEqualStrings("answer\n", out);
++    }
++    // A closed `function_call` block is tool markup too.
++    const block = try stripToolCallMarkup(a, "A<function_call>x</function_call>B");
++    defer a.free(block);
++    try std.testing.expectEqualStrings("AB", block);
++}
++
++test "hasOrphanToolCallClose flags a lone namespaced or function_call closer" {
++    const a = std.testing.allocator;
++    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n</function_call>"));
++    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n</function_response>"));
++    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n</antml:invoke>"));
++    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n</mm:parameter>"));
++}
++
++test "hasOrphanToolCallClose ignores a balanced pair before a plain unclosed opener" {
++    const a = std.testing.allocator;
++    // A balanced `=` pair that closes back to depth 0 must not leave the `=`
++    // flag set for a later, plain opener the code releases as prose.
++    try std.testing.expect(!try hasOrphanToolCallClose(a, "<function=x>ok</function> and the <tool_call> marker"));
++}
++
++test "stripToolCallMarkup keeps the prose after an unclosed = opener" {
++    const a = std.testing.allocator;
++    const out = try stripToolCallMarkup(a, "The model emits <function=read> tags. Then the real answer here.");
++    defer a.free(out);
++    try std.testing.expectEqualStrings("The model emits  tags. Then the real answer here.", out);
++}
++
+ test "stripToolCallMarkup hides a function_calls block" {
+     const a = std.testing.allocator;
+     const out = try stripToolCallMarkup(a, "A<function_calls><invoke name=\"shell\"></invoke></function_calls>B");
+@@ -3615,3 +3852,24 @@ test "stripToolCallMarkup hides a quoted-colon salvaged call" {
+     defer a.free(out);
+     try std.testing.expectEqualStrings("AB", out);
+ }
++
++test "stripToolCallMarkup drops a lone closer after an unclosed fence" {
++    // The prod reply promised a comparison table, opened a ``` fence and then
++    // degenerated into a lone `</function>`. An unterminated fence must not hide
++    // the trailing garbled closer from the strip.
++    const a = std.testing.allocator;
++    const cases = [_][]const u8{ "answer\n```\n</function>", "answer\n~~~\n</function>" };
++    for (cases) |input| {
++        const out = try stripToolCallMarkup(a, input);
++        defer a.free(out);
++        try std.testing.expect(std.mem.indexOf(u8, out, "</function") == null);
++    }
++}
++
++test "hasOrphanToolCallClose flags a lone closer after an unclosed fence" {
++    const a = std.testing.allocator;
++    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n```\n</function>"));
++    try std.testing.expect(try hasOrphanToolCallClose(a, "answer\n~~~\n</function>"));
++    // A closed fence still preserves a documented sample.
++    try std.testing.expect(!try hasOrphanToolCallClose(a, "```\n</function>\n```"));
++}
+diff --git a/src/streaming.zig b/src/streaming.zig
+index 05f98e1..7ffe728 100644
+--- a/src/streaming.zig
++++ b/src/streaming.zig
+@@ -169,12 +169,24 @@ pub const TagFilter = struct {
+         "<think",
+         // OpenAI/Anthropic-style text tool markup. A model that falls back to
+         // this dialect can degenerate into a loop of `</function>` closers that
+-        // must never reach a channel (OpenClaw's `TOOL_CALL_TAG_NAMES`).
++        // must never reach a channel. Same name set as OpenClaw's
++        // `TOOL_CALL_TAG_NAMES` and `providers.helpers.tool_call_open_tags`,
++        // including `function_call`/`function_response` and the `antml:`/`mm:`
++        // namespaced variants.
+         "<function",
+         "<function_calls",
++        "<function_call",
++        "<function_response",
+         "<tool_calls",
+         "<invoke",
+         "<parameter",
++        "<antml:invoke",
++        "<antml:parameter",
++        "<antml:function_calls",
++        "<mm:tool_call",
++        "<mm:function_calls",
++        "<mm:invoke",
++        "<mm:parameter",
+     };
+ 
+     // Closing tag *names*, without the trailing delimiter. A close is matched
+@@ -194,9 +206,18 @@ pub const TagFilter = struct {
+         "[/TOOL_CALL",
+         "</function",
+         "</function_calls",
++        "</function_call",
++        "</function_response",
+         "</tool_calls",
+         "</invoke",
+         "</parameter",
++        "</antml:invoke",
++        "</antml:parameter",
++        "</antml:function_calls",
++        "</mm:tool_call",
++        "</mm:function_calls",
++        "</mm:invoke",
++        "</mm:parameter",
+     };
+ 
+     const think_open_tag = "<think>";
+@@ -715,7 +736,17 @@ pub const TagFilter = struct {
+                 } else |_| {
+                     self.emitRegion(body);
+                 }
++            } else if (providers.helpers.isFunctionDialectOpenAt(body, 0)) {
++                // An unterminated `=`-dialect call (`<function=NAME>` /
++                // `<parameter=NAME>`) is garbled tool markup, not prose, so drop
++                // the opener tag. Drop only the tag token, not the whole buffered
++                // block: a mid-sentence mention leaves trailing prose that is a
++                // real answer. Mirrors `stripToolCallMarkup`.
++                const open_end = providers.helpers.matchToolCallOpenTag(body, 0) orelse body.len;
++                self.emitRegion(body[open_end..]);
+             } else {
++                // Any other opener is released, so a stray `<tool_call>` in prose
++                // cannot swallow the answer.
+                 self.emitRegion(body);
+             }
+         }
+@@ -785,17 +816,14 @@ pub const TagFilter = struct {
+         return body[start..end];
+     }
+ 
+-    fn isWhitespace(b: u8) bool {
+-        return b == ' ' or b == '\t' or b == '\n' or b == '\r' or b == 0x0b or b == 0x0c;
+-    }
+-
+     /// True when `b` may delimit a tag whose name is `name`. Angle tags (`<…`)
+     /// are delimited by `>` or whitespace (a model may drop the `>`); the
+     /// bracket dialect (`[tool_call]`, which the dispatcher's XML fallback also
+-    /// accepts) requires its `]`.
++    /// accepts) requires its `]`. The `=` dialect (`<function=NAME>`) is handled
++    /// by the shared predicate so the preview matches the final strip.
+     fn delimiterOk(name: []const u8, b: u8) bool {
+         if (name.len > 0 and name[0] == '[') return b == ']';
+-        return b == '>' or isWhitespace(b);
++        return providers.helpers.toolTagDelimiterOk(name, b);
+     }
+ 
+     /// True when `b` ends a tag token (`>` or the bracket dialect's `]`).
+@@ -1164,6 +1192,75 @@ test "TagFilter drops a stray function close tag" {
+     try std.testing.expectEqualStrings("Answer", col.joined(&buf));
+ }
+ 
++test "TagFilter drops a single stray function close tag" {
++    // Prod shape: one lone closer at the very end of the answer.
++    var col = collectChunks(16){};
++    var filter = TagFilter.init(col.sink());
++    const s = filter.sink();
++    s.emitChunk("核心数据到手了。\n</function>");
++    s.emitFinal();
++    var buf: [64]u8 = undefined;
++    try std.testing.expectEqualStrings("核心数据到手了。\n", col.joined(&buf));
++}
++
++test "TagFilter drops the OpenAI function= dialect block" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.init(col.sink());
++    const s = filter.sink();
++    s.emitChunk("prose\n<function=web_search>query</function>\nend");
++    s.emitFinal();
++    var buf: [128]u8 = undefined;
++    try std.testing.expectEqualStrings("prose\n\nend", col.joined(&buf));
++}
++
++test "TagFilter drops a truncated function= opener" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.init(col.sink());
++    const s = filter.sink();
++    s.emitChunk("prose\n<function=web_search>");
++    s.emitFinal();
++    var buf: [64]u8 = undefined;
++    try std.testing.expectEqualStrings("prose\n", col.joined(&buf));
++}
++
++test "TagFilter drops an orphan tool_call closer" {
++    var col = collectChunks(16){};
++    var filter = TagFilter.init(col.sink());
++    const s = filter.sink();
++    s.emitChunk("answer\n</tool_call>");
++    s.emitFinal();
++    var buf: [64]u8 = undefined;
++    try std.testing.expectEqualStrings("answer\n", col.joined(&buf));
++}
++
++test "TagFilter drops the function_call/function_response and namespaced closers" {
++    const cases = [_][]const u8{
++        "answer\n</function_call>",
++        "answer\n</function_response>",
++        "answer\n</antml:invoke>",
++        "answer\n</mm:parameter>",
++    };
++    for (cases) |c| {
++        var col = collectChunks(16){};
++        var filter = TagFilter.init(col.sink());
++        const s = filter.sink();
++        s.emitChunk(c);
++        s.emitFinal();
++        var buf: [64]u8 = undefined;
++        try std.testing.expectEqualStrings("answer\n", col.joined(&buf));
++    }
++}
++
++test "TagFilter keeps the prose after an unclosed = opener" {
++    var col = collectChunks(64){};
++    var filter = TagFilter.init(col.sink());
++    const s = filter.sink();
++    s.emitChunk("The model emits <function=read> tags. Then the real answer here.");
++    s.emitFinal();
++    var buf: [128]u8 = undefined;
++    try std.testing.expectEqualStrings("The model emits  tags. Then the real answer here.", col.joined(&buf));
++}
++
+ test "TagFilter strips a function_calls block" {
+     var col = collectChunks(16){};
+     var filter = TagFilter.init(col.sink());
+-- 
+2.56.0
+
