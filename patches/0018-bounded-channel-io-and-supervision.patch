@@ -1,0 +1,2251 @@
+From caeb568fdd16e163fb20d34120b24eedafc77835 Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Sat, 17 Oct 2026 00:31:50 +0900
+Subject: [PATCH] fix(channels): bound channel network I/O and make poller
+ supervision non-blocking
+
+Every credentialed and download call on the poller path now carries a timeout
+bound (telegram getUpdates/send, max, matrix sync/health, weixin getupdates
+long-poll headroom), so a stalled socket returns a bounded error instead of
+hanging the loop. Poller liveness is tracked separately from worker-turn
+progress; a wedged or dispatching poller is detached or stopped past a hard
+deadline instead of blocking supervisor shutdown, and a turn that progresses
+without ever finishing is recovered.
+---
+ src/channel_loop.zig          | 198 +++++++++++++--
+ src/channel_manager.zig       | 459 ++++++++++++++++++++++++++++++++--
+ src/channels/matrix.zig       |  80 +++++-
+ src/channels/max_api.zig      | 159 +++++++++---
+ src/channels/signal.zig       |  10 +-
+ src/channels/telegram.zig     |   4 +
+ src/channels/telegram_api.zig | 111 +++++++-
+ src/channels/weixin.zig       |  22 +-
+ src/http_util.zig             | 359 +++++++++++++++++++++++++-
+ src/voice.zig                 |   5 +-
+ 10 files changed, 1317 insertions(+), 90 deletions(-)
+
+diff --git a/src/channel_loop.zig b/src/channel_loop.zig
+index 8dd0254..dd17541 100644
+--- a/src/channel_loop.zig
++++ b/src/channel_loop.zig
+@@ -10,6 +10,7 @@ const Config = @import("config.zig").Config;
+ const config_types = @import("config_types.zig");
+ const telegram = @import("channels/telegram.zig");
+ const session_mod = @import("session.zig");
++const agent_mod = @import("agent/root.zig");
+ const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+ const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
+ const providers = @import("providers/root.zig");
+@@ -798,7 +799,9 @@ fn handleTelegramInteractiveCallback(
+     message_id: i64,
+     is_group: bool,
+     message_sender_id: []const u8,
++    heartbeat: ?*Atomic(i64),
+ ) bool {
++    if (heartbeat) |h| bumpProgress(h);
+     // Route before starting the typing/draft turn, mirroring processTelegramMessage:
+     // a callback the router folds into the running turn must not start a new
+     // draft turn and reset the running turn's live draft. Slash commands are
+@@ -834,7 +837,8 @@ fn handleTelegramInteractiveCallback(
+             return false;
+         }
+ 
+-        const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
++        const progress_sink: ?agent_mod.ProgressSink = if (heartbeat) |h| progressHeartbeatSink(h) else null;
++        const model_reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, null, progress_sink) catch |err| {
+             log.err("failed to process telegram callback interaction: {}", .{err});
+             response_owned = true;
+             break :blk allocator.dupe(u8, defaultAgentErrorMessage(err)) catch return true;
+@@ -999,7 +1003,9 @@ fn processTelegramMessage(
+     reply_to_id: ?i64,
+     message_sender_id: []const u8,
+     replace_message: bool,
++    heartbeat: ?*Atomic(i64),
+ ) void {
++    if (heartbeat) |h| bumpProgress(h);
+     // Route before starting the typing/draft turn: a message the router folds
+     // into the running turn (injected/dropped) must not start a new draft turn
+     // and reset the running turn's live draft.
+@@ -1039,6 +1045,7 @@ fn processTelegramMessage(
+         .tg_ptr = tg_ptr,
+         .chat_id = sender,
+         .draft_id = typing_turn.draft_id,
++        .heartbeat = heartbeat,
+         // Telegram is served by this loop rather than daemon.processInboundMessage,
+         // so the reasoning passthrough that the daemon selects has to be selected
+         // here too. The draft shows the thinking as a quoted block; the delivered
+@@ -1049,7 +1056,8 @@ fn processTelegramMessage(
+     const sink = tg_ptr.makeSink(&stream_ctx);
+ 
+     tg_ptr.setTaskReaction(sender, message_id, .running);
+-    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
++    const progress_sink: ?agent_mod.ProgressSink = if (heartbeat) |h| progressHeartbeatSink(h) else null;
++    const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, progress_sink) catch |err| {
+         logAgentProcessingError(allocator, "Agent error", err);
+         tg_ptr.setTaskReaction(sender, message_id, .failed);
+         const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+@@ -1111,6 +1119,7 @@ const MessageTask = struct {
+     reply_to_id: ?i64,
+     message_sender_id: []const u8,
+     replace_message: bool,
++    heartbeat: ?*Atomic(i64),
+ 
+     fn run(task: *MessageTask) void {
+         processTelegramMessage(
+@@ -1125,6 +1134,7 @@ const MessageTask = struct {
+             task.reply_to_id,
+             task.message_sender_id,
+             task.replace_message,
++            task.heartbeat,
+         );
+     }
+ 
+@@ -1312,11 +1322,58 @@ fn matrixRoomPeerId(reply_target: ?[]const u8) []const u8 {
+ // TelegramLoopState — shared state between supervisor and polling thread
+ // ════════════════════════════════════════════════════════════════════════════
+ 
++/// Coarse phase of a polling thread. Recorded so the supervisor can report
++/// where a stalled poller is stuck when it declares the thread stale.
++pub const PollStep = enum(u8) {
++    startup = 0,
++    polling = 1,
++    dispatching = 2,
++};
++
++fn markPollStep(cell: *Atomic(u8), step: PollStep) void {
++    cell.store(@intFromEnum(step), .release);
++}
++
++/// Bump a poller's progress heartbeat. The poll loop bumps it as it enters a
++/// dispatch, and the running turn bumps it through `progressHeartbeatSink`
++/// (one hint per tool call) and, on streaming channels, per streamed chunk. The
++/// supervisor treats a frozen heartbeat as a stall even while the poller is
++/// dispatching, so a hung turn or worker join is still recovered.
++pub fn bumpProgress(cell: *Atomic(i64)) void {
++    cell.store(std_compat.time.timestamp(), .release);
++}
++
++fn progressHeartbeat(ctx: *anyopaque, _: agent_mod.ProgressHint) void {
++    const cell: *Atomic(i64) = @ptrCast(@alignCast(ctx));
++    bumpProgress(cell);
++}
++
++/// A `ProgressSink` that refreshes `cell` on every turn progress hint.
++pub fn progressHeartbeatSink(cell: *Atomic(i64)) agent_mod.ProgressSink {
++    return .{ .callback = progressHeartbeat, .ctx = @ptrCast(cell) };
++}
++
+ pub const TelegramLoopState = struct {
+     /// Updated after each pollUpdates() — epoch seconds.
+     last_activity: Atomic(i64),
+     /// Supervisor sets this to ask the polling thread to stop.
+     stop_requested: Atomic(bool),
++    /// Coarse phase of the polling thread (see `PollStep`).
++    step: Atomic(u8),
++    /// Poller-owned progress heartbeat (see `bumpProgress`): the poll loop bumps
++    /// it every iteration, and a turn running *on the polling thread* bumps it
++    /// through `progressHeartbeatSink`. Only the polling thread writes it, so a
++    /// frozen value means the poller itself stalled.
++    progress: Atomic(i64),
++    /// Progress of parallel worker turns (Telegram runs turns off-thread when
++    /// `session.max_concurrent_tasks > 1`). Deliberately separate from
++    /// `progress`: a worker that keeps streaming must not read as poller
++    /// liveness, or a wedged poller whose worker is still running would never be
++    /// declared stale (the exact stall supervision exists to recover).
++    turn_progress: Atomic(i64),
++    /// Set by the polling loop as its last action, so the supervisor can bound
++    /// how long it waits for the thread before detaching it.
++    exited: Atomic(bool),
+     /// Thread handle for join().
+     thread: ?std.Thread = null,
+ 
+@@ -1324,6 +1381,10 @@ pub const TelegramLoopState = struct {
+         return .{
+             .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
+             .stop_requested = Atomic(bool).init(false),
++            .step = Atomic(u8).init(@intFromEnum(PollStep.startup)),
++            .progress = Atomic(i64).init(std_compat.time.timestamp()),
++            .turn_progress = Atomic(i64).init(std_compat.time.timestamp()),
++            .exited = Atomic(bool).init(false),
+         };
+     }
+ };
+@@ -1567,8 +1628,17 @@ pub fn runTelegramLoop(
+     loop_state: *TelegramLoopState,
+     tg_ptr: *telegram.TelegramChannel,
+ ) void {
++    // Last action of the thread: lets the supervisor bound how long it waits
++    // before detaching a poller that will not come back.
++    defer loop_state.exited.store(true, .release);
+     // Set up transcription — key comes from providers.{audio_media.provider}
+     const trans = config.audio_media;
++    // Remember the transcriber this poller installs so teardown only clears the
++    // shared field while it is still ours. A detached poller can outlive a
++    // respawn that installed its own transcriber; unconditionally destroying
++    // tg_ptr.transcriber would free the live one and null the field the new
++    // poller just set (voice transcription silently disabled).
++    var installed_transcriber: ?*voice.WhisperTranscriber = null;
+     if (config.getProviderKey(trans.provider)) |key| {
+         const wt = allocator.create(voice.WhisperTranscriber) catch {
+             log.warn("Failed to allocate WhisperTranscriber", .{});
+@@ -1580,11 +1650,14 @@ pub fn runTelegramLoop(
+             .model = trans.model,
+             .language = trans.language,
+         };
++        installed_transcriber = wt;
+         tg_ptr.transcriber = wt.transcriber();
+     }
+-    defer if (tg_ptr.transcriber) |t| {
+-        allocator.destroy(@as(*voice.WhisperTranscriber, @ptrCast(@alignCast(t.ptr))));
+-        tg_ptr.transcriber = null;
++    defer if (installed_transcriber) |wt| {
++        if (tg_ptr.transcriber) |t| {
++            if (t.ptr == @as(*anyopaque, @ptrCast(wt))) tg_ptr.transcriber = null;
++        }
++        allocator.destroy(wt);
+     };
+ 
+     // Restore persisted Telegram offset (OpenClaw parity).
+@@ -1611,6 +1684,13 @@ pub fn runTelegramLoop(
+ 
+     // Parallel worker bookkeeping.
+     // Keep at most one in-flight worker per session_key to preserve order.
++    //
++    // The joins below are deliberately unbounded. A worker wedged in a non-network
++    // op cannot be joined with a timeout (std.Thread.join has none), and detaching
++    // it would let a hung turn keep holding its session lock while the channel
++    // silently kept polling - masking the stall. Instead the poller records a
++    // `progress` heartbeat (see bumpProgress) and the supervisor detaches and
++    // respawns a poller that stops making progress (see channel_manager).
+     var active_worker_threads: std.StringHashMapUnmanaged(std.Thread) = .empty;
+     var active_worker_order: std.ArrayListUnmanaged([]const u8) = .empty;
+     defer {
+@@ -1632,6 +1712,7 @@ pub fn runTelegramLoop(
+     const enable_parallel = max_parallel_tasks > 1;
+ 
+     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
++        markPollStep(&loop_state.step, .polling);
+         const messages = tg_ptr.pollUpdates(allocator) catch |err| {
+             log.warn("Telegram poll error: {}", .{err});
+             loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+@@ -1642,6 +1723,8 @@ pub fn runTelegramLoop(
+         // Update activity after each poll (even if no messages)
+         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+ 
++        markPollStep(&loop_state.step, .dispatching);
++        bumpProgress(&loop_state.progress);
+         for (messages) |msg| {
+             // Reply-to logic
+             const use_reply_to = msg.is_group or tg_ptr.reply_in_private;
+@@ -1674,6 +1757,7 @@ pub fn runTelegramLoop(
+                     msg.message_id.?,
+                     msg.is_group,
+                     msg.id,
++                    &loop_state.progress,
+                 )) {
+                     continue;
+                 }
+@@ -1821,6 +1905,7 @@ pub fn runTelegramLoop(
+                         .reply_to_id = reply_to_id,
+                         .message_sender_id = task_message_sender_id,
+                         .replace_message = msg.replace_message,
++                        .heartbeat = &loop_state.turn_progress,
+                     };
+ 
+                     const thread = std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, messageTaskWorker, .{task}) catch |err| {
+@@ -1877,6 +1962,7 @@ pub fn runTelegramLoop(
+                 reply_to_id,
+                 msg.id,
+                 msg.replace_message,
++                &loop_state.progress,
+             );
+         }
+ 
+@@ -1888,14 +1974,19 @@ pub fn runTelegramLoop(
+         }
+ 
+         if (tg_ptr.persistableUpdateOffset()) |persistable_update_id| {
+-            persistTelegramUpdateOffsetIfAdvanced(
+-                allocator,
+-                config,
+-                tg_ptr.account_id,
+-                tg_ptr.bot_token,
+-                &persisted_update_id,
+-                persistable_update_id,
+-            );
++            // A detached poller that resumes must not rewind the on-disk offset:
++            // the respawned poller may already have persisted a higher id, and
++            // this poller's local `persisted_update_id` is stale.
++            if (!loop_state.stop_requested.load(.acquire)) {
++                persistTelegramUpdateOffsetIfAdvanced(
++                    allocator,
++                    config,
++                    tg_ptr.account_id,
++                    tg_ptr.bot_token,
++                    &persisted_update_id,
++                    persistable_update_id,
++                );
++            }
+         }
+ 
+         // Periodic session eviction
+@@ -1925,6 +2016,15 @@ pub const SignalLoopState = struct {
+     last_activity: Atomic(i64),
+     /// Supervisor sets this to ask the polling thread to stop.
+     stop_requested: Atomic(bool),
++    /// Coarse phase of the polling thread (see `PollStep`).
++    step: Atomic(u8),
++    /// Bumped on every observable poll/turn progress (see `bumpProgress`). The
++    /// supervisor treats a frozen heartbeat as a stall even while the poller is
++    /// dispatching, so a hung turn or worker join is still recovered.
++    progress: Atomic(i64),
++    /// Set by the polling loop as its last action, so the supervisor can bound
++    /// how long it waits for the thread before detaching it.
++    exited: Atomic(bool),
+     /// Thread handle for join().
+     thread: ?std.Thread = null,
+ 
+@@ -1932,6 +2032,9 @@ pub const SignalLoopState = struct {
+         return .{
+             .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
+             .stop_requested = Atomic(bool).init(false),
++            .step = Atomic(u8).init(@intFromEnum(PollStep.startup)),
++            .progress = Atomic(i64).init(std_compat.time.timestamp()),
++            .exited = Atomic(bool).init(false),
+         };
+     }
+ };
+@@ -1945,6 +2048,15 @@ pub const WeixinLoopState = struct {
+     last_activity: Atomic(i64),
+     /// Supervisor sets this to ask the polling thread to stop.
+     stop_requested: Atomic(bool),
++    /// Coarse phase of the polling thread (see `PollStep`).
++    step: Atomic(u8),
++    /// Bumped on every observable poll/turn progress (see `bumpProgress`). The
++    /// supervisor treats a frozen heartbeat as a stall even while the poller is
++    /// dispatching, so a hung turn or worker join is still recovered.
++    progress: Atomic(i64),
++    /// Set by the polling loop as its last action, so the supervisor can bound
++    /// how long it waits for the thread before detaching it.
++    exited: Atomic(bool),
+     /// Thread handle for join().
+     thread: ?std.Thread = null,
+ 
+@@ -1952,6 +2064,9 @@ pub const WeixinLoopState = struct {
+         return .{
+             .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
+             .stop_requested = Atomic(bool).init(false),
++            .step = Atomic(u8).init(@intFromEnum(PollStep.startup)),
++            .progress = Atomic(i64).init(std_compat.time.timestamp()),
++            .exited = Atomic(bool).init(false),
+         };
+     }
+ };
+@@ -1971,12 +2086,16 @@ pub fn runSignalLoop(
+     loop_state: *SignalLoopState,
+     sg_ptr: *signal.SignalChannel,
+ ) void {
++    // Last action of the thread: lets the supervisor bound how long it waits
++    // before detaching a poller that will not come back.
++    defer loop_state.exited.store(true, .release);
+     // Update activity timestamp at start
+     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+ 
+     var evict_counter: u32 = 0;
+ 
+     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
++        markPollStep(&loop_state.step, .polling);
+         const messages = sg_ptr.pollMessages(allocator) catch |err| {
+             log.warn("Signal poll error: {}", .{err});
+             loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+@@ -1987,6 +2106,8 @@ pub fn runSignalLoop(
+         // Update activity after each poll (even if no messages)
+         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+ 
++        markPollStep(&loop_state.step, .dispatching);
++        bumpProgress(&loop_state.progress);
+         for (messages) |msg| {
+             const schedule_chat_id = msg.reply_target orelse msg.sender;
+             setScheduleToolContext(
+@@ -2044,7 +2165,7 @@ pub fn runSignalLoop(
+                 .is_group = msg.is_group,
+             });
+ 
+-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
++            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, null, progressHeartbeatSink(&loop_state.progress)) catch |err| {
+                 logAgentProcessingError(allocator, "Signal agent error", err);
+                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+@@ -2100,11 +2221,15 @@ pub fn runWeixinLoop(
+     loop_state: *WeixinLoopState,
+     wx_ptr: *weixin.WeixinChannel,
+ ) void {
++    // Last action of the thread: lets the supervisor bound how long it waits
++    // before detaching a poller that will not come back.
++    defer loop_state.exited.store(true, .release);
+     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+ 
+     var evict_counter: u32 = 0;
+ 
+     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
++        markPollStep(&loop_state.step, .polling);
+         const messages = wx_ptr.pollMessages(allocator) catch |err| {
+             log.warn("Weixin poll error: {}", .{err});
+             loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+@@ -2114,6 +2239,8 @@ pub fn runWeixinLoop(
+ 
+         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+ 
++        markPollStep(&loop_state.step, .dispatching);
++        bumpProgress(&loop_state.progress);
+         for (messages) |msg| {
+             const reply_target = msg.reply_target orelse msg.sender;
+             setScheduleToolContext(
+@@ -2157,7 +2284,7 @@ pub fn runWeixinLoop(
+                 .is_group = false,
+             });
+ 
+-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
++            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, null, progressHeartbeatSink(&loop_state.progress)) catch |err| {
+                 logAgentProcessingError(allocator, "Weixin agent error", err);
+                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+@@ -2205,6 +2332,15 @@ pub const MatrixLoopState = struct {
+     last_activity: Atomic(i64),
+     /// Supervisor sets this to ask the polling thread to stop.
+     stop_requested: Atomic(bool),
++    /// Coarse phase of the polling thread (see `PollStep`).
++    step: Atomic(u8),
++    /// Bumped on every observable poll/turn progress (see `bumpProgress`). The
++    /// supervisor treats a frozen heartbeat as a stall even while the poller is
++    /// dispatching, so a hung turn or worker join is still recovered.
++    progress: Atomic(i64),
++    /// Set by the polling loop as its last action, so the supervisor can bound
++    /// how long it waits for the thread before detaching it.
++    exited: Atomic(bool),
+     /// Thread handle for join().
+     thread: ?std.Thread = null,
+ 
+@@ -2212,6 +2348,9 @@ pub const MatrixLoopState = struct {
+         return .{
+             .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
+             .stop_requested = Atomic(bool).init(false),
++            .step = Atomic(u8).init(@intFromEnum(PollStep.startup)),
++            .progress = Atomic(i64).init(std_compat.time.timestamp()),
++            .exited = Atomic(bool).init(false),
+         };
+     }
+ };
+@@ -2225,6 +2364,15 @@ pub const MaxLoopState = struct {
+     last_activity: Atomic(i64),
+     /// Supervisor sets this to ask the polling thread to stop.
+     stop_requested: Atomic(bool),
++    /// Coarse phase of the polling thread (see `PollStep`).
++    step: Atomic(u8),
++    /// Bumped on every observable poll/turn progress (see `bumpProgress`). The
++    /// supervisor treats a frozen heartbeat as a stall even while the poller is
++    /// dispatching, so a hung turn or worker join is still recovered.
++    progress: Atomic(i64),
++    /// Set by the polling loop as its last action, so the supervisor can bound
++    /// how long it waits for the thread before detaching it.
++    exited: Atomic(bool),
+     /// Thread handle for join().
+     thread: ?std.Thread = null,
+ 
+@@ -2232,6 +2380,9 @@ pub const MaxLoopState = struct {
+         return .{
+             .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
+             .stop_requested = Atomic(bool).init(false),
++            .step = Atomic(u8).init(@intFromEnum(PollStep.startup)),
++            .progress = Atomic(i64).init(std_compat.time.timestamp()),
++            .exited = Atomic(bool).init(false),
+         };
+     }
+ };
+@@ -2358,6 +2509,9 @@ pub fn runMatrixLoop(
+     loop_state: *MatrixLoopState,
+     mx_ptr: *matrix.MatrixChannel,
+ ) void {
++    // Last action of the thread: lets the supervisor bound how long it waits
++    // before detaching a poller that will not come back.
++    defer loop_state.exited.store(true, .release);
+     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+ 
+     const state_dir: ?[]u8 = matrix.MatrixChannel.stateDirFromConfigPath(allocator, config.config_path) catch |err| blk: {
+@@ -2370,6 +2524,7 @@ pub fn runMatrixLoop(
+     var evict_counter: u32 = 0;
+ 
+     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
++        markPollStep(&loop_state.step, .polling);
+         const messages = mx_ptr.pollMessages(allocator) catch |err| {
+             if (err == error.MatrixSyncPositionExpired) {
+                 if (state_dir) |dir| mx_ptr.discardPersistedNextBatch(dir);
+@@ -2385,6 +2540,8 @@ pub fn runMatrixLoop(
+ 
+         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+ 
++        markPollStep(&loop_state.step, .dispatching);
++        bumpProgress(&loop_state.progress);
+         for (messages) |msg| {
+             const schedule_chat_id = msg.reply_target orelse msg.sender;
+             setScheduleToolContext(
+@@ -2436,7 +2593,7 @@ pub fn runMatrixLoop(
+                 .group_id = if (msg.is_group) room_peer_id else null,
+             });
+ 
+-            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
++            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, null, progressHeartbeatSink(&loop_state.progress)) catch |err| {
+                 logAgentProcessingError(allocator, "Matrix agent error", err);
+                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+@@ -2517,6 +2674,9 @@ pub fn runMaxLoop(
+     loop_state: *MaxLoopState,
+     mx_ptr: *max_mod.MaxChannel,
+ ) void {
++    // Last action of the thread: lets the supervisor bound how long it waits
++    // before detaching a poller that will not come back.
++    defer loop_state.exited.store(true, .release);
+     // 1. Fetch bot identity
+     mx_ptr.channel().start() catch |err| {
+         log.err("Max channel start failed: {}", .{err});
+@@ -2531,6 +2691,7 @@ pub fn runMaxLoop(
+     const max_backoff_ns: u64 = 30 * std.time.ns_per_s;
+ 
+     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
++        markPollStep(&loop_state.step, .polling);
+         const messages = mx_ptr.pollUpdates(allocator) catch |err| {
+             log.warn("Max poll error: {}", .{err});
+             loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+@@ -2543,6 +2704,8 @@ pub fn runMaxLoop(
+         backoff_ns = std.time.ns_per_s;
+         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+ 
++        markPollStep(&loop_state.step, .dispatching);
++        bumpProgress(&loop_state.progress);
+         for (messages) |msg| {
+             const reply_target = msg.reply_target orelse msg.sender;
+             setScheduleToolContext(
+@@ -2602,7 +2765,7 @@ pub fn runMaxLoop(
+             defer stream_ctx.deinit();
+             const sink = mx_ptr.makeSink(&stream_ctx);
+ 
+-            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink, null) catch |err| {
++            const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink, progressHeartbeatSink(&loop_state.progress)) catch |err| {
+                 logAgentProcessingError(allocator, "Max agent error", err);
+                 const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                 defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+@@ -3160,6 +3323,7 @@ test "telegram callback starts typing turn and cleans up on local slash miss" {
+         77,
+         false,
+         "user_a",
++        null,
+     );
+ 
+     try std.testing.expect(!handled);
+diff --git a/src/channel_manager.zig b/src/channel_manager.zig
+index 61c686f..1a23c17 100644
+--- a/src/channel_manager.zig
++++ b/src/channel_manager.zig
+@@ -31,6 +31,7 @@ const web = channels_mod.web;
+ const Channel = channels_mod.Channel;
+ 
+ const log = std.log.scoped(.channel_manager);
++const Atomic = @import("portable_atomic.zig").Atomic;
+ 
+ pub const ListenerType = enum {
+     /// Telegram, Signal — poll in a loop
+@@ -112,13 +113,13 @@ pub const ChannelManager = struct {
+         }
+     }
+ 
+-    fn destroyPollingState(self: *ChannelManager, state: PollingState) void {
++    fn destroyPollingState(allocator: Allocator, state: PollingState) void {
+         switch (state) {
+-            .telegram => |ls| self.allocator.destroy(ls),
+-            .signal => |ls| self.allocator.destroy(ls),
+-            .weixin => |ls| self.allocator.destroy(ls),
+-            .matrix => |ls| self.allocator.destroy(ls),
+-            .max => |ls| self.allocator.destroy(ls),
++            .telegram => |ls| allocator.destroy(ls),
++            .signal => |ls| allocator.destroy(ls),
++            .weixin => |ls| allocator.destroy(ls),
++            .matrix => |ls| allocator.destroy(ls),
++            .max => |ls| allocator.destroy(ls),
+         }
+     }
+ 
+@@ -159,20 +160,182 @@ pub const ChannelManager = struct {
+         return false;
+     }
+ 
+-    fn stopPollingThread(self: *ChannelManager, entry: *Entry) void {
+-        if (entry.polling_state) |state| {
+-            requestPollingStop(state);
++    /// Grace period for a polling thread to observe `stop_requested` and exit.
++    /// Every blocking call on the poller path is time-bounded (curl --max-time),
++    /// so a cooperative poller joins cleanly once it returns from the call it is
++    /// in. The grace must exceed the largest such bound on the poller path - a
++    /// media upload on the reply-send path is bounded at 120s - so 150s lets a
++    /// normal restart join; only a genuinely wedged thread is detached.
++    const POLLING_STOP_GRACE_NS: u64 = 150 * std.time.ns_per_s;
++
++    /// A dispatching poller that has not refreshed its turn heartbeat for this
++    /// long is treated as stalled (a hung turn, tool, or worker join). Generous,
++    /// because a single provider request can run for minutes before the next
++    /// progress hint, and a long-but-progressing turn must not be restarted.
++    const DISPATCH_STALL_SECS: i64 = 900;
++
++    /// Hard wall-clock bound on how long a poller may stay out of the poll step,
++    /// regardless of turn progress. `last_activity` only advances when a poll
++    /// completes, so `now - last_activity` is the time spent dispatching. Without
++    /// this, a turn that keeps emitting progress hints but never terminates is
++    /// never declared stale - the one stall freshness alone cannot recover.
++    const MAX_DISPATCH_SECS: i64 = 1800;
++
++    /// Wait up to `grace_ns` for a polling thread to record that it exited.
++    ///
++    /// `std.Thread.join` has no timeout, so joining a thread wedged in a
++    /// blocking syscall hangs the caller forever - the incident where a stale
++    /// Telegram poller could not be restarted and only a manual container
++    /// restart recovered the process. The polling loops set `exited` as their
++    /// last action, so the supervisor can bound the wait and detach a thread
++    /// that never comes back instead of blocking on it.
++    fn waitForExit(exited: *const Atomic(bool), grace_ns: u64) bool {
++        const deadline = std_compat.time.nanoTimestamp() + @as(i128, grace_ns);
++        while (!exited.load(.acquire)) {
++            if (std_compat.time.nanoTimestamp() >= deadline) return false;
++            std_compat.thread.sleep(25 * std.time.ns_per_ms);
+         }
++        return true;
++    }
++
++    fn pollingExited(state: PollingState) *const Atomic(bool) {
++        return switch (state) {
++            .telegram => |ls| &ls.exited,
++            .signal => |ls| &ls.exited,
++            .weixin => |ls| &ls.exited,
++            .matrix => |ls| &ls.exited,
++            .max => |ls| &ls.exited,
++        };
++    }
++
++    fn pollingStep(state: PollingState) u8 {
++        return switch (state) {
++            .telegram => |ls| ls.step.load(.acquire),
++            .signal => |ls| ls.step.load(.acquire),
++            .weixin => |ls| ls.step.load(.acquire),
++            .matrix => |ls| ls.step.load(.acquire),
++            .max => |ls| ls.step.load(.acquire),
++        };
++    }
++
++    fn pollingProgress(state: PollingState) i64 {
++        return switch (state) {
++            .telegram => |ls| ls.progress.load(.acquire),
++            .signal => |ls| ls.progress.load(.acquire),
++            .weixin => |ls| ls.progress.load(.acquire),
++            .matrix => |ls| ls.progress.load(.acquire),
++            .max => |ls| ls.progress.load(.acquire),
++        };
++    }
++
++    /// The poller's own liveness: the last completed poll (`last_activity`) or
++    /// the last turn heartbeat (`progress`). Both are written only by the
++    /// polling thread - a parallel worker's turn bumps the separate
++    /// `turn_progress` cell - so a frozen value means the poller itself stalled.
++    /// Do NOT fold worker progress in here: a wedged poller whose worker keeps
++    /// streaming is exactly the stall the supervisor must recover.
++    fn pollingFreshness(state: PollingState) i64 {
++        return @max(pollingLastActivity(state), pollingProgress(state));
++    }
++
++    /// A poller in the poll step that has not completed a poll for this long is
++    /// stale. Also the bound on how long a poller may go without re-entering the
++    /// poll step (e.g. blocked joining a worker).
++    const STALE_THRESHOLD_SECS: i64 = 600;
++
++    /// Whether a poller is stale at `now`, from its own liveness only (see
++    /// `pollingFreshness`), with a longer bound while it is dispatching so a
++    /// long-but-progressing turn is not restarted. Also bounded by the hard
++    /// dispatch wall-clock (`MAX_DISPATCH_SECS`): a turn that keeps progressing
++    /// forever is still recovered.
++    fn pollingStale(state: PollingState, now: i64) bool {
++        const dispatching = pollingStep(state) == @intFromEnum(channel_loop.PollStep.dispatching);
++        const threshold: i64 = if (dispatching) DISPATCH_STALL_SECS else STALE_THRESHOLD_SECS;
++        if ((now - pollingFreshness(state)) > threshold) return true;
++        return dispatching and (now - pollingLastActivity(state)) > MAX_DISPATCH_SECS;
++    }
++
++    fn pollingStepName(step: u8) []const u8 {
++        return switch (step) {
++            @intFromEnum(channel_loop.PollStep.polling) => "polling",
++            @intFromEnum(channel_loop.PollStep.dispatching) => "dispatching",
++            else => "startup",
++        };
++    }
+ 
++    fn stopPollingThread(self: *ChannelManager, entry: *Entry) bool {
++        return stopPollingThreadGrace(self.allocator, entry, POLLING_STOP_GRACE_NS);
++    }
++
++    /// Stop a polling thread, bounded so a wedged poller can never hang the
++    /// caller (`std.Thread.join` has no timeout - the incident's supervisor
++    /// deadlocked on exactly that).
++    ///
++    /// Returns true when the thread is gone (joined or detached) and the entry
++    /// is cleared, so the caller may respawn; false when the poller is doing
++    /// real work and was deliberately left running.
++    fn stopPollingThreadGrace(allocator: Allocator, entry: *Entry, grace_ns: u64) bool {
++        const state = entry.polling_state;
+         if (entry.thread) |t| {
+-            t.join();
++            if (state) |s| {
++                // Leave a poller alone only while it is doing real, progressing
++                // work: a turn that keeps refreshing its heartbeat. A poller in
++                // the poll step is network-bound and bounded, and a poller whose
++                // heartbeat has frozen is wedged - both are safe to stop. This is
++                // what lets the supervisor recover a stall that happens *while
++                // dispatching* (a hung turn or worker join), which the earlier
++                // blanket dispatching-suppression made unrecoverable.
++                const now = std_compat.time.timestamp();
++                const progressing = (now - pollingProgress(s)) <= DISPATCH_STALL_SECS and
++                    (now - pollingLastActivity(s)) <= MAX_DISPATCH_SECS;
++                if (!pollingExited(s).load(.acquire) and
++                    pollingStep(s) == @intFromEnum(channel_loop.PollStep.dispatching) and
++                    progressing and
++                    !daemon.isShutdownRequested())
++                {
++                    log.info("{s} poller busy (step={s}); leaving it running", .{ entry.name, pollingStepName(pollingStep(s)) });
++                    return false;
++                }
++                requestPollingStop(s);
++                if (waitForExit(pollingExited(s), grace_ns)) {
++                    // The loop has left its body; join reclaims the thread promptly.
++                    t.join();
++                    destroyPollingState(allocator, s);
++                    entry.polling_state = null;
++                } else {
++                    log.warn(
++                        "{s} polling thread did not exit within {d}s (step={s}); detaching it so supervision can continue",
++                        .{ entry.name, grace_ns / std.time.ns_per_s, pollingStepName(pollingStep(s)) },
++                    );
++                    // detach() lets the OS reclaim the thread and its 16 MiB
++                    // stack on exit; dropping the handle without join/detach
++                    // would leak that stack forever. The loop state is left
++                    // allocated - the detached thread still owns it.
++                    //
++                    // The detached poller re-checks `stop_requested` at the top
++                    // of its loop, so it exits as soon as the blocked call
++                    // returns. Until then it can briefly run alongside the
++                    // respawned poller and touch the same channel object (e.g.
++                    // Telegram's last_update_id). Accepted: that window needs the
++                    // blocked call to return after the grace, and the alternative
++                    // - never restarting a wedged poller - is the incident.
++                    t.detach();
++                    entry.polling_state = null;
++                }
++            } else {
++                // No loop state to signal stop through; detach rather than risk
++                // an unbounded join (unreachable in practice: spawnPollingThread
++                // always sets thread and state together).
++                t.detach();
++            }
+             entry.thread = null;
++            return true;
+         }
+-
+-        if (entry.polling_state) |state| {
+-            self.destroyPollingState(state);
++        if (state) |s| {
++            destroyPollingState(allocator, s);
+             entry.polling_state = null;
+         }
++        return true;
+     }
+ 
+     fn listenerTypeFromMode(mode: channel_catalog.ListenerMode) ListenerType {
+@@ -366,11 +529,23 @@ pub const ChannelManager = struct {
+         return started;
+     }
+ 
++    /// On shutdown, wait up to the largest bound on the poller path so a poller
++    /// parked in a bounded call (getUpdates ~45s, a media upload ~120s) exits
++    /// and is joined rather than detached. Detaching on shutdown would let the
++    /// poller outlive `ChannelManager.deinit` (which frees `entries`) and the
++    /// daemon's `channel_rt.deinit()`/channel teardown, touching freed state.
++    /// A genuinely wedged poller (no bounded call in flight) is still detached
++    /// once this bound elapses; the daemon then exits promptly, so the process -
++    /// not shared state - reclaims it.
++    const SHUTDOWN_STOP_GRACE_NS: u64 = POLLING_STOP_GRACE_NS;
++
+     /// Signal all threads to stop and join them.
+     pub fn stopAll(self: *ChannelManager) void {
+         for (self.entries.items) |*entry| {
+             switch (entry.listener_type) {
+-                .polling => self.stopPollingThread(entry),
++                .polling => {
++                    _ = stopPollingThreadGrace(self.allocator, entry, SHUTDOWN_STOP_GRACE_NS);
++                },
+                 .gateway_loop, .webhook_only, .send_only => entry.channel.stop(),
+                 .not_implemented => {},
+             }
+@@ -380,7 +555,6 @@ pub const ChannelManager = struct {
+     /// Monitoring loop: check health, restart failed channels with backoff.
+     /// Blocks until shutdown.
+     pub fn supervisionLoop(self: *ChannelManager, state: *daemon.DaemonState) void {
+-        const STALE_THRESHOLD_SECS: i64 = 600;
+         const WATCH_INTERVAL_SECS: u64 = 10;
+ 
+         while (!daemon.isShutdownRequested()) {
+@@ -423,8 +597,8 @@ pub const ChannelManager = struct {
+ 
+                 const polling_state = entry.polling_state orelse continue;
+                 const now = std_compat.time.timestamp();
+-                const last = pollingLastActivity(polling_state);
+-                const stale = (now - last) > STALE_THRESHOLD_SECS;
++                const poller_step = pollingStep(polling_state);
++                const stale = pollingStale(polling_state, now);
+ 
+                 const probe_ok = entry.channel.healthCheck();
+ 
+@@ -434,17 +608,32 @@ pub const ChannelManager = struct {
+                     if (entry.supervised.state != .running) entry.supervised.recordSuccess();
+                 } else {
+                     const reason: []const u8 = if (stale) "polling thread stale" else "health check failed";
+-                    log.warn("{s} issue: {s}", .{ entry.name, reason });
++                    log.warn("{s} issue: {s} (poller step: {s}, idle {d}s)", .{
++                        entry.name,
++                        reason,
++                        pollingStepName(poller_step),
++                        now - pollingFreshness(polling_state),
++                    });
+                     health.markComponentError(entry.name, reason);
+ 
++                    // Snapshot before recording: a restart deferred because the
++                    // poller is busy and progressing must not count against the
++                    // circuit breaker, or repeated ticks would drive a healthy
++                    // channel to gave_up.
++                    const supervised_before = entry.supervised;
+                     entry.supervised.recordFailure();
+ 
+                     if (entry.supervised.shouldRestart()) {
+                         log.info("Restarting {s} (attempt {d})", .{ entry.name, entry.supervised.restart_count });
+                         state.markError("channels", reason);
+ 
+-                        // Stop old thread
+-                        self.stopPollingThread(entry);
++                        // Stop old thread. Bounded: never blocks on a wedged
++                        // poller. A poller busy dispatching is left running and
++                        // the restart is retried on the next supervision tick.
++                        if (!self.stopPollingThread(entry)) {
++                            entry.supervised = supervised_before;
++                            continue;
++                        }
+ 
+                         // Backoff
+                         std_compat.thread.sleep(entry.supervised.currentBackoffMs() * std.time.ns_per_ms);
+@@ -455,6 +644,7 @@ pub const ChannelManager = struct {
+                                 log.err("Failed to respawn {s} thread: {}", .{ entry.name, err });
+                                 continue;
+                             };
++                            log.info("{s} polling thread started", .{entry.name});
+                             entry.supervised.recordSuccess();
+                             state.markRunning("channels");
+                             health.markComponentOk(entry.name);
+@@ -491,6 +681,189 @@ pub const ChannelManager = struct {
+ // Tests
+ // ════════════════════════════════════════════════════════════════════════════
+ 
++test "waitForExit honors an already-set exit flag and its deadline" {
++    var exited = Atomic(bool).init(true);
++    try std.testing.expect(ChannelManager.waitForExit(&exited, 1 * std.time.ns_per_s));
++
++    var stuck = Atomic(bool).init(false);
++    const start = std_compat.time.nanoTimestamp();
++    try std.testing.expect(!ChannelManager.waitForExit(&stuck, 150 * std.time.ns_per_ms));
++    const elapsed = std_compat.time.nanoTimestamp() - start;
++    try std.testing.expect(elapsed >= 100 * std.time.ns_per_ms);
++    try std.testing.expect(elapsed < 2 * std.time.ns_per_s);
++}
++
++test "pollingStepName maps recorded poll steps" {
++    try std.testing.expectEqualStrings("polling", ChannelManager.pollingStepName(@intFromEnum(channel_loop.PollStep.polling)));
++    try std.testing.expectEqualStrings("dispatching", ChannelManager.pollingStepName(@intFromEnum(channel_loop.PollStep.dispatching)));
++    try std.testing.expectEqualStrings("startup", ChannelManager.pollingStepName(@intFromEnum(channel_loop.PollStep.startup)));
++}
++
++var test_stuck_release = Atomic(bool).init(false);
++
++/// Stands in for a poller wedged in a blocking syscall: it never sets `exited`.
++fn testStuckPoller() void {
++    const deadline = std_compat.time.nanoTimestamp() + 5 * std.time.ns_per_s;
++    while (!test_stuck_release.load(.acquire) and std_compat.time.nanoTimestamp() < deadline) {
++        std_compat.thread.sleep(5 * std.time.ns_per_ms);
++    }
++}
++
++/// Stands in for a cooperative poller: it records `exited` shortly after start.
++fn testQuickExiter(state: *channel_loop.TelegramLoopState) void {
++    std_compat.thread.sleep(50 * std.time.ns_per_ms);
++    state.exited.store(true, .release);
++}
++
++fn testPollingEntry(thread: std.Thread, state: *channel_loop.TelegramLoopState) Entry {
++    return .{
++        .name = "telegram",
++        .adapter_key = "telegram",
++        .channel = undefined,
++        .listener_type = .polling,
++        .supervised = undefined,
++        .thread = thread,
++        .polling_state = .{ .telegram = state },
++    };
++}
++
++test "stopPollingThreadGrace detaches a wedged poller instead of blocking" {
++    // page_allocator: the detach path intentionally leaves the loop state
++    // allocated (the detached thread owns it), so testing.allocator would flag
++    // an expected leak.
++    const allocator = std.heap.page_allocator;
++    const state = try allocator.create(channel_loop.TelegramLoopState);
++    state.* = channel_loop.TelegramLoopState.init();
++    state.step.store(@intFromEnum(channel_loop.PollStep.polling), .release);
++
++    test_stuck_release.store(false, .release);
++    const thread = try std.Thread.spawn(.{}, testStuckPoller, .{});
++    var entry = testPollingEntry(thread, state);
++
++    const start = std_compat.time.nanoTimestamp();
++    const stopped = ChannelManager.stopPollingThreadGrace(allocator, &entry, 150 * std.time.ns_per_ms);
++    const elapsed = std_compat.time.nanoTimestamp() - start;
++
++    // Must return within the grace instead of joining forever (the incident).
++    try std.testing.expect(stopped);
++    try std.testing.expect(elapsed < 2 * std.time.ns_per_s);
++    try std.testing.expect(entry.thread == null);
++    try std.testing.expect(entry.polling_state == null);
++    // The stop was requested before detaching.
++    try std.testing.expect(state.stop_requested.load(.acquire));
++
++    test_stuck_release.store(true, .release);
++}
++
++test "stopPollingThreadGrace leaves a dispatching poller running" {
++    const allocator = std.testing.allocator;
++    const state = try allocator.create(channel_loop.TelegramLoopState);
++    state.* = channel_loop.TelegramLoopState.init();
++    state.step.store(@intFromEnum(channel_loop.PollStep.dispatching), .release);
++
++    const thread = try std.Thread.spawn(.{}, testQuickExiter, .{state});
++    var entry = testPollingEntry(thread, state);
++
++    // A short grace must not detach a poller that is mid-turn.
++    const stopped = ChannelManager.stopPollingThreadGrace(allocator, &entry, 20 * std.time.ns_per_ms);
++
++    try std.testing.expect(!stopped);
++    try std.testing.expect(entry.thread != null);
++    try std.testing.expect(entry.polling_state != null);
++    // It must never have been signalled to stop.
++    try std.testing.expect(!state.stop_requested.load(.acquire));
++
++    thread.join();
++    allocator.destroy(state);
++}
++
++test "stopPollingThreadGrace stops a dispatching poller whose heartbeat is stale" {
++    // page_allocator: the detach path intentionally leaves the loop state
++    // allocated (the detached thread owns it).
++    const allocator = std.heap.page_allocator;
++    const state = try allocator.create(channel_loop.TelegramLoopState);
++    state.* = channel_loop.TelegramLoopState.init();
++    state.step.store(@intFromEnum(channel_loop.PollStep.dispatching), .release);
++    // Frozen heartbeat: no turn progress for longer than the stall bound. This
++    // is the hung turn/worker join the earlier suppression could never recover.
++    state.progress.store(std_compat.time.timestamp() - (ChannelManager.DISPATCH_STALL_SECS + 30), .release);
++
++    test_stuck_release.store(false, .release);
++    const thread = try std.Thread.spawn(.{}, testStuckPoller, .{});
++    var entry = testPollingEntry(thread, state);
++
++    const stopped = ChannelManager.stopPollingThreadGrace(allocator, &entry, 150 * std.time.ns_per_ms);
++
++    try std.testing.expect(stopped);
++    try std.testing.expect(entry.thread == null);
++    try std.testing.expect(entry.polling_state == null);
++    try std.testing.expect(state.stop_requested.load(.acquire));
++
++    test_stuck_release.store(true, .release);
++}
++
++test "pollingStale ignores a worker turn's progress while the poller is wedged" {
++    const allocator = std.testing.allocator;
++    const state = try allocator.create(channel_loop.TelegramLoopState);
++    defer allocator.destroy(state);
++    state.* = channel_loop.TelegramLoopState.init();
++
++    const now: i64 = 10_000;
++    // The poller itself has made no progress for 1000s (frozen in the poll
++    // step)...
++    state.last_activity.store(now - 1000, .release);
++    state.progress.store(now - 1000, .release);
++    state.step.store(@intFromEnum(channel_loop.PollStep.polling), .release);
++    // ...but a parallel worker turn is still streaming.
++    state.turn_progress.store(now, .release);
++
++    // The supervisor must still declare it stale: worker progress is not poller
++    // liveness. This fails if freshness goes back to max() over a cell that
++    // worker turns also write.
++    try std.testing.expect(ChannelManager.pollingStale(.{ .telegram = state }, now));
++
++    // A progressing turn on the poller thread (dispatching step) is not stale...
++    state.step.store(@intFromEnum(channel_loop.PollStep.dispatching), .release);
++    state.progress.store(now, .release);
++    try std.testing.expect(!ChannelManager.pollingStale(.{ .telegram = state }, now));
++
++    // ...but a dispatching poller whose own heartbeat has frozen is.
++    state.progress.store(now - (ChannelManager.DISPATCH_STALL_SECS + 1), .release);
++    try std.testing.expect(ChannelManager.pollingStale(.{ .telegram = state }, now));
++}
++
++test "pollingFreshness tracks the newest of poll activity and turn progress" {
++    const allocator = std.testing.allocator;
++    const state = try allocator.create(channel_loop.TelegramLoopState);
++    defer allocator.destroy(state);
++    state.* = channel_loop.TelegramLoopState.init();
++
++    state.last_activity.store(100, .release);
++    state.progress.store(250, .release);
++    try std.testing.expectEqual(@as(i64, 250), ChannelManager.pollingFreshness(.{ .telegram = state }));
++
++    state.last_activity.store(300, .release);
++    try std.testing.expectEqual(@as(i64, 300), ChannelManager.pollingFreshness(.{ .telegram = state }));
++}
++
++test "stopPollingThreadGrace joins a cooperative poller and frees its state" {
++    const allocator = std.testing.allocator;
++    const state = try allocator.create(channel_loop.TelegramLoopState);
++    state.* = channel_loop.TelegramLoopState.init();
++    state.step.store(@intFromEnum(channel_loop.PollStep.polling), .release);
++
++    const thread = try std.Thread.spawn(.{}, testQuickExiter, .{state});
++    var entry = testPollingEntry(thread, state);
++
++    const stopped = ChannelManager.stopPollingThreadGrace(allocator, &entry, 3 * std.time.ns_per_s);
++
++    try std.testing.expect(stopped);
++    try std.testing.expect(entry.thread == null);
++    try std.testing.expect(entry.polling_state == null);
++    // testing.allocator fails the test if the loop state was not freed by the
++    // join path.
++}
++
+ test "PollingState has telegram signal weixin matrix and max variants" {
+     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .telegram)) !=
+         @intFromEnum(@as(std.meta.Tag(PollingState), .signal)));
+@@ -1285,3 +1658,49 @@ test "ChannelManager collects web channel from config" {
+     try std.testing.expectEqualStrings("/relay", web_ptr.ws_path);
+     try std.testing.expectEqualStrings("relay-token-0123456789", web_ptr.configured_auth_token.?);
+ }
++
++test "pollingStale recovers a progressing turn past the hard dispatch bound" {
++    const allocator = std.testing.allocator;
++    const state = try allocator.create(channel_loop.TelegramLoopState);
++    defer allocator.destroy(state);
++    state.* = channel_loop.TelegramLoopState.init();
++
++    const now: i64 = 100_000;
++    state.step.store(@intFromEnum(channel_loop.PollStep.dispatching), .release);
++    // The turn keeps emitting progress hints...
++    state.progress.store(now, .release);
++
++    // ...within the hard bound it is not stale...
++    state.last_activity.store(now - (ChannelManager.MAX_DISPATCH_SECS - 1), .release);
++    try std.testing.expect(!ChannelManager.pollingStale(.{ .telegram = state }, now));
++
++    // ...but past it the poller must be recovered even though the turn is
++    // still progressing (the stall freshness alone cannot recover).
++    state.last_activity.store(now - (ChannelManager.MAX_DISPATCH_SECS + 1), .release);
++    try std.testing.expect(ChannelManager.pollingStale(.{ .telegram = state }, now));
++}
++
++test "stopPollingThreadGrace stops a progressing turn past the hard dispatch bound" {
++    // page_allocator: the detach path intentionally leaves the loop state
++    // allocated (the detached thread owns it).
++    const allocator = std.heap.page_allocator;
++    const state = try allocator.create(channel_loop.TelegramLoopState);
++    state.* = channel_loop.TelegramLoopState.init();
++    state.step.store(@intFromEnum(channel_loop.PollStep.dispatching), .release);
++    // Fresh heartbeat, but the poller has been out of the poll step too long.
++    state.progress.store(std_compat.time.timestamp(), .release);
++    state.last_activity.store(std_compat.time.timestamp() - (ChannelManager.MAX_DISPATCH_SECS + 10), .release);
++
++    test_stuck_release.store(false, .release);
++    const thread = try std.Thread.spawn(.{}, testStuckPoller, .{});
++    var entry = testPollingEntry(thread, state);
++
++    const stopped = ChannelManager.stopPollingThreadGrace(allocator, &entry, 150 * std.time.ns_per_ms);
++
++    try std.testing.expect(stopped);
++    try std.testing.expect(entry.thread == null);
++    try std.testing.expect(entry.polling_state == null);
++    try std.testing.expect(state.stop_requested.load(.acquire));
++
++    test_stuck_release.store(true, .release);
++}
+diff --git a/src/channels/matrix.zig b/src/channels/matrix.zig
+index b83269a..d89db40 100644
+--- a/src/channels/matrix.zig
++++ b/src/channels/matrix.zig
+@@ -454,7 +454,7 @@ pub const MatrixChannel = struct {
+         defer self.allocator.free(auth_header);
+ 
+         const headers = [_][]const u8{auth_header};
+-        const resp = try root.http_util.curlPut(self.allocator, url, body_list.items, &headers);
++        const resp = try root.http_util.httpRequestWithTimeout(self.allocator, .PUT, url, body_list.items, &headers, "application/json", null, "30");
+         defer self.allocator.free(resp);
+ 
+         if (std.mem.indexOf(u8, resp, "\"event_id\"") == null) {
+@@ -491,11 +491,15 @@ pub const MatrixChannel = struct {
+         defer self.allocator.free(auth_header);
+         const headers = [_][]const u8{auth_header};
+ 
+-        const resp = root.http_util.curlPut(
++        const resp = root.http_util.httpRequestWithTimeout(
+             self.allocator,
++            .PUT,
+             url,
+             "{\"typing\":true,\"timeout\":15000}",
+             &headers,
++            "application/json",
++            null,
++            "10",
+         ) catch return;
+         self.allocator.free(resp);
+     }
+@@ -516,7 +520,11 @@ pub const MatrixChannel = struct {
+         defer self.allocator.free(auth_header);
+         const headers = [_][]const u8{auth_header};
+ 
+-        const resp = root.http_util.curlGet(self.allocator, url, &headers, "10") catch return false;
++        // Bounded: `curlGet` falls back to the untimed std.http client for a
++        // credentialed GET, and healthCheck runs on the supervision thread - a
++        // silently dropped socket there would freeze supervision for every
++        // channel, not just this poller.
++        const resp = root.http_util.httpGetWithProxyTimeout(self.allocator, url, &headers, null, "10", root.http_util.DEFAULT_CURL_GET_MAX_BYTES) catch return false;
+         defer self.allocator.free(resp);
+ 
+         return std.mem.indexOf(u8, resp, "\"user_id\"") != null;
+@@ -674,7 +682,12 @@ pub const MatrixChannel = struct {
+         defer self.allocator.free(auth_header);
+ 
+         const headers = [_][]const u8{auth_header};
+-        const resp = try root.http_util.curlPost(self.allocator, url, "{}", &headers);
++        // Bounded: auto-join runs on the matrix polling thread (inside
++        // pollMessages), so an untimed call could wedge the poller. Route through
++        // httpRequestWithTimeout, NOT curlPostWithProxy: the latter silently
++        // falls back to the untimed std.http client for a credentialed request
++        // and would drop this bound.
++        const resp = try root.http_util.httpRequestWithTimeout(self.allocator, .POST, url, "{}", &headers, "application/json", null, "15");
+         defer self.allocator.free(resp);
+     }
+ 
+@@ -992,7 +1005,11 @@ pub const MatrixChannel = struct {
+         defer allocator.free(auth_header);
+         const headers = [_][]const u8{auth_header};
+ 
+-        const resp = root.http_util.curlGetWithStatusAndTimeout(allocator, url, &headers, "35") catch |err| {
++        // Bounded and status-preserving: `curlGetWithStatusAndTimeout` falls
++        // back to the untimed std.http client for this credentialed request, so
++        // a silently dropped socket would park the poller for the rest of the
++        // process lifetime (the incident).
++        const resp = root.http_util.httpRequestWithStatusTimeout(allocator, .GET, url, null, &headers, null, null, "35") catch |err| {
+             log.warn("Matrix sync failed: {}", .{err});
+             return err;
+         };
+@@ -2303,3 +2320,56 @@ test "MatrixChannel recognizes expired sync position responses" {
+     ));
+     try std.testing.expect(!MatrixChannel.responseIndicatesExpiredPosition(allocator, "not-json"));
+ }
++
++const StalledSyncServer = struct {
++    server: *std_compat.net.Server,
++    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
++};
++
++/// Accept one connection and never reply, holding it open: the incident's
++/// silently dropped socket, where no FIN/RST ever arrives.
++fn serveStalledSync(ctx: *StalledSyncServer) void {
++    var conn = ctx.server.accept() catch return;
++    defer conn.stream.close();
++    while (!ctx.release.load(.acquire)) std_compat.thread.sleep(5 * std.time.ns_per_ms);
++}
++
++// Regression: the Matrix /sync long poll is a credentialed GET. It must be
++// time-bounded (curl --max-time) rather than falling back to the untimed
++// std.http client, which would park the poller until TCP keepalive (default 2h).
++test "MatrixChannel sync GET is time-bounded on a stalled socket" {
++    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
++
++    const allocator = std.testing.allocator;
++    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
++    var server = try addr.listen(.{});
++    defer server.deinit();
++
++    var ctx = StalledSyncServer{ .server = &server };
++    const thread = try std.Thread.spawn(.{}, serveStalledSync, .{&ctx});
++
++    var hs_buf: [128]u8 = undefined;
++    const homeserver = try std.fmt.bufPrint(&hs_buf, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
++    const ch = MatrixChannel.init(allocator, homeserver, "secret-token", "!room:example.org", &.{});
++
++    var url_buf: [4096]u8 = undefined;
++    const url = try ch.buildSyncUrl(&url_buf);
++    const auth_header = try ch.authHeader(allocator);
++    defer allocator.free(auth_header);
++    const headers = [_][]const u8{auth_header};
++
++    const start = std_compat.time.nanoTimestamp();
++    const result = root.http_util.httpRequestWithStatusTimeout(allocator, .GET, url, null, &headers, null, null, "2");
++    const elapsed = std_compat.time.nanoTimestamp() - start;
++
++    if (result) |resp| {
++        allocator.free(resp.body);
++        return error.TestUnexpectedResult;
++    } else |err| {
++        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
++    }
++    try std.testing.expect(elapsed < 6 * std.time.ns_per_s);
++
++    ctx.release.store(true, .release);
++    thread.join();
++}
+diff --git a/src/channels/max_api.zig b/src/channels/max_api.zig
+index e98faaa..d2713d1 100644
+--- a/src/channels/max_api.zig
++++ b/src/channels/max_api.zig
+@@ -72,15 +72,26 @@ pub const Client = struct {
+     allocator: std.mem.Allocator,
+     bot_token: []const u8,
+     proxy: ?[]const u8,
++    /// Bot API base URL. Defaults to the public API; override to point at a
++    /// self-hosted server (or a local stub in tests).
++    api_base: []const u8 = BASE_URL,
++    /// Return canned responses instead of hitting the network. Defaults to true
++    /// under `zig test` so the suite never calls out; set false to exercise the
++    /// real transport (e.g. the bounded-timeout regression test).
++    stub: bool = builtin.is_test,
++    /// `--max-time` (decimal seconds) for the bounded write calls that run on
++    /// the poller path (edit/delete). Overridable so a test can assert the bound
++    /// without waiting out the production timeout.
++    write_timeout: []const u8 = "30",
+ 
+     // ── URL builder ─────────────────────────────────────────────────────
+ 
+     /// Build a full API URL into `buf`. Returns a slice of `buf`.
+     ///   buildUrl(buf, "/me", null)         → "https://platform-api.max.ru/me"
+     ///   buildUrl(buf, "/messages", "chat_id=123") → ".../messages?chat_id=123"
+-    pub fn buildUrl(buf: []u8, path: []const u8, query: ?[]const u8) ![]const u8 {
++    pub fn buildUrl(self: Client, buf: []u8, path: []const u8, query: ?[]const u8) ![]const u8 {
+         var w: std.Io.Writer = .fixed(buf);
+-        try w.writeAll(BASE_URL);
++        try w.writeAll(self.api_base);
+         try w.writeAll(path);
+         if (query) |q| {
+             try w.writeByte('?');
+@@ -104,10 +115,13 @@ pub const Client = struct {
+             return allocator.dupe(u8, "{\"user_id\":123,\"name\":\"TestBot\",\"username\":\"test_bot\"}");
+         }
+         var url_buf: [256]u8 = undefined;
+-        const url = try buildUrl(&url_buf, "/me", null);
++        const url = try self.buildUrl(&url_buf, "/me", null);
+         var auth_buf: [512]u8 = undefined;
+         const auth = try self.authHeader(&auth_buf);
+-        return root.http_util.curlGetWithProxy(allocator, url, &.{auth}, "10", self.proxy);
++        // Bounded: getMe runs on the poller path (runMaxLoop startup and the
++        // supervisor health check), and curlGetWithProxy drops the bound for
++        // this credentialed request.
++        return root.http_util.httpRequestWithTimeout(allocator, .GET, url, null, &.{auth}, null, self.proxy, "10");
+     }
+ 
+     pub fn getMeOk(self: Client) bool {
+@@ -174,11 +188,14 @@ pub const Client = struct {
+         var query_buf: [256]u8 = undefined;
+         var query_writer: std.Io.Writer = .fixed(&query_buf);
+         try query_writer.print("chat_id={s}", .{encoded_chat_id});
+-        const url = try buildUrl(&url_buf, "/messages", query_writer.buffered());
++        const url = try self.buildUrl(&url_buf, "/messages", query_writer.buffered());
+ 
+         var auth_buf: [512]u8 = undefined;
+         const auth = try self.authHeader(&auth_buf);
+-        return root.http_util.curlPostWithProxy(allocator, url, body_json, &.{auth}, self.proxy, "30");
++        // Bounded and body-preserving: the reply send runs on the poller path,
++        // and curlPostWithProxy drops the bound for this credentialed request.
++        const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .POST, url, body_json, &.{auth}, "application/json", self.proxy, "30");
++        return resp.body;
+     }
+ 
+     pub fn parseSentMessageMid(allocator: std.mem.Allocator, json: []const u8) ?SentMessageMeta {
+@@ -201,7 +218,7 @@ pub const Client = struct {
+     }
+ 
+     pub fn editMessage(self: Client, allocator: std.mem.Allocator, message_id: []const u8, body_json: []const u8) ![]u8 {
+-        if (comptime builtin.is_test) {
++        if (self.stub) {
+             return allocator.dupe(u8, "{\"success\":true}");
+         }
+         var url_buf: [512]u8 = undefined;
+@@ -210,11 +227,17 @@ pub const Client = struct {
+         var query_buf: [256]u8 = undefined;
+         var query_writer: std.Io.Writer = .fixed(&query_buf);
+         try query_writer.print("message_id={s}", .{encoded_message_id});
+-        const url = try buildUrl(&url_buf, "/messages", query_writer.buffered());
++        const url = try self.buildUrl(&url_buf, "/messages", query_writer.buffered());
+ 
+         var auth_buf: [512]u8 = undefined;
+         const auth = try self.authHeader(&auth_buf);
+-        return root.http_util.curlPut(allocator, url, body_json, &.{auth});
++        // Bounded and body-preserving: streaming edits run on the poller path
++        // (runMaxLoop dispatches inline), so an untimed call can wedge the Max
++        // poller. Route through the bounded curl path, NOT curlPut: curlPut has
++        // no --max-time and its credentialed fallback silently uses the untimed
++        // std.http client.
++        const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .PUT, url, body_json, &.{auth}, "application/json", null, self.write_timeout);
++        return resp.body;
+     }
+ 
+     pub fn deleteMessage(self: Client, allocator: std.mem.Allocator, message_id: []const u8) !void {
+@@ -225,11 +248,11 @@ pub const Client = struct {
+         var query_buf: [256]u8 = undefined;
+         var query_writer: std.Io.Writer = .fixed(&query_buf);
+         try query_writer.print("message_id={s}", .{encoded_message_id});
+-        const url = try buildUrl(&url_buf, "/messages", query_writer.buffered());
++        const url = try self.buildUrl(&url_buf, "/messages", query_writer.buffered());
+ 
+         var auth_buf: [512]u8 = undefined;
+         const auth = try self.authHeader(&auth_buf);
+-        try curlDelete(allocator, url, auth, self.proxy);
++        try curlDelete(allocator, url, auth, self.proxy, self.write_timeout);
+     }
+ 
+     // ── Callbacks ───────────────────────────────────────────────────────
+@@ -252,7 +275,7 @@ pub const Client = struct {
+         var query_buf: [384]u8 = undefined;
+         var query_writer: std.Io.Writer = .fixed(&query_buf);
+         try query_writer.print("callback_id={s}", .{encoded_callback_id});
+-        const url = try buildUrl(&url_buf, "/answers", query_writer.buffered());
++        const url = try self.buildUrl(&url_buf, "/answers", query_writer.buffered());
+ 
+         var body: std.ArrayListUnmanaged(u8) = .empty;
+         defer body.deinit(allocator);
+@@ -272,8 +295,9 @@ pub const Client = struct {
+ 
+         var auth_buf: [512]u8 = undefined;
+         const auth = try self.authHeader(&auth_buf);
+-        const resp = try root.http_util.curlPostWithProxy(allocator, url, body.items, &.{auth}, self.proxy, "10");
+-        allocator.free(resp);
++        // Bounded: callback answers run inline on the poller thread.
++        const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .POST, url, body.items, &.{auth}, "application/json", self.proxy, "10");
++        allocator.free(resp.body);
+     }
+ 
+     // ── Updates (long-polling) ──────────────────────────────────────────
+@@ -291,7 +315,7 @@ pub const Client = struct {
+             defer allocator.free(encoded_marker);
+             try qw.print("&marker={s}", .{encoded_marker});
+         }
+-        const url = try buildUrl(&url_buf, "/updates", qw.buffered());
++        const url = try self.buildUrl(&url_buf, "/updates", qw.buffered());
+ 
+         var auth_buf: [512]u8 = undefined;
+         const auth = try self.authHeader(&auth_buf);
+@@ -301,7 +325,9 @@ pub const Client = struct {
+         const timeout_val = std.fmt.parseInt(u32, timeout, 10) catch 30;
+         const max_time = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_val + 5}) catch "35";
+ 
+-        return root.http_util.curlGetWithProxy(allocator, url, &.{auth}, max_time, self.proxy);
++        // Bounded: this is the Max poller's long poll, and curlGetWithProxy
++        // drops the bound for this credentialed request.
++        return root.http_util.httpRequestWithTimeout(allocator, .GET, url, null, &.{auth}, null, self.proxy, max_time);
+     }
+ 
+     // ── Subscriptions (webhooks) ────────────────────────────────────────
+@@ -311,7 +337,7 @@ pub const Client = struct {
+             return allocator.dupe(u8, "{\"success\":true}");
+         }
+         var url_buf: [256]u8 = undefined;
+-        const url = try buildUrl(&url_buf, "/subscriptions", null);
++        const url = try self.buildUrl(&url_buf, "/subscriptions", null);
+ 
+         var body: std.ArrayListUnmanaged(u8) = .empty;
+         defer body.deinit(allocator);
+@@ -334,7 +360,8 @@ pub const Client = struct {
+ 
+         var auth_buf: [512]u8 = undefined;
+         const auth = try self.authHeader(&auth_buf);
+-        return root.http_util.curlPostWithProxy(allocator, url, body.items, &.{auth}, self.proxy, "10");
++        const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .POST, url, body.items, &.{auth}, "application/json", self.proxy, "10");
++        return resp.body;
+     }
+ 
+     pub fn unsubscribe(self: Client, allocator: std.mem.Allocator, webhook_url: []const u8) !void {
+@@ -345,11 +372,11 @@ pub const Client = struct {
+         var query_buf: [1024]u8 = undefined;
+         var query_writer: std.Io.Writer = .fixed(&query_buf);
+         try query_writer.print("url={s}", .{encoded_url});
+-        const url = try buildUrl(&url_buf, "/subscriptions", query_writer.buffered());
++        const url = try self.buildUrl(&url_buf, "/subscriptions", query_writer.buffered());
+ 
+         var auth_buf: [512]u8 = undefined;
+         const auth = try self.authHeader(&auth_buf);
+-        try curlDelete(allocator, url, auth, self.proxy);
++        try curlDelete(allocator, url, auth, self.proxy, self.write_timeout);
+     }
+ 
+     // ── Typing indicator ────────────────────────────────────────────────
+@@ -362,13 +389,13 @@ pub const Client = struct {
+         var path_buf: [512]u8 = undefined;
+         var path_writer: std.Io.Writer = .fixed(&path_buf);
+         try path_writer.print("/chats/{s}/actions", .{encoded_chat_id});
+-        const url = try buildUrl(&url_buf, path_writer.buffered(), null);
++        const url = try self.buildUrl(&url_buf, path_writer.buffered(), null);
+ 
+         const body = "{\"action\":\"typing_on\"}";
+         var auth_buf: [512]u8 = undefined;
+         const auth = try self.authHeader(&auth_buf);
+-        const resp = try root.http_util.curlPostWithProxy(allocator, url, body, &.{auth}, self.proxy, "10");
+-        allocator.free(resp);
++        const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .POST, url, body, &.{auth}, "application/json", self.proxy, "10");
++        allocator.free(resp.body);
+     }
+ 
+     // ── File upload ─────────────────────────────────────────────────────
+@@ -383,11 +410,12 @@ pub const Client = struct {
+         var query_buf: [128]u8 = undefined;
+         var query_writer: std.Io.Writer = .fixed(&query_buf);
+         try query_writer.print("type={s}", .{encoded_file_type});
+-        const url = try buildUrl(&url_buf, "/uploads", query_writer.buffered());
++        const url = try self.buildUrl(&url_buf, "/uploads", query_writer.buffered());
+ 
+         var auth_buf: [512]u8 = undefined;
+         const auth = try self.authHeader(&auth_buf);
+-        const upload_init_resp = try root.http_util.curlPostWithProxy(allocator, url, "", &.{auth}, self.proxy, "30");
++        const upload_init = try root.http_util.httpRequestWithStatusTimeout(allocator, .POST, url, "", &.{auth}, "application/json", self.proxy, "30");
++        const upload_init_resp = upload_init.body;
+         errdefer allocator.free(upload_init_resp);
+ 
+         const upload_desc = parseUploadDescriptor(allocator, upload_init_resp) orelse return error.CurlFailed;
+@@ -442,8 +470,12 @@ pub const Client = struct {
+ // Internal: DELETE via curl subprocess
+ // ════════════════════════════════════════════════════════════════════════════
+ 
+-fn curlDelete(allocator: std.mem.Allocator, url: []const u8, auth_header: []const u8, proxy: ?[]const u8) !void {
+-    const resp = try root.http_util.httpRequestWithStatus(allocator, .DELETE, url, null, &.{auth_header}, null, proxy);
++fn curlDelete(allocator: std.mem.Allocator, url: []const u8, auth_header: []const u8, proxy: ?[]const u8, max_time: []const u8) !void {
++    // Bounded: deleteMessage and unsubscribe run on the poller path (inline
++    // dispatch), and httpRequestWithStatus takes the untimed std.http fallback
++    // for an Authorization header. The status-preserving variant keeps the body
++    // contract without dropping the bound.
++    const resp = try root.http_util.httpRequestWithStatusTimeout(allocator, .DELETE, url, null, &.{auth_header}, null, proxy, max_time);
+     allocator.free(resp.body);
+ }
+ 
+@@ -466,8 +498,8 @@ fn curlMultipartUpload(
+     try body.appendSlice(allocator, "--" ++ MAX_UPLOAD_BOUNDARY ++ "--\r\n");
+ 
+     const content_type = "multipart/form-data; boundary=" ++ MAX_UPLOAD_BOUNDARY;
+-    const resp = try root.http_util.httpRequestWithStatus(allocator, .POST, url, body.items, &.{auth_header}, content_type, proxy);
+-    return resp.body;
++    // Bounded: the media upload runs on the polling thread's reply-send path.
++    return root.http_util.httpRequestWithTimeout(allocator, .POST, url, body.items, &.{auth_header}, content_type, proxy, "120");
+ }
+ 
+ fn appendMaxMultipartFile(
+@@ -602,24 +634,87 @@ pub fn buildInlineKeyboardButtonsJson(
+ // Tests
+ // ════════════════════════════════════════════════════════════════════════════
+ 
++fn testClient() Client {
++    return .{ .allocator = std.testing.allocator, .bot_token = "test-token", .proxy = null };
++}
++
+ test "buildUrl without query" {
+     var buf: [256]u8 = undefined;
+-    const url = try Client.buildUrl(&buf, "/me", null);
++    const url = try testClient().buildUrl(&buf, "/me", null);
+     try std.testing.expectEqualStrings("https://platform-api.max.ru/me", url);
+ }
+ 
+ test "buildUrl with query params" {
+     var buf: [256]u8 = undefined;
+-    const url = try Client.buildUrl(&buf, "/messages", "chat_id=123");
++    const url = try testClient().buildUrl(&buf, "/messages", "chat_id=123");
+     try std.testing.expectEqualStrings("https://platform-api.max.ru/messages?chat_id=123", url);
+ }
+ 
+ test "buildUrl with compound query" {
+     var buf: [512]u8 = undefined;
+-    const url = try Client.buildUrl(&buf, "/updates", "timeout=30&types=message_created&marker=abc");
++    const url = try testClient().buildUrl(&buf, "/updates", "timeout=30&types=message_created&marker=abc");
+     try std.testing.expectEqualStrings("https://platform-api.max.ru/updates?timeout=30&types=message_created&marker=abc", url);
+ }
+ 
++const MaxStalledApiCtx = struct {
++    server: *std_compat.net.Server,
++    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
++};
++
++/// Accept one connection and hold it open without replying for up to ~8s: a
++/// silently-dropped socket (peer gone, no FIN/RST).
++fn serveMaxStalledApi(ctx: *MaxStalledApiCtx) void {
++    var conn = ctx.server.accept() catch return;
++    defer conn.stream.close();
++    const deadline = std_compat.time.nanoTimestamp() + 8 * std.time.ns_per_s;
++    while (!ctx.release.load(.acquire) and std_compat.time.nanoTimestamp() < deadline) {
++        std_compat.thread.sleep(5 * std.time.ns_per_ms);
++    }
++}
++
++// Regression for the Max poller path: editMessage streams message edits on the
++// poller thread (runMaxLoop dispatches inline), so a stalled socket must return
++// a bounded error. Drives the real call site (editMessage -> bounded transport):
++// reverting it to the untimed, unbounded curlPut makes it hang/ReadFailed.
++test "max editMessage returns a bounded error on a stalled socket" {
++    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
++
++    const allocator = std.testing.allocator;
++    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
++    var server = try addr.listen(.{});
++    defer server.deinit();
++
++    var ctx = MaxStalledApiCtx{ .server = &server };
++    const thread = try std.Thread.spawn(.{}, serveMaxStalledApi, .{&ctx});
++
++    var base_buf: [64]u8 = undefined;
++    const api_base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
++    const client = Client{
++        .allocator = allocator,
++        .bot_token = "test-token",
++        .proxy = "",
++        .api_base = api_base,
++        .stub = false,
++        .write_timeout = "2",
++    };
++
++    const start = std_compat.time.nanoTimestamp();
++    const result = client.editMessage(allocator, "mid-1", "{\"text\":\"x\"}");
++    const elapsed = std_compat.time.nanoTimestamp() - start;
++
++    if (result) |body| {
++        allocator.free(body);
++        return error.TestUnexpectedResult;
++    } else |err| {
++        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
++    }
++    // The bound must fire long before any TCP retransmit/keepalive timeout.
++    try std.testing.expect(elapsed < 6 * std.time.ns_per_s);
++
++    ctx.release.store(true, .release);
++    thread.join();
++}
++
+ test "authHeader uses raw token format required by Max" {
+     const client = Client{
+         .allocator = std.testing.allocator,
+diff --git a/src/channels/signal.zig b/src/channels/signal.zig
+index 38b8550..09ef4c6 100644
+--- a/src/channels/signal.zig
++++ b/src/channels/signal.zig
+@@ -452,7 +452,9 @@ pub const SignalChannel = struct {
+         const rpc_body = try body.toOwnedSlice(allocator);
+         defer allocator.free(rpc_body);
+ 
+-        const resp = root.http_util.curlPost(allocator, url, rpc_body, &.{}) catch |err| {
++        // Bounded: this runs on the signal polling thread (inside processEnvelope),
++        // so an untimed call could wedge the poller the way Telegram did.
++        const resp = root.http_util.curlPostWithProxy(allocator, url, rpc_body, &.{}, null, "15") catch |err| {
+             log.warn("Signal fetch attachment {s} failed: {}", .{ attachment_id, err });
+             return null;
+         };
+@@ -776,7 +778,7 @@ pub const SignalChannel = struct {
+         var url_buf: [1024]u8 = undefined;
+         const url = try self.rpcUrl(&url_buf);
+ 
+-        const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch |err| {
++        const resp = root.http_util.curlPostWithProxy(self.allocator, url, rpc_body, &.{}, null, "30") catch |err| {
+             log.warn("Signal RPC send failed: {}", .{err});
+             return err;
+         };
+@@ -815,7 +817,7 @@ pub const SignalChannel = struct {
+         var url_buf: [1024]u8 = undefined;
+         const url = try self.sendUrl(&url_buf);
+ 
+-        const resp = root.http_util.curlPost(self.allocator, url, rest_body, &.{}) catch |err| {
++        const resp = root.http_util.curlPostWithProxy(self.allocator, url, rest_body, &.{}, null, "60") catch |err| {
+             log.warn("Signal REST send failed: {}", .{err});
+             return err;
+         };
+@@ -859,7 +861,7 @@ pub const SignalChannel = struct {
+         var url_buf: [1024]u8 = undefined;
+         const url = self.rpcUrl(&url_buf) catch return;
+ 
+-        const resp = root.http_util.curlPost(self.allocator, url, rpc_body, &.{}) catch return;
++        const resp = root.http_util.curlPostWithProxy(self.allocator, url, rpc_body, &.{}, null, "10") catch return;
+         self.allocator.free(resp);
+     }
+ 
+diff --git a/src/channels/telegram.zig b/src/channels/telegram.zig
+index b5fd189..b963403 100644
+--- a/src/channels/telegram.zig
++++ b/src/channels/telegram.zig
+@@ -3608,6 +3608,9 @@ pub const TelegramChannel = struct {
+         /// reply still goes through `stripThinkBlocks`.
+         think_mode: streaming.ThinkMode = .strip,
+         filter: streaming.TagFilter = .{},
++        /// Poller progress heartbeat, bumped on every streamed chunk so a
++        /// long-but-streaming turn is never mistaken for a stall.
++        heartbeat: ?*Atomic(i64) = null,
+ 
+         pub fn deinit(self: *StreamCtx) void {
+             self.filter.deinit();
+@@ -3617,6 +3620,7 @@ pub const TelegramChannel = struct {
+     fn streamCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
+         if (event.stage != .chunk or event.text.len == 0) return;
+         const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
++        if (ctx.heartbeat) |h| h.store(std_compat.time.timestamp(), .release);
+         ctx.tg_ptr.sendDraftChunkForTurn(ctx.chat_id, ctx.draft_id, event.text) catch {};
+     }
+ 
+diff --git a/src/channels/telegram_api.zig b/src/channels/telegram_api.zig
+index 13dc86a..3f42bcf 100644
+--- a/src/channels/telegram_api.zig
++++ b/src/channels/telegram_api.zig
+@@ -1,7 +1,10 @@
+ const std = @import("std");
+ const std_compat = @import("compat");
++const builtin = @import("builtin");
+ const root = @import("root.zig");
+ 
++const log = std.log.scoped(.telegram_api);
++
+ pub const SentMessageMeta = struct {
+     message_id: ?i64 = null,
+ };
+@@ -23,10 +26,13 @@ pub const Client = struct {
+     allocator: std.mem.Allocator,
+     bot_token: []const u8,
+     proxy: ?[]const u8,
++    /// Bot API base URL. Defaults to the public API; override to point at a
++    /// self-hosted Bot API server (or a local stub in tests).
++    api_base: []const u8 = "https://api.telegram.org",
+ 
+     pub fn apiUrl(self: Client, buf: []u8, method: []const u8) ![]const u8 {
+         var w: std.Io.Writer = .fixed(buf);
+-        try w.print("https://api.telegram.org/bot{s}/{s}", .{ self.bot_token, method });
++        try w.print("{s}/bot{s}/{s}", .{ self.api_base, self.bot_token, method });
+         return w.buffered();
+     }
+ 
+@@ -262,10 +268,13 @@ pub const Client = struct {
+     }
+ 
+     pub fn downloadFile(self: Client, allocator: std.mem.Allocator, file_path: []const u8, timeout: []const u8) ![]u8 {
+-        _ = timeout;
+         var url_buf: [1024]u8 = undefined;
+         const url = try self.fileUrl(&url_buf, file_path);
+-        return root.http_util.httpGetWithProxy(allocator, url, &.{}, self.proxy);
++        // Bound the media download too: it runs on the poller (or turn) thread
++        // and must not park on a stalled socket. Use the large download cap, not
++        // the 4 MiB GET default, so documents/audio/photo up to the Bot API's
++        // ~20 MB limit still download.
++        return root.http_util.httpGetWithProxyTimeout(allocator, url, &.{}, self.proxy, timeout, root.http_util.DEFAULT_CURL_DOWNLOAD_MAX_BYTES);
+     }
+ 
+     pub fn postMultipart(
+@@ -312,21 +321,37 @@ pub const Client = struct {
+         try body.appendSlice(allocator, "--" ++ boundary ++ "--\r\n");
+ 
+         const content_type = "multipart/form-data; boundary=" ++ boundary;
+-        const resp = try root.http_util.httpRequest(allocator, .POST, url, body.items, &.{}, content_type, self.proxy);
++        // Media uploads can be large; give them a generous but hard bound so a
++        // stalled socket cannot wedge the sending thread.
++        const resp = try root.http_util.httpRequestWithTimeout(allocator, .POST, url, body.items, &.{}, content_type, self.proxy, "120");
+         defer allocator.free(resp);
+         if (responseHasTelegramError(resp)) return error.TelegramApiError;
+     }
+ 
+     fn post(self: Client, allocator: std.mem.Allocator, method: []const u8, body: []const u8, timeout: []const u8) ![]u8 {
+-        _ = timeout;
+         var url_buf: [512]u8 = undefined;
+         const url = try self.apiUrl(&url_buf, method);
+-        return root.http_util.httpPostJsonWithProxy(allocator, url, body, &.{}, self.proxy);
++        // Bound every Bot API call. `getUpdates` long-polls for up to 30s, and
++        // the untimed std.http client would park the polling thread forever if
++        // the connection is silently dropped; curl's `--max-time` returns
++        // error.CurlTimeout instead, which the polling loop retries.
++        return root.http_util.httpPostJsonWithProxyTimeout(allocator, url, body, &.{}, self.proxy, timeout) catch |err| {
++            // Name the method and its bound so a stalled call is identifiable
++            // from logs (the incident left no record of which call hung). A
++            // getUpdates long-poll that merely times out is benign and can
++            // happen every poll cycle on a slow link, so it stays out of WARN.
++            if (err == error.CurlTimeout and std.mem.eql(u8, method, "getUpdates")) {
++                log.debug("telegram getUpdates timed out after {s}s", .{timeout});
++            } else {
++                log.warn("telegram {s} failed (max-time {s}s): {}", .{ method, timeout, err });
++            }
++            return err;
++        };
+     }
+ 
+     fn fileUrl(self: Client, buf: []u8, file_path: []const u8) ![]const u8 {
+         var w: std.Io.Writer = .fixed(buf);
+-        try w.print("https://api.telegram.org/file/bot{s}/{s}", .{ self.bot_token, file_path });
++        try w.print("{s}/file/bot{s}/{s}", .{ self.api_base, self.bot_token, file_path });
+         return w.buffered();
+     }
+ };
+@@ -569,6 +594,78 @@ test "telegram api client builds method url" {
+     try std.testing.expectEqualStrings("https://api.telegram.org/bot123:ABC/getUpdates", url);
+ }
+ 
++test "telegram api client honors a custom base url" {
++    const client = Client{
++        .allocator = std.testing.allocator,
++        .bot_token = "123:ABC",
++        .proxy = null,
++        .api_base = "http://127.0.0.1:8081",
++    };
++    var buf: [256]u8 = undefined;
++    const url = try client.apiUrl(&buf, "getUpdates");
++    try std.testing.expectEqualStrings("http://127.0.0.1:8081/bot123:ABC/getUpdates", url);
++}
++
++const StalledApiCtx = struct {
++    server: *std_compat.net.Server,
++    release: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
++};
++
++/// Accept one connection and hold it open without replying for up to ~8s, then
++/// close: the incident's silently-dropped `getUpdates` socket (peer gone, no
++/// FIN/RST). `release` lets the test end the hold early once the request
++/// returned.
++fn serveStalledApi(ctx: *StalledApiCtx) void {
++    var conn = ctx.server.accept() catch return;
++    defer conn.stream.close();
++    const deadline = std_compat.time.nanoTimestamp() + 8 * std.time.ns_per_s;
++    while (!ctx.release.load(.acquire) and std_compat.time.nanoTimestamp() < deadline) {
++        std_compat.thread.sleep(5 * std.time.ns_per_ms);
++    }
++}
++
++// Regression for the incident: `Client.getUpdates` runs on the Telegram polling
++// thread, so a stalled Bot API socket must return a bounded error instead of
++// parking the poller until TCP keepalive (default 2h). This drives the real
++// call site (`getUpdates` -> `post`), not just the bounded transport helper, so
++// reverting `post` to the untimed std.http client makes it fail.
++test "telegram getUpdates returns a bounded error on a stalled socket" {
++    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
++
++    const allocator = std.testing.allocator;
++    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
++    var server = try addr.listen(.{});
++    defer server.deinit();
++
++    var ctx = StalledApiCtx{ .server = &server };
++    const thread = try std.Thread.spawn(.{}, serveStalledApi, .{&ctx});
++
++    var base_buf: [64]u8 = undefined;
++    const api_base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
++    const client = Client{
++        .allocator = allocator,
++        .bot_token = "123:ABC",
++        .proxy = "",
++        .api_base = api_base,
++    };
++
++    const start = std_compat.time.nanoTimestamp();
++    const result = client.getUpdates(allocator, "{\"timeout\":30}", "2");
++    const elapsed = std_compat.time.nanoTimestamp() - start;
++
++    if (result) |body| {
++        allocator.free(body);
++        return error.TestUnexpectedResult;
++    } else |err| {
++        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
++    }
++    // The bound must fire long before any TCP retransmit/keepalive timeout.
++    try std.testing.expect(elapsed < 6 * std.time.ns_per_s);
++
++    ctx.release.store(true, .release);
++    thread.join();
++}
++
+ test "telegram api responseHasTelegramError matches error payloads" {
+     try std.testing.expect(responseHasTelegramError("{\"ok\":false,\"error_code\":400}"));
+     try std.testing.expect(!responseHasTelegramError("{\"ok\":true,\"result\":{}}"));
+diff --git a/src/channels/weixin.zig b/src/channels/weixin.zig
+index 8f7d506..c9f1f40 100644
+--- a/src/channels/weixin.zig
++++ b/src/channels/weixin.zig
+@@ -12,7 +12,12 @@ const ILINK_CLIENT_VERSION = "131329"; // 2.1.1 encoded as 0x00020101
+ const CHANNEL_VERSION = "2.1.1";
+ const WEIXIN_REPLY_TARGET_SEPARATOR: u8 = 0x1f;
+ const SEND_TIMEOUT_SECS = "15";
+-const GET_UPDATES_TIMEOUT_SECS = "35";
++/// Headroom over the server's long-poll so a normal empty poll returns before
++/// curl's `--max-time` fires: a bound at or below the long poll would turn
++/// every poll into error.CurlTimeout and spin the poller. The request carries
++/// no explicit long-poll timeout, so the margin is a guess pending the API's
++/// documented default.
++const GET_UPDATES_TIMEOUT_SECS = "45";
+ const GET_UPDATES_ITEM_TYPE_TEXT: u8 = 1;
+ const GET_UPDATES_ITEM_TYPE_VOICE: u8 = 3;
+ const MESSAGE_TYPE_BOT: u8 = 2;
+@@ -174,17 +179,22 @@ pub const WeixinChannel = struct {
+         var headers = try AuthHeaderSet.init(self.allocator, token);
+         defer headers.deinit(self.allocator);
+ 
+-        const resp_body = root.http_util.curlPostWithProxy(
++        // Bounded: the reply send runs inline on the poller thread, and
++        // curlPostWithProxy drops the timeout for this credentialed request.
++        const resp = root.http_util.httpRequestWithStatusTimeout(
+             self.allocator,
++            .POST,
+             url,
+             payload.items,
+             &headers.headers,
++            "application/json",
+             self.config.proxy,
+             SEND_TIMEOUT_SECS,
+         ) catch |err| switch (err) {
+             error.OutOfMemory => return err,
+             else => return error.WeixinApiError,
+         };
++        const resp_body = resp.body;
+         defer self.allocator.free(resp_body);
+ 
+         try ensureApiResponseOk(self.allocator, resp_body);
+@@ -204,17 +214,23 @@ pub const WeixinChannel = struct {
+         var headers = try AuthHeaderSet.init(self.allocator, self.config.token);
+         defer headers.deinit(self.allocator);
+ 
+-        const resp_body = root.http_util.curlPostWithProxy(
++        // Bounded: this is the poller's long poll, and curlPostWithProxy would
++        // silently drop the timeout for this credentialed request (it falls back
++        // to the untimed std.http client for an Authorization header).
++        const resp = root.http_util.httpRequestWithStatusTimeout(
+             self.allocator,
++            .POST,
+             url,
+             payload.items,
+             &headers.headers,
++            "application/json",
+             self.config.proxy,
+             GET_UPDATES_TIMEOUT_SECS,
+         ) catch |err| switch (err) {
+             error.OutOfMemory => return err,
+             else => return error.WeixinApiError,
+         };
++        const resp_body = resp.body;
+         defer self.allocator.free(resp_body);
+ 
+         var parsed = try parseGetUpdatesResponse(allocator, resp_body, self.config.allow_from);
+diff --git a/src/http_util.zig b/src/http_util.zig
+index a44b90d..6d0b442 100644
+--- a/src/http_util.zig
++++ b/src/http_util.zig
+@@ -15,7 +15,7 @@ const platform = @import("platform.zig");
+ 
+ const log = std.log.scoped(.http_util);
+ threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
+-const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
++pub const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
+ const DEFAULT_CURL_POST_MAX_BYTES: usize = 8 * 1024 * 1024;
+ const MAX_CURL_STDERR_BYTES: usize = 16 * 1024;
+ const MAX_CURL_RESPONSE_HEADERS_BYTES: usize = 64 * 1024;
+@@ -953,6 +953,119 @@ pub fn httpGetWithProxy(
+     return httpRequest(allocator, .GET, url, null, headers, null, proxy);
+ }
+ 
++/// HTTP POST JSON with a hard `--max-time` bound, via the curl subprocess.
++///
++/// The `std.http` path has no client-side socket timeout in Zig 0.16, so a
++/// request whose TCP connection is silently dropped (no FIN/RST) parks the
++/// reader until the kernel's TCP keepalive fires - the incident where
++/// Telegram's 30s `getUpdates` long poll froze the polling thread for the rest
++/// of the process lifetime. curl's `--max-time` turns that stall into
++/// `error.CurlTimeout`, which the caller can retry. `max_time` is a decimal
++/// seconds string (e.g. `"45"`).
++pub fn httpPostJsonWithProxyTimeout(
++    allocator: Allocator,
++    url: []const u8,
++    body: []const u8,
++    headers: []const []const u8,
++    proxy: ?[]const u8,
++    max_time: []const u8,
++) ![]u8 {
++    return httpRequestWithTimeout(allocator, .POST, url, body, headers, "application/json", proxy, max_time);
++}
++
++/// Response-size cap for a bounded GET that streams large media. Telegram's
++/// `getFile` serves documents up to ~20 MB (a self-hosted Bot API server more),
++/// so `DEFAULT_CURL_GET_MAX_BYTES` (4 MiB) would silently drop them.
++pub const DEFAULT_CURL_DOWNLOAD_MAX_BYTES: usize = 64 * 1024 * 1024;
++
++/// HTTP GET with a hard `--max-time` bound and an explicit response-size cap,
++/// via the curl subprocess. See `httpPostJsonWithProxyTimeout` for why the
++/// poller path must not use the untimed `std.http` client.
++///
++/// Unlike `curlGetWithProxy` this neither falls back to the untimed std.http
++/// client for a credentialed request nor sets curl `--fail`: the bound must
++/// always hold, and a non-2xx stays `error.HttpStatusError` (matching
++/// `httpRequest`) instead of curl exit 22's `error.CurlFailed`.
++pub fn httpGetWithProxyTimeout(
++    allocator: Allocator,
++    url: []const u8,
++    headers: []const []const u8,
++    proxy: ?[]const u8,
++    max_time: []const u8,
++    max_bytes: usize,
++) ![]u8 {
++    const resp = try secureCurlRequestWithStatusAndHeaders(allocator, .{
++        .method = .GET,
++        .url = url,
++        .headers = headers,
++        .proxy = proxy,
++        .max_time = max_time,
++        .max_response_bytes = max_bytes,
++    });
++    allocator.free(resp.headers);
++    errdefer allocator.free(resp.body);
++    if (resp.status_code < 200 or resp.status_code >= 300) return error.HttpStatusError;
++    return resp.body;
++}
++
++/// HTTP request with an explicit content type and a hard `--max-time` bound,
++/// via the curl subprocess. Mirrors `httpRequest` (non-2xx is an error) but
++/// cannot block indefinitely on a stalled socket.
++pub fn httpRequestWithTimeout(
++    allocator: Allocator,
++    method: std.http.Method,
++    url: []const u8,
++    body: ?[]const u8,
++    headers: []const []const u8,
++    content_type: ?[]const u8,
++    proxy: ?[]const u8,
++    max_time: []const u8,
++) ![]u8 {
++    const resp = try curlRequestWithStatusAndHeaders(allocator, .{
++        .method = method,
++        .url = url,
++        .body = body,
++        .headers = headers,
++        .content_type = content_type,
++        .proxy = proxy,
++        .max_time = max_time,
++    });
++    allocator.free(resp.headers);
++    errdefer allocator.free(resp.body);
++    // Mirror `httpRequest` exactly: a non-2xx response is error.HttpStatusError,
++    // not curl --fail's error.CurlFailed, so callers see the same error identity.
++    if (resp.status_code < 200 or resp.status_code >= 300) return error.HttpStatusError;
++    return resp.body;
++}
++
++/// HTTP request with a hard `--max-time` bound that returns the status code and
++/// body instead of failing on a non-2xx. Mirrors `httpRequestWithStatus` (used
++/// by channels that inspect the body for an error payload) but goes through the
++/// bounded curl path, so it neither blocks on a stalled socket nor drops the
++/// bound through `curlRequestWithProxy`'s credentialed std.http fallback.
++pub fn httpRequestWithStatusTimeout(
++    allocator: Allocator,
++    method: std.http.Method,
++    url: []const u8,
++    body: ?[]const u8,
++    headers: []const []const u8,
++    content_type: ?[]const u8,
++    proxy: ?[]const u8,
++    max_time: []const u8,
++) !HttpResponse {
++    const resp = try curlRequestWithStatusAndHeaders(allocator, .{
++        .method = method,
++        .url = url,
++        .body = body,
++        .headers = headers,
++        .content_type = content_type,
++        .proxy = proxy,
++        .max_time = max_time,
++    });
++    allocator.free(resp.headers);
++    return .{ .status_code = resp.status_code, .body = resp.body };
++}
++
+ const proxy_env_var_names = [_][]const u8{
+     "http_proxy",
+     "HTTP_PROXY",
+@@ -2633,3 +2746,247 @@ test "initClientDefaultProxiesFromEnvMap parses proxy settings" {
+     try std.testing.expect(client.http_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-http.example")));
+     try std.testing.expect(client.https_proxy.?.host.eql(try std.Io.net.HostName.init("proxy-https.example")));
+ }
++
++const StalledSocketCtx = struct {
++    server: *std_compat.net.Server,
++    accepted: AtomicBool = AtomicBool.init(false),
++    release: AtomicBool = AtomicBool.init(false),
++};
++
++/// Accept one connection and never reply, holding the socket open. This is the
++/// incident's stalled `getUpdates` socket: the peer is gone but no FIN/RST ever
++/// arrives, so an untimed read blocks until TCP keepalive (default 2h).
++fn serveStalledSocket(ctx: *StalledSocketCtx) void {
++    var conn = ctx.server.accept() catch return;
++    defer conn.stream.close();
++    ctx.accepted.store(true, .release);
++    while (!ctx.release.load(.acquire)) std_compat.thread.sleep(5 * std.time.ns_per_ms);
++}
++
++// Regression: a Telegram-style long poll whose socket is silently dropped must
++// return a timeout error instead of hanging the polling thread forever - the
++// untimed `std.http` client has no read timeout in Zig 0.16. The bounded helper
++// must enforce curl's `--max-time`.
++test "bounded http post times out instead of hanging on a stalled socket" {
++    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
++
++    const allocator = std.testing.allocator;
++    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
++    var server = try addr.listen(.{});
++    defer server.deinit();
++
++    var ctx = StalledSocketCtx{ .server = &server };
++    const thread = try std.Thread.spawn(.{}, serveStalledSocket, .{&ctx});
++
++    const url = try std.fmt.allocPrint(
++        allocator,
++        "http://127.0.0.1:{d}/bot-test-token/getUpdates",
++        .{server.listen_address.in.getPort()},
++    );
++    defer allocator.free(url);
++
++    const start = std_compat.time.nanoTimestamp();
++    const result = httpPostJsonWithProxyTimeout(allocator, url, "{\"timeout\":30}", &.{}, "", "2");
++    const elapsed = std_compat.time.nanoTimestamp() - start;
++
++    if (result) |body| {
++        allocator.free(body);
++        return error.TestUnexpectedResult;
++    } else |err| {
++        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
++    }
++    // The bound must fire long before any TCP retransmit/keepalive timeout.
++    try std.testing.expect(elapsed < 10 * std.time.ns_per_s);
++
++    ctx.release.store(true, .release);
++    thread.join();
++}
++
++const FixedHttpResponseCtx = struct {
++    server: *std_compat.net.Server,
++    status_line: []const u8,
++    body: []const u8,
++};
++
++/// Accept one connection, drain the request, and reply with a fixed status line
++/// and body. `Connection: close` lets curl finish the response.
++fn serveFixedHttpResponse(ctx: *FixedHttpResponseCtx) void {
++    var conn = ctx.server.accept() catch return;
++    defer conn.stream.close();
++    var req_buf: [4096]u8 = undefined;
++    _ = conn.stream.read(&req_buf) catch {};
++    var head_buf: [256]u8 = undefined;
++    const head = std.fmt.bufPrint(&head_buf, "{s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ ctx.status_line, ctx.body.len }) catch return;
++    conn.stream.writeAll(head) catch {};
++    conn.stream.writeAll(ctx.body) catch {};
++}
++
++// Regression: the bounded GET must keep `httpRequest`'s error identity - a
++// non-2xx is `error.HttpStatusError`, not curl `--fail`'s `error.CurlFailed`.
++test "bounded http get maps a non-2xx to HttpStatusError" {
++    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
++
++    const allocator = std.testing.allocator;
++    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
++    var server = try addr.listen(.{});
++    defer server.deinit();
++
++    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 404 Not Found", .body = "" };
++    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
++
++    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/missing", .{server.listen_address.in.getPort()});
++    defer allocator.free(url);
++
++    const result = httpGetWithProxyTimeout(allocator, url, &.{}, "", "5", 1024);
++    thread.join();
++
++    if (result) |body| {
++        allocator.free(body);
++        return error.TestUnexpectedResult;
++    } else |err| {
++        try std.testing.expectEqual(@as(anyerror, error.HttpStatusError), err);
++    }
++}
++
++// Regression: the bounded status-preserving request must keep httpRequestWithStatus'
++// contract - a non-2xx is returned with its body (not turned into an error) - so
++// Weixin can still read the error payload, unlike httpRequestWithTimeout.
++test "bounded http request with status preserves a non-2xx body" {
++    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
++
++    const allocator = std.testing.allocator;
++    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
++    var server = try addr.listen(.{});
++    defer server.deinit();
++
++    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 401 Unauthorized", .body = "{\"error\":\"nope\"}" };
++    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
++
++    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/guarded", .{server.listen_address.in.getPort()});
++    defer allocator.free(url);
++
++    const resp = httpRequestWithStatusTimeout(allocator, .DELETE, url, null, &.{}, null, "", "5") catch return error.TestUnexpectedResult;
++    thread.join();
++    defer allocator.free(resp.body);
++
++    try std.testing.expectEqual(@as(u16, 401), resp.status_code);
++    try std.testing.expectEqualStrings("{\"error\":\"nope\"}", resp.body);
++}
++
++// Regression: the bounded GET must enforce its size cap, so a caller that needs
++// a larger body (a media download) has to opt into a bigger cap explicitly
++// rather than silently truncating.
++test "bounded http get enforces the response size cap" {
++    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
++
++    const allocator = std.testing.allocator;
++    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
++    var server = try addr.listen(.{});
++    defer server.deinit();
++
++    const big_body = try allocator.alloc(u8, 4096);
++    defer allocator.free(big_body);
++    @memset(big_body, 'x');
++
++    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 200 OK", .body = big_body };
++    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
++
++    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/doc", .{server.listen_address.in.getPort()});
++    defer allocator.free(url);
++
++    const result = httpGetWithProxyTimeout(allocator, url, &.{}, "", "5", 64);
++    thread.join();
++
++    if (result) |body| {
++        allocator.free(body);
++        return error.TestUnexpectedResult;
++    } else |err| {
++        try std.testing.expectEqual(@as(anyerror, error.CurlReadError), err);
++    }
++}
++
++const StalledCredentialCtx = struct {
++    server: *std_compat.net.Server,
++    release: AtomicBool = AtomicBool.init(false),
++};
++
++fn serveStalledCredential(ctx: *StalledCredentialCtx) void {
++    var conn = ctx.server.accept() catch return;
++    defer conn.stream.close();
++    const deadline = std_compat.time.nanoTimestamp() + 10 * std.time.ns_per_s;
++    while (!ctx.release.load(.acquire) and std_compat.time.nanoTimestamp() < deadline) {
++        std_compat.thread.sleep(5 * std.time.ns_per_ms);
++    }
++}
++
++// Regression: a credentialed request must not silently fall back to the untimed
++// std.http client (`curlRequestWithProxy` does exactly that, dropping the bound).
++// A stalled socket with an Authorization header must still return error.CurlTimeout.
++test "bounded http request keeps the timeout for a credentialed request" {
++    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
++
++    const allocator = std.testing.allocator;
++    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
++    var server = try addr.listen(.{});
++    defer server.deinit();
++
++    var ctx = StalledCredentialCtx{ .server = &server };
++    const thread = try std.Thread.spawn(.{}, serveStalledCredential, .{&ctx});
++
++    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/join", .{server.listen_address.in.getPort()});
++    defer allocator.free(url);
++
++    const headers = [_][]const u8{"Authorization: Bearer secret-token"};
++    const start = std_compat.time.nanoTimestamp();
++    const result = httpRequestWithTimeout(allocator, .POST, url, "{}", &headers, "application/json", "", "2");
++    const elapsed = std_compat.time.nanoTimestamp() - start;
++
++    if (result) |body| {
++        allocator.free(body);
++        return error.TestUnexpectedResult;
++    } else |err| {
++        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
++    }
++    try std.testing.expect(elapsed < 6 * std.time.ns_per_s);
++
++    ctx.release.store(true, .release);
++    thread.join();
++}
++
++// Regression: the status-preserving bounded request (the Matrix poller's
++// /sync long poll routes through it) must keep the timeout for a credentialed
++// GET instead of falling back to the untimed std.http client.
++test "bounded status request keeps the timeout for a credentialed get" {
++    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
++
++    const allocator = std.testing.allocator;
++    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
++    var server = try addr.listen(.{});
++    defer server.deinit();
++
++    var ctx = StalledCredentialCtx{ .server = &server };
++    const thread = try std.Thread.spawn(.{}, serveStalledCredential, .{&ctx});
++
++    const url = try std.fmt.allocPrint(
++        allocator,
++        "http://127.0.0.1:{d}/_matrix/client/v3/sync?timeout=30000",
++        .{server.listen_address.in.getPort()},
++    );
++    defer allocator.free(url);
++
++    const headers = [_][]const u8{"Authorization: Bearer secret-token"};
++    const start = std_compat.time.nanoTimestamp();
++    const result = httpRequestWithStatusTimeout(allocator, .GET, url, null, &headers, null, null, "2");
++    const elapsed = std_compat.time.nanoTimestamp() - start;
++
++    if (result) |resp| {
++        allocator.free(resp.body);
++        return error.TestUnexpectedResult;
++    } else |err| {
++        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
++    }
++    try std.testing.expect(elapsed < 6 * std.time.ns_per_s);
++
++    ctx.release.store(true, .release);
++    thread.join();
++}
+diff --git a/src/voice.zig b/src/voice.zig
+index e48ba65..e747140 100644
+--- a/src/voice.zig
++++ b/src/voice.zig
+@@ -491,7 +491,10 @@ fn getFilePath(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []c
+     try json_util.appendJsonString(&body_list, allocator, file_id);
+     try body_list.appendSlice(allocator, "}");
+ 
+-    const resp = try http_util.curlPost(allocator, url, body_list.items, &.{});
++    // Bound this Bot API call: it runs on the Telegram poller thread (voice
++    // transcription happens inside pollUpdates), so a stalled socket must not
++    // park the poller. The untimed curlPost had no --max-time.
++    const resp = try http_util.curlPostWithProxy(allocator, url, body_list.items, &.{}, null, "15");
+     defer allocator.free(resp);
+ 
+     // Parse response
+-- 
+2.56.0
+

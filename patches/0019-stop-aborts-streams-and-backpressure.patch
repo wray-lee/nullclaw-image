@@ -1,0 +1,1462 @@
+From 2e487d7cd44d8497588ab35821ea3c6b68406e20 Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Sat, 17 Oct 2026 00:32:05 +0900
+Subject: [PATCH] fix(stop): abort in-flight provider streams and backpressure
+ chunk publishing
+
+`/stop` now raises an interrupt flag the blocking provider request observes, so
+every route (reliable, codex, gemini, sse/curl) aborts its in-flight stream
+promptly instead of finishing the turn. Stream-chunk publishing is bounded:
+a full outbound queue returns Timeout instead of parking the turn, and a stopped
+turn's queued chunks are dropped and its stop marker cleared. Slack streamed
+deltas are throttled to the presenter's one-flush-per-interval minimum.
+---
+ src/agent/root.zig                      | 180 ++++++++++++++++++++++-
+ src/bus.zig                             |  33 +++++
+ src/channels/root.zig                   |   8 ++
+ src/channels/slack.zig                  | 126 ++++++++++++++++-
+ src/channels/slack_stream_presenter.zig |  51 ++++++-
+ src/daemon.zig                          | 181 ++++++++++++++++++++++--
+ src/http_util.zig                       |  38 +++++
+ src/providers/gemini.zig                |  35 ++++-
+ src/providers/openai_codex.zig          |  38 ++++-
+ src/providers/reliable.zig              |  30 +++-
+ src/providers/sse.zig                   | 144 +++++++++++++++++--
+ src/session.zig                         |  36 +++++
+ 12 files changed, 856 insertions(+), 44 deletions(-)
+
+diff --git a/src/agent/root.zig b/src/agent/root.zig
+index 6e8447a..119f698 100644
+--- a/src/agent/root.zig
++++ b/src/agent/root.zig
+@@ -96,6 +96,14 @@ pub const DrainCallback = *const fn (ctx: *anyopaque, allocator: std.mem.Allocat
+ // Agent
+ // ═══════════════════════════════════════════════════════════════════════════
+ 
++/// True when `err` is a user-initiated /stop rather than a provider failure.
++/// `error.Interrupted` is the streaming cancel path; `error.CurlInterrupted`
++/// is raised by the blocking curl transport when the interrupt watcher kills
++/// the child, so both must end the turn instead of being retried or reported.
++fn isInterruptError(err: anyerror) bool {
++    return err == error.Interrupted or err == error.CurlInterrupted;
++}
++
+ pub const Agent = struct {
+     const TextPreview = struct {
+         slice: []const u8,
+@@ -2260,12 +2268,14 @@ pub const Agent = struct {
+             var response: ChatResponse = undefined;
+             var response_attempt: u32 = 1;
+             providers.clearLastApiErrorDetail();
++            // Expose the agent interrupt flag to the provider call so /stop can
++            // abort an in-flight generation. The streaming path kills the curl
++            // child from curlStream; the blocking path's curl request is killed
++            // the same way, so a stop reaches every provider route, not only the
++            // streaming one.
++            @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
++            defer @import("../http_util.zig").setThreadInterruptFlag(null);
+             if (is_streaming) {
+-                // Expose the agent interrupt flag to the provider stream so /stop
+-                // can abort an in-flight generation (curlStream kills the curl
+-                // child, which unblocks the read loop).
+-                @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
+-                defer @import("../http_util.zig").setThreadInterruptFlag(null);
+                 self.recordLlmRequestEvent(turn_model_name, messages);
+                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
+                 const stream_result = self.provider.streamChat(
+@@ -2292,7 +2302,7 @@ pub const Agent = struct {
+                     // failure: end the turn with the normal interrupt reply
+                     // rather than recording a failure, retrying, or surfacing a
+                     // generic provider error to the channel.
+-                    if (err == error.Interrupted) return self.interruptedReply();
++                    if (isInterruptError(err)) return self.interruptedReply();
+ 
+                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
+                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
+@@ -2335,7 +2345,7 @@ pub const Agent = struct {
+                             // retry stream is running. End the turn with the
+                             // interrupt reply instead of surfacing the raw error
+                             // and degrading the route for a user-initiated stop.
+-                            if (retry_err == error.Interrupted) return self.interruptedReply();
++                            if (isInterruptError(retry_err)) return self.interruptedReply();
+                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                             self.emitUsageFailure(turn_model_name);
+                             return retry_err;
+@@ -2378,6 +2388,12 @@ pub const Agent = struct {
+                     turn_model_name,
+                     self.temperature,
+                 ) catch |err| retry_blk: {
++                    // /stop aborted the blocking provider request (curlInterrupted)
++                    // or the stream before it produced output (Interrupted). End
++                    // the turn with the interrupt reply instead of recording a
++                    // failure, retrying, or surfacing a provider error.
++                    if (isInterruptError(err)) return self.interruptedReply();
++
+                     // Record the failed attempt
+                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
+                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
+@@ -2414,6 +2430,7 @@ pub const Agent = struct {
+                             turn_model_name,
+                             self.temperature,
+                         ) catch |retry_err| {
++                            if (isInterruptError(retry_err)) return self.interruptedReply();
+                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                             self.emitUsageFailure(turn_model_name);
+                             return retry_err;
+@@ -2453,6 +2470,7 @@ pub const Agent = struct {
+                             turn_model_name,
+                             self.temperature,
+                         ) catch |retry_after_compact_err| {
++                            if (isInterruptError(retry_after_compact_err)) return self.interruptedReply();
+                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
+                             self.emitUsageFailure(turn_model_name);
+                             return retry_after_compact_err;
+@@ -2486,6 +2504,7 @@ pub const Agent = struct {
+                         turn_model_name,
+                         self.temperature,
+                     ) catch |retry_err| {
++                        if (isInterruptError(retry_err)) return self.interruptedReply();
+                         // Context exhaustion recovery: if we have enough history,
+                         // force-compress and retry once more
+                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
+@@ -2516,6 +2535,7 @@ pub const Agent = struct {
+                                 turn_model_name,
+                                 self.temperature,
+                             ) catch |retry_after_compact_err| {
++                                if (isInterruptError(retry_after_compact_err)) return self.interruptedReply();
+                                 if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
+                                 self.emitUsageFailure(turn_model_name);
+                                 return retry_after_compact_err;
+@@ -11867,6 +11887,152 @@ test "Agent ends the turn with the interrupt reply when /stop lands during the v
+     try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+ }
+ 
++test "Agent exposes the interrupt flag to the blocking provider request" {
++    const allocator = std.testing.allocator;
++    const http_util = @import("../http_util.zig");
++
++    const FlagProbeProvider = struct {
++        saw_flag: bool = false,
++
++        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return allocator_.dupe(u8, "ok");
++        }
++
++        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++            const self: *@This() = @ptrCast(@alignCast(ptr));
++            // Regression: a turn without a stream sink takes the blocking branch,
++            // which used to run without installing the interrupt flag, so a /stop
++            // could not abort the in-flight provider request.
++            self.saw_flag = http_util.currentThreadInterruptFlag() != null;
++            return .{
++                .content = try allocator_.dupe(u8, "done"),
++                .tool_calls = &.{},
++                .usage = .{},
++            };
++        }
++
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return false;
++        }
++        fn supportsStreaming(_: *anyopaque) bool {
++            return false;
++        }
++        fn getName(_: *anyopaque) []const u8 {
++            return "flag-probe";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++
++    var provider_state = FlagProbeProvider{};
++    const provider_vtable = Provider.VTable{
++        .chatWithSystem = FlagProbeProvider.chatWithSystem,
++        .chat = FlagProbeProvider.chat,
++        .supportsNativeTools = FlagProbeProvider.supportsNativeTools,
++        .getName = FlagProbeProvider.getName,
++        .deinit = FlagProbeProvider.deinitFn,
++        .supports_streaming = FlagProbeProvider.supportsStreaming,
++    };
++    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    const runtime_tools = [_]Tool{
++        try makeMockFilterTool(allocator, "shell"),
++    };
++    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
++
++    var cfg = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "openai/gpt-4.1-mini",
++        .allocator = allocator,
++    };
++    cfg.agent.max_tool_iterations = 2;
++    var noop = observability.NoopObserver{};
++    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("hello");
++    defer allocator.free(response);
++
++    try std.testing.expect(provider_state.saw_flag);
++}
++
++test "Agent ends a blocking turn when /stop aborts the provider request" {
++    const allocator = std.testing.allocator;
++    const http_util = @import("../http_util.zig");
++
++    const BlockingInterruptProvider = struct {
++        calls: usize = 0,
++
++        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return allocator_.dupe(u8, "ok");
++        }
++
++        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
++            const self: *@This() = @ptrCast(@alignCast(ptr));
++            self.calls += 1;
++            // Stand in for a request that never ends on its own: the blocking
++            // curl transport is killed by the interrupt watcher, which only
++            // exists when the agent exposed the flag on this thread. The watcher
++            // kill surfaces as error.CurlInterrupted, which must end the turn
++            // with the interrupt reply (no retry, no generic provider error).
++            if (http_util.currentThreadInterruptFlag()) |flag| {
++                const writable: *std.atomic.Value(bool) = @constCast(flag);
++                writable.store(true, .release);
++                return error.CurlInterrupted;
++            }
++            return .{
++                .content = try allocator_.dupe(u8, "completed without interrupt"),
++                .tool_calls = &.{},
++                .usage = .{},
++            };
++        }
++
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return false;
++        }
++        fn supportsStreaming(_: *anyopaque) bool {
++            return false;
++        }
++        fn getName(_: *anyopaque) []const u8 {
++            return "blocking-interrupt";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++
++    var provider_state = BlockingInterruptProvider{};
++    const provider_vtable = Provider.VTable{
++        .chatWithSystem = BlockingInterruptProvider.chatWithSystem,
++        .chat = BlockingInterruptProvider.chat,
++        .supportsNativeTools = BlockingInterruptProvider.supportsNativeTools,
++        .getName = BlockingInterruptProvider.getName,
++        .deinit = BlockingInterruptProvider.deinitFn,
++        .supports_streaming = BlockingInterruptProvider.supportsStreaming,
++    };
++    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    const runtime_tools = [_]Tool{
++        try makeMockFilterTool(allocator, "shell"),
++    };
++    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
++
++    var cfg = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "openai/gpt-4.1-mini",
++        .allocator = allocator,
++    };
++    cfg.agent.max_tool_iterations = 2;
++    var noop = observability.NoopObserver{};
++    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
++    defer agent.deinit();
++
++    const response = try agent.turn("hello");
++    defer allocator.free(response);
++
++    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
++    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
++}
++
+ test "Agent rejects an oversized tool-call batch" {
+     const BigBatchProvider = struct {
+         calls: usize = 0,
+diff --git a/src/bus.zig b/src/bus.zig
+index dbc4c70..34866a4 100644
+--- a/src/bus.zig
++++ b/src/bus.zig
+@@ -548,6 +548,12 @@ pub const Bus = struct {
+         return self.outbound.publish(msg);
+     }
+ 
++    /// Bounded variant for droppable outbound traffic (stream previews): never
++    /// blocks the producer for longer than `timeout_ms` when the queue is full.
++    pub fn publishOutboundTimeout(self: *Bus, msg: OutboundMessage, timeout_ms: u32) error{ Closed, Timeout }!void {
++        return self.outbound.publishTimeout(msg, timeout_ms);
++    }
++
+     pub fn consumeOutbound(self: *Bus) ?OutboundMessage {
+         return self.outbound.consume();
+     }
+@@ -783,6 +789,33 @@ test "bus roundtrip outbound" {
+     try testing.expectEqualStrings("pong", got.content);
+ }
+ 
++test "publishOutboundTimeout reports Timeout instead of blocking on a full queue" {
++    const alloc = testing.allocator;
++    var bus = Bus.init();
++    defer bus.close();
++
++    var filled: usize = 0;
++    while (filled < QUEUE_CAPACITY) : (filled += 1) {
++        try bus.publishOutbound(try makeOutbound(alloc, "c", "t", "x"));
++    }
++
++    const overflow = try makeOutbound(alloc, "c", "t", "y");
++    try testing.expectError(error.Timeout, bus.publishOutboundTimeout(overflow, 20));
++    overflow.deinit(alloc);
++
++    // Draining one entry makes room again.
++    var drained = bus.consumeOutbound().?;
++    drained.deinit(alloc);
++    const again = try makeOutbound(alloc, "c", "t", "z");
++    try bus.publishOutboundTimeout(again, 20);
++
++    bus.close();
++    while (bus.consumeOutbound()) |msg| {
++        var m = msg;
++        m.deinit(alloc);
++    }
++}
++
+ test "bus close stops both queues" {
+     var bus = Bus.init();
+     bus.close();
+diff --git a/src/channels/root.zig b/src/channels/root.zig
+index e7ed44e..6cb139f 100644
+--- a/src/channels/root.zig
++++ b/src/channels/root.zig
+@@ -207,6 +207,9 @@ pub const Channel = struct {
+         supportsStreamingOutbound: *const fn (ptr: *anyopaque) bool = &defaultSupportsStreamingOutbound,
+         /// Whether the channel can create, edit, and delete host-managed draft messages.
+         supportsTrackedDrafts: *const fn (ptr: *anyopaque) bool = &defaultSupportsTrackedDrafts,
++        /// Optional: drop a target's already-queued `.chunk` events after a
++        /// /stop so a stopped turn's leftovers cannot replay to the user.
++        cancelStreams: ?*const fn (ptr: *anyopaque, target: []const u8) void = null,
+     };
+ 
+     pub fn start(self: Channel) !void {
+@@ -295,6 +298,11 @@ pub const Channel = struct {
+     pub fn supportsTrackedDrafts(self: Channel) bool {
+         return self.vtable.supportsTrackedDrafts(self.ptr);
+     }
++
++    /// Drop queued stream chunks for `target` when the channel supports it.
++    pub fn cancelStreams(self: Channel, target: []const u8) void {
++        if (self.vtable.cancelStreams) |cancel| cancel(self.ptr, target);
++    }
+ };
+ 
+ // ════════════════════════════════════════════════════════════════════════════
+diff --git a/src/channels/slack.zig b/src/channels/slack.zig
+index f4d9e96..f86a2b7 100644
+--- a/src/channels/slack.zig
++++ b/src/channels/slack.zig
+@@ -253,6 +253,11 @@ pub const SlackChannel = struct {
+     /// Guards `stream_states` and the API calls made from it.
+     stream_mu: std_compat.sync.Mutex = .{},
+     stream_states: std.StringHashMapUnmanaged(stream_presenter.StreamState) = .empty,
++    /// Targets whose current turn was stopped. Queued `.chunk` events for them
++    /// are dropped so a stopped turn's leftovers cannot replay once the
++    /// outbound dispatcher catches up. Keyed by the exact outbound target and
++    /// expiring after the late-chunk grace window. Guarded by `stream_mu`.
++    stream_cancels: std.StringHashMapUnmanaged(i64) = .empty,
+     policy: root.ChannelPolicy = .{},
+     bus: ?*bus_mod.Bus = null,
+     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+@@ -1810,6 +1815,71 @@ pub const SlackChannel = struct {
+         self.stream_mu.lock();
+         defer self.stream_mu.unlock();
+         stream_presenter.deinitStreamStates(self.allocator, &self.stream_states);
++        var it = self.stream_cancels.iterator();
++        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
++        self.stream_cancels.deinit(self.allocator);
++        self.stream_cancels = .empty;
++    }
++
++    fn vtableCancelStreams(ptr: *anyopaque, target: []const u8) void {
++        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
++        self.cancelStreams(target);
++    }
++
++    /// Mark `target` cancelled after a /stop, so the stopped turn's already
++    /// queued `.chunk` events are dropped instead of replaying. Cleared when the
++    /// stopped turn's final reply is delivered, or after the grace window.
++    pub fn cancelStreams(self: *SlackChannel, target: []const u8) void {
++        if (target.len == 0) return;
++
++        self.stream_mu.lock();
++        defer self.stream_mu.unlock();
++
++        const now_ms = std_compat.time.milliTimestamp();
++        self.pruneStreamCancelsLocked(now_ms);
++
++        const gop = self.stream_cancels.getOrPut(self.allocator, target) catch |err| {
++            log.warn("Slack stream cancel allocation failed: {}", .{err});
++            return;
++        };
++        if (!gop.found_existing) {
++            gop.key_ptr.* = self.allocator.dupe(u8, target) catch {
++                _ = self.stream_cancels.remove(target);
++                log.warn("Slack stream cancel allocation failed: {}", .{error.OutOfMemory});
++                return;
++            };
++        }
++        gop.value_ptr.* = now_ms + stream_presenter.STREAM_LATE_CHUNK_GRACE_MS;
++    }
++
++    fn isStreamCancelledLocked(self: *SlackChannel, target: []const u8, now_ms: i64) bool {
++        const expiry = self.stream_cancels.get(target) orelse return false;
++        if (now_ms >= expiry) {
++            self.clearStreamCancelLocked(target);
++            return false;
++        }
++        return true;
++    }
++
++    fn clearStreamCancelLocked(self: *SlackChannel, target: []const u8) void {
++        if (self.stream_cancels.fetchRemove(target)) |entry| self.allocator.free(entry.key);
++    }
++
++    /// Drop expired cancel markers so a long-running bot does not accumulate one
++    /// entry per target it has ever stopped.
++    fn pruneStreamCancelsLocked(self: *SlackChannel, now_ms: i64) void {
++        var stale: [stream_presenter.STREAM_MAX_TRACKED_TARGETS][]const u8 = undefined;
++        var stale_len: usize = 0;
++        var it = self.stream_cancels.iterator();
++        while (it.next()) |entry| {
++            if (now_ms < entry.value_ptr.*) continue;
++            if (stale_len == stale.len) break;
++            stale[stale_len] = entry.key_ptr.*;
++            stale_len += 1;
++        }
++        for (stale[0..stale_len]) |key| {
++            if (self.stream_cancels.fetchRemove(key)) |entry| self.allocator.free(entry.key);
++        }
+     }
+ 
+     /// The turn ended without a reply body; close the turn so late deltas are
+@@ -1820,6 +1890,7 @@ pub const SlackChannel = struct {
+ 
+         const now_ms = std_compat.time.milliTimestamp();
+         if (self.stream_states.getPtr(target)) |state| state.finishTurn(self.allocator, now_ms);
++        self.clearStreamCancelLocked(target);
+     }
+ 
+     fn streamChunk(self: *SlackChannel, target: []const u8, chunk: []const u8) void {
+@@ -1830,6 +1901,9 @@ pub const SlackChannel = struct {
+         defer self.stream_mu.unlock();
+ 
+         const now_ms = std_compat.time.milliTimestamp();
++        // A /stop cancelled this target: the deltas still queued ahead of the
++        // stop must not replay to the user once the dispatcher catches up.
++        if (self.isStreamCancelledLocked(target, now_ms)) return;
+         const state = self.ensureStreamStateLocked(target, now_ms) catch |err| {
+             log.warn("Slack streaming state allocation failed: {}", .{err});
+             return;
+@@ -2091,6 +2165,10 @@ pub const SlackChannel = struct {
+         defer self.stream_mu.unlock();
+ 
+         const now_ms = std_compat.time.milliTimestamp();
++        // Every queued delta was dequeued ahead of this final, so the stop marker
++        // has done its job and must not leak into the next turn -- including a
++        // turn that streamed nothing and returns early below without a state.
++        self.clearStreamCancelLocked(target);
+         const state = self.stream_states.getPtr(target) orelse
+             return vtableSend(@ptrCast(self), target, message, media);
+         // Keep the entry: late deltas of this turn are dropped by isLateChunk.
+@@ -2252,6 +2330,7 @@ pub const SlackChannel = struct {
+         .stopTyping = &vtableStopTyping,
+         .setTaskReaction = &vtableSetTaskReaction,
+         .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
++        .cancelStreams = &vtableCancelStreams,
+     };
+ 
+     pub fn channel(self: *SlackChannel) root.Channel {
+@@ -3088,11 +3167,13 @@ test "slack streaming keeps the native path across chunks of one turn" {
+     defer ch.channel().stop();
+ 
+     try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++    // A second delta inside the flush window is coalesced rather than sent, but
++    // the turn must keep using the native transport.
+     try ch.channel().sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
+ 
+     const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+     try std.testing.expectEqual(stream_presenter.StreamMode.native, state.mode);
+-    try std.testing.expectEqualStrings(("x" ** 200) ++ ("y" ** 200), state.sent);
++    try std.testing.expectEqualStrings("x" ** 200, state.sent);
+ }
+ 
+ test "slack streaming uses edited messages when the target has no thread" {
+@@ -3179,6 +3260,49 @@ test "slack streaming drops deltas that arrive after the final reply" {
+     try std.testing.expectEqual(@as(usize, 0), state.buffer.items.len);
+ }
+ 
++test "slack streaming drops queued chunks for a cancelled target" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++    const iface = ch.channel();
++
++    // The turn opened a stream, then the user hit /stop.
++    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++    {
++        // Advance the flush clock past the 1s floor so the next delta would reach
++        // the wire (and grow state.sent) if the cancel did not drop it.
++        const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++        state.last_flush_time -= stream_presenter.STREAM_FLUSH_MIN_INTERVAL_MS + 1;
++    }
++    iface.cancelStreams("C1:1700.1");
++
++    // Regression: deltas already queued ahead of the /stop must not replay once
++    // the outbound dispatcher catches up.
++    try iface.sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
++
++    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqualStrings("x" ** 200, state.sent);
++}
++
++test "slack streaming flushes a later delta past the interval when not cancelled" {
++    var ch = initStreamingChannel(true);
++    defer ch.channel().stop();
++    const iface = ch.channel();
++
++    // Positive control for the cancelled-target test above: the same clock
++    // advance with no /stop must let the delta through, proving the cancel is
++    // what dropped it.
++    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
++    {
++        const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++        state.last_flush_time -= stream_presenter.STREAM_FLUSH_MIN_INTERVAL_MS + 1;
++    }
++
++    try iface.sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
++
++    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
++    try std.testing.expectEqualStrings(("x" ** 200) ++ ("y" ** 200), state.sent);
++}
++
+ test "slack streaming final without streaming enabled is delivered complete" {
+     var ch = initStreamingChannel(false);
+     defer ch.channel().stop();
+diff --git a/src/channels/slack_stream_presenter.zig b/src/channels/slack_stream_presenter.zig
+index 00674bd..bd905cf 100755
+--- a/src/channels/slack_stream_presenter.zig
++++ b/src/channels/slack_stream_presenter.zig
+@@ -146,8 +146,14 @@ pub fn hasVisibleStreamText(text: []const u8) bool {
+ }
+ 
+ fn shouldFlush(state: *const StreamState, now_ms: i64) bool {
+-    if (state.buffer.items.len - state.sent.len >= STREAM_FLUSH_MIN_DELTA_BYTES) return true;
+-    return now_ms - state.last_flush_time >= STREAM_FLUSH_MIN_INTERVAL_MS;
++    const pending = state.buffer.items.len - state.sent.len;
++    if (pending == 0) return false;
++    if (now_ms - state.last_flush_time >= STREAM_FLUSH_MIN_INTERVAL_MS) return true;
++    // Only the first flush of a turn may open the stream before the interval,
++    // and only once a meaningful amount of text has accumulated. Every later
++    // flush waits the full interval, so a fast token stream can no longer turn
++    // one turn into a burst of synchronous Slack calls.
++    return state.sent.len == 0 and pending >= STREAM_FLUSH_MIN_DELTA_BYTES;
+ }
+ 
+ /// Snapshot the buffered stream for the wire.
+@@ -495,6 +501,47 @@ test "appendStreamChunk flushes on the minimum delta before the interval" {
+     try std.testing.expectEqualStrings(big, flush.text);
+ }
+ 
++test "appendStreamChunk throttles a sustained delta stream to one flush per interval" {
++    var state = StreamState{};
++    defer state.deinit(std.testing.allocator);
++
++    // The first burst opens the stream.
++    var first = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "a" ** STREAM_FLUSH_MIN_DELTA_BYTES,
++        1_000,
++    )) orelse return error.TestUnexpectedResult;
++    defer first.deinit(std.testing.allocator);
++
++    // Regression: a fast token stream used to flush on every delta >=
++    // STREAM_FLUSH_MIN_DELTA_BYTES, turning one turn into dozens of synchronous
++    // Slack calls. Inside the window only the first flush may happen.
++    try std.testing.expect((try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "b" ** STREAM_FLUSH_MIN_DELTA_BYTES,
++        1_100,
++    )) == null);
++    try std.testing.expect((try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "c" ** STREAM_FLUSH_MIN_DELTA_BYTES,
++        1_900,
++    )) == null);
++
++    var next = (try appendStreamChunk(
++        std.testing.allocator,
++        &state,
++        "d" ** STREAM_FLUSH_MIN_DELTA_BYTES,
++        2_000,
++    )) orelse return error.TestUnexpectedResult;
++    defer next.deinit(std.testing.allocator);
++
++    try std.testing.expectEqual(@as(usize, STREAM_FLUSH_MIN_DELTA_BYTES * 4), next.text.len);
++    try std.testing.expectEqual(@as(usize, STREAM_FLUSH_MIN_DELTA_BYTES), next.delta_start);
++}
++
+ test "appendStreamChunk returns only the unsent suffix on later flushes" {
+     var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
+     defer state.deinit(std.testing.allocator);
+diff --git a/src/daemon.zig b/src/daemon.zig
+index 5544be1..40e3a19 100644
+--- a/src/daemon.zig
++++ b/src/daemon.zig
+@@ -1091,9 +1091,18 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
+         return;
+     };
+     message.draft_id = ctx.draft_id;
+-    ctx.event_bus.publishOutbound(message) catch |err| {
++    // A stream chunk is a droppable preview: never block the agent turn waiting
++    // for outbound-queue space. The single outbound dispatcher can be parked in
++    // a slow Slack call, and blocking here kept the turn alive (and deaf to
++    // /stop) until the backlog drained. A timeout of 0 drops the chunk the
++    // moment the queue is full instead of sleeping.
++    ctx.event_bus.publishOutboundTimeout(message, 0) catch |err| {
+         message.deinit(ctx.allocator);
+-        if (err != error.Closed) {
++        if (err == error.Timeout) {
++            // The dispatcher is behind; drop this preview instead of parking the
++            // turn on a full queue.
++            log.debug("inbound dispatch dropped a stream chunk: outbound queue full", .{});
++        } else if (err != error.Closed) {
+             log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
+         }
+         return;
+@@ -1287,6 +1296,7 @@ fn inboundDispatchShardIndex(
+ fn tryHandleStopCommandBeforeEnqueue(
+     allocator: std.mem.Allocator,
+     config: *const Config,
++    registry: *const dispatch.ChannelRegistry,
+     session_mgr: *@import("session.zig").SessionManager,
+     msg: *const bus_mod.InboundMessage,
+ ) bool {
+@@ -1307,6 +1317,21 @@ fn tryHandleStopCommandBeforeEnqueue(
+     log.info("stop command interrupting running turn before enqueue session=0x{x}", .{
+         std.hash.Wyhash.hash(0, session_key),
+     });
++
++    // Drop the stopped turn's already-queued stream chunks so they cannot replay
++    // once the outbound dispatcher catches up. The targets come from the
++    // interrupted sessions, not from the stop message: a Slack slash command has
++    // no thread context, so its own chat id names the whole channel and would
++    // silence every concurrent thread.
++    if (resolveOutboundChannel(registry, msg.channel, parsed_meta.fields.account_id)) |channel| {
++        var targets: std.ArrayListUnmanaged([]u8) = .empty;
++        defer {
++            for (targets.items) |target| allocator.free(target);
++            targets.deinit(allocator);
++        }
++        session_mgr.collectActiveTurnTargets(allocator, session_key, &targets);
++        for (targets.items) |target| channel.cancelStreams(target);
++    }
+     return true;
+ }
+ 
+@@ -1618,7 +1643,7 @@ fn inboundDispatcherThread(
+ 
+         while (ready_messages.items.len > 0) {
+             var msg = ready_messages.orderedRemove(0);
+-            if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, &runtime.session_mgr, &msg)) {
++            if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, registry, &runtime.session_mgr, &msg)) {
+                 msg.deinit(allocator);
+                 continue;
+             }
+@@ -1638,7 +1663,7 @@ fn inboundDispatcherThread(
+     debouncer.flushAll(&ready_messages) catch {};
+     while (ready_messages.items.len > 0) {
+         var msg = ready_messages.orderedRemove(0);
+-        if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, &runtime.session_mgr, &msg)) {
++        if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, registry, &runtime.session_mgr, &msg)) {
+             msg.deinit(allocator);
+             continue;
+         }
+@@ -2246,6 +2271,9 @@ test "dispatcher interrupts a busy session for /stop before enqueue" {
+     var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
+     defer sm.deinit();
+ 
++    var registry = dispatch.ChannelRegistry.init(allocator);
++    defer registry.deinit();
++
+     const session_key = "daemon:stop-before-enqueue";
+     const session = try sm.getOrCreate(session_key);
+     defer session.turn_running.store(false, .release);
+@@ -2261,23 +2289,155 @@ test "dispatcher interrupts a busy session for /stop before enqueue" {
+         .content = "/stop",
+         .session_key = session_key,
+     };
+-    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &stop_msg));
++    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &stop_msg));
+     try std.testing.expect(session.agent.interrupt_requested.load(.acquire));
+ 
+     // A non-stop message is left for the queue and does not raise the flag.
+     session.agent.clearInterruptRequest();
+     var normal_msg = stop_msg;
+     normal_msg.content = "just a message";
+-    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &normal_msg));
++    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &normal_msg));
+     try std.testing.expect(!session.agent.interrupt_requested.load(.acquire));
+ 
+     // /stop with no running turn is not consumed: normal routing replies.
+     session.turn_running.store(false, .release);
+     session.agent.clearInterruptRequest();
+-    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &stop_msg));
++    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &stop_msg));
+     try std.testing.expect(!session.agent.interrupt_requested.load(.acquire));
+ }
+ 
++test "publishStreamingChunk drops a preview instead of blocking on a full outbound queue" {
++    const allocator = std.testing.allocator;
++    var event_bus = bus_mod.Bus.init();
++    defer event_bus.close();
++
++    var filled: usize = 0;
++    while (filled < bus_mod.QUEUE_CAPACITY) : (filled += 1) {
++        try event_bus.publishOutbound(try bus_mod.makeOutbound(allocator, "c", "t", "x"));
++    }
++
++    var ctx = StreamingOutboundCtx{
++        .allocator = allocator,
++        .event_bus = &event_bus,
++        .channel = "c",
++        .account_id = null,
++        .chat_id = "t",
++    };
++    const start = std_compat.time.milliTimestamp();
++    publishStreamingChunk(&ctx, .{ .stage = .chunk, .text = "hello" });
++    const elapsed = std_compat.time.milliTimestamp() - start;
++
++    // Regression: a full queue used to park the turn here forever, keeping it
++    // running (and unresponsive to /stop) until the dispatcher drained. The
++    // publish must return at once so the agent loop reaches its interrupt check.
++    try std.testing.expect(elapsed < 100);
++    try std.testing.expect(!ctx.emitted_chunk);
++
++    event_bus.close();
++    while (event_bus.consumeOutbound()) |msg| {
++        var m = msg;
++        m.deinit(allocator);
++    }
++}
++
++test "dispatcher cancels the stopped turn's queued stream chunks before enqueue" {
++    const allocator = std.testing.allocator;
++    const providers_mod = @import("providers/root.zig");
++    const session_mod = @import("session.zig");
++
++    const StopMockProvider = struct {
++        fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return a.dupe(u8, "ok");
++        }
++        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers_mod.ChatRequest, _: []const u8, _: f64) anyerror!providers_mod.ChatResponse {
++            return error.ShouldNotChat;
++        }
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return false;
++        }
++        fn getName(_: *anyopaque) []const u8 {
++            return "stop-cancel-mock";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++    var provider_state: u8 = 0;
++    const provider_vtable = providers_mod.Provider.VTable{
++        .chatWithSystem = StopMockProvider.chatWithSystem,
++        .chat = StopMockProvider.chat,
++        .supportsNativeTools = StopMockProvider.supportsNativeTools,
++        .getName = StopMockProvider.getName,
++        .deinit = StopMockProvider.deinitFn,
++    };
++    const provider = providers_mod.Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    const RecordingChannel = struct {
++        var cancelled: [64]u8 = undefined;
++        var cancelled_len: usize = 0;
++
++        fn start(_: *anyopaque) anyerror!void {}
++        fn stop(_: *anyopaque) void {}
++        fn send(_: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {}
++        fn name(_: *anyopaque) []const u8 {
++            return "test-channel";
++        }
++        fn healthCheck(_: *anyopaque) bool {
++            return true;
++        }
++        fn cancelStreams(_: *anyopaque, target: []const u8) void {
++            cancelled_len = @min(target.len, cancelled.len);
++            @memcpy(cancelled[0..cancelled_len], target[0..cancelled_len]);
++        }
++    };
++    RecordingChannel.cancelled_len = 0;
++
++    var noop = observability.NoopObserver{};
++    const config = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "test/mock-model",
++        .allocator = allocator,
++    };
++    var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
++    defer sm.deinit();
++
++    var ch_state: u8 = 0;
++    const ch_vtable = channels_mod.Channel.VTable{
++        .start = RecordingChannel.start,
++        .stop = RecordingChannel.stop,
++        .send = RecordingChannel.send,
++        .name = RecordingChannel.name,
++        .healthCheck = RecordingChannel.healthCheck,
++        .cancelStreams = RecordingChannel.cancelStreams,
++    };
++    var registry = dispatch.ChannelRegistry.init(allocator);
++    defer registry.deinit();
++    try registry.register(.{ .ptr = @ptrCast(&ch_state), .vtable = &ch_vtable });
++
++    const session_key = "daemon:stop-cancel-targets";
++    const session = try sm.getOrCreate(session_key);
++    defer session.turn_running.store(false, .release);
++    defer session.agent.conversation_context = null;
++    session.agent.clearInterruptRequest();
++    // The running turn delivers to a thread target, which is what a bare
++    // channel slash stop must cancel (not the whole channel).
++    session.agent.conversation_context = .{
++        .channel = "test-channel",
++        .delivery_chat_id = "C1:1700.0",
++    };
++    session.turn_running.store(true, .release);
++
++    var stop_msg = bus_mod.InboundMessage{
++        .channel = "test-channel",
++        .sender_id = "user-1",
++        .chat_id = "C1",
++        .content = "/stop",
++        .session_key = session_key,
++    };
++    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &stop_msg));
++    try std.testing.expect(RecordingChannel.cancelled_len > 0);
++    try std.testing.expectEqualStrings("C1:1700.0", RecordingChannel.cancelled[0..RecordingChannel.cancelled_len]);
++}
++
+ test "hasSupervisedChannels false for defaults" {
+     const config = Config{
+         .workspace_dir = "/tmp",
+@@ -3956,6 +4116,9 @@ test "Slack slash /stop interrupts the busy channel and thread sessions before e
+     var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
+     defer sm.deinit();
+ 
++    var registry = dispatch.ChannelRegistry.init(allocator);
++    defer registry.deinit();
++
+     // The message the Slack channel actually publishes for `/nullclaw /stop`.
+     var msg = try produceSlashStopMessage(allocator);
+     defer msg.deinit(allocator);
+@@ -3971,7 +4134,7 @@ test "Slack slash /stop interrupts the busy channel and thread sessions before e
+     channel_session.agent.clearInterruptRequest();
+     channel_session.turn_running.store(true, .release);
+ 
+-    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &msg));
++    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &msg));
+     try std.testing.expect(channel_session.agent.interrupt_requested.load(.acquire));
+ 
+     // Case 2: the busy turn lives in a thread session under the channel, which
+@@ -3987,6 +4150,6 @@ test "Slack slash /stop interrupts the busy channel and thread sessions before e
+     thread_session.agent.clearInterruptRequest();
+     thread_session.turn_running.store(true, .release);
+ 
+-    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &msg));
++    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &msg));
+     try std.testing.expect(thread_session.agent.interrupt_requested.load(.acquire));
+ }
+diff --git a/src/http_util.zig b/src/http_util.zig
+index 6d0b442..a159880 100644
+--- a/src/http_util.zig
++++ b/src/http_util.zig
+@@ -164,6 +164,44 @@ pub fn stopCancelWatcher(done: *AtomicBool, watcher: *?std.Thread) void {
+     }
+ }
+ 
++/// Spawn the watcher that kills `child` when the current thread's agent
++/// interrupt flag (installed by the agent around a provider call) is raised.
++///
++/// `done`, `watcher`, and `ctx` are caller-owned storage that must outlive the
++/// watcher; pair with `stopCancelWatcher`. A no-op leaving `watcher` null when
++/// no interrupt flag is installed on this thread.
++pub fn spawnCancelWatcher(
++    child: *std_compat.process.Child,
++    done: *AtomicBool,
++    watcher: *?std.Thread,
++    ctx: *CancelWatcherCtx,
++) void {
++    const flag = thread_interrupt_flag orelse return;
++    ctx.* = .{ .child = child, .cancel_flag = flag, .done = done };
++    watcher.* = std.Thread.spawn(.{}, cancelWatcherMain, .{ctx}) catch null;
++}
++
++/// True when the agent /stop raised the interrupt flag on this thread. The curl
++/// transports check it between stream deltas so a stop aborts the in-flight
++/// request instead of draining everything the provider already buffered.
++pub fn interruptRequested() bool {
++    const flag = thread_interrupt_flag orelse return false;
++    return flag.load(.acquire);
++}
++
++/// Stop the cancel watcher, then kill and reap the curl child. The watcher must
++/// be joined before `wait()` clears `child.id`, or a reused PID could be
++/// signalled.
++pub fn stopCancelWatcherAndReap(
++    child: *std_compat.process.Child,
++    done: *AtomicBool,
++    watcher: *?std.Thread,
++) void {
++    stopCancelWatcher(done, watcher);
++    _ = child.kill() catch {};
++    _ = child.wait() catch {};
++}
++
+ fn abortCurlChild(
+     child: *std_compat.process.Child,
+     cancel_done: *AtomicBool,
+diff --git a/src/providers/gemini.zig b/src/providers/gemini.zig
+index f0f08e6..2936fff 100644
+--- a/src/providers/gemini.zig
++++ b/src/providers/gemini.zig
+@@ -865,19 +865,26 @@ pub const GeminiProvider = struct {
+ 
+         try child.spawn();
+ 
++        // Abort the in-flight stream when the agent /stop raises the interrupt
++        // flag: the watcher kills curl and the read loop below returns
++        // error.Interrupted instead of running the request to completion.
++        var cancel_done = std.atomic.Value(bool).init(false);
++        var cancel_watcher: ?std.Thread = null;
++        var cancel_ctx: http_util.CancelWatcherCtx = undefined;
++        http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
++        defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
++
+         if (child.stdin) |stdin_file| {
+             stdin_file.writeAll(body) catch {
+                 stdin_file.close();
+                 child.stdin = null;
+-                _ = child.kill() catch {};
+-                _ = child.wait() catch {};
++                http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                 return error.GeminiApiError;
+             };
+             stdin_file.close();
+             child.stdin = null;
+         } else {
+-            _ = child.kill() catch {};
+-            _ = child.wait() catch {};
++            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+             return error.GeminiApiError;
+         }
+ 
+@@ -894,6 +901,12 @@ pub const GeminiProvider = struct {
+         var saw_done = false;
+ 
+         outer: while (true) {
++            // /stop: stop reading at the next delta boundary instead of draining
++            // every delta the provider already buffered.
++            if (http_util.interruptRequested()) {
++                http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++                return error.Interrupted;
++            }
+             const n = file.read(&read_buf) catch break;
+             if (n == 0) break;
+ 
+@@ -910,6 +923,10 @@ pub const GeminiProvider = struct {
+                     switch (result) {
+                         .delta => |text| {
+                             defer allocator.free(text);
++                            if (http_util.interruptRequested()) {
++                                http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++                                return error.Interrupted;
++                            }
+                             try accumulated.appendSlice(allocator, text);
+                             callback(ctx, root.StreamChunk.textDelta(text));
+                         },
+@@ -945,12 +962,22 @@ pub const GeminiProvider = struct {
+             }
+         }
+ 
++        // A /stop killed curl before the stream finished: report the interrupt
++        // instead of salvaging the partial text as a completed response.
++        if (!saw_done and http_util.interruptRequested()) {
++            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++            return error.Interrupted;
++        }
++
+         // Drain remaining stdout to prevent deadlock on wait()
+         while (true) {
+             const n = file.read(&read_buf) catch break;
+             if (n == 0) break;
+         }
+ 
++        // Join the watcher before reaping curl (PID-reuse window; see
++        // stopCancelWatcherAndReap). The stdout stream is already at EOF.
++        http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+         const term = child.wait() catch |err| {
+             log.err("curlStreamGemini child.wait failed: {}", .{err});
+             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+diff --git a/src/providers/openai_codex.zig b/src/providers/openai_codex.zig
+index 58b7a9b..c3abbf5 100644
+--- a/src/providers/openai_codex.zig
++++ b/src/providers/openai_codex.zig
+@@ -458,19 +458,26 @@ fn codexStreamRequest(
+ 
+     try child.spawn();
+ 
++    // Abort the in-flight stream when the agent /stop raises the interrupt
++    // flag: the watcher kills curl and the read loop below returns
++    // error.Interrupted instead of running the request to completion.
++    var cancel_done = std.atomic.Value(bool).init(false);
++    var cancel_watcher: ?std.Thread = null;
++    var cancel_ctx: http_util.CancelWatcherCtx = undefined;
++    http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
++    defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
++
+     if (child.stdin) |stdin_file| {
+         stdin_file.writeAll(body) catch {
+             stdin_file.close();
+             child.stdin = null;
+-            _ = child.kill() catch {};
+-            _ = child.wait() catch {};
++            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+             return error.CurlWriteError;
+         };
+         stdin_file.close();
+         child.stdin = null;
+     } else {
+-        _ = child.kill() catch {};
+-        _ = child.wait() catch {};
++        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+         return error.CurlWriteError;
+     }
+ 
+@@ -489,6 +496,12 @@ fn codexStreamRequest(
+     var saw_terminal = false;
+ 
+     outer: while (true) {
++        // /stop: stop reading at the next delta boundary instead of draining
++        // every delta the provider already buffered.
++        if (http_util.interruptRequested()) {
++            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++            return error.Interrupted;
++        }
+         const n = file.read(&read_buf) catch break;
+         if (n == 0) break;
+ 
+@@ -502,6 +515,10 @@ fn codexStreamRequest(
+                 switch (result) {
+                     .delta => |delta_evt| {
+                         defer allocator.free(delta_evt.text);
++                        if (http_util.interruptRequested()) {
++                            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++                            return error.Interrupted;
++                        }
+                         const is_tool_payload = std.mem.indexOf(u8, delta_evt.text, "<tool_call>") != null;
+                         const ends_stream = codexDeltaSourceEndsStream(delta_evt.source);
+                         switch (delta_evt.source) {
+@@ -567,14 +584,20 @@ fn codexStreamRequest(
+         }
+     }
+ 
++    // A /stop killed curl before the stream finished: report the interrupt
++    // instead of salvaging the partial text as a completed response.
++    if (!saw_terminal and http_util.interruptRequested()) {
++        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++        return error.Interrupted;
++    }
++
+     if (saw_terminal) {
+         // Regression: Codex can emit a terminal event before curl exits. Stop the
+         // subprocess here so completed streams do not wait on a stalled socket.
+         // NOTE: No direct unit test covers the child-kill path here. Under the
+         // current Zig/macOS test runner, PATH-based curl interception is not
+         // reliable enough for a deterministic subprocess regression test.
+-        _ = child.kill() catch {};
+-        _ = child.wait() catch {};
++        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+         if (accumulated.items.len == 0) return error.NoResponseContent;
+         callback(ctx, root.StreamChunk.finalChunk());
+         return finalizeCodexStreamResult(allocator, accumulated.items);
+@@ -586,6 +609,9 @@ fn codexStreamRequest(
+         if (n == 0) break;
+     }
+ 
++    // Join the watcher before reaping curl (PID-reuse window; see
++    // stopCancelWatcherAndReap). The stdout stream is already at EOF.
++    http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+     const term = child.wait() catch {
+         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
+             callback(ctx, root.StreamChunk.finalChunk());
+diff --git a/src/providers/reliable.zig b/src/providers/reliable.zig
+index 962dd79..3f3d688 100644
+--- a/src/providers/reliable.zig
++++ b/src/providers/reliable.zig
+@@ -467,7 +467,7 @@ pub const ReliableProvider = struct {
+         allocator: std.mem.Allocator,
+         request: ChatRequest,
+         current_model: []const u8,
+-    ) ?ChatResponse {
++    ) error{Interrupted}!?ChatResponse {
+         var backoff_ms = self.base_backoff_ms;
+         var attempt: u32 = 0;
+         while (attempt <= self.max_retries) : (attempt += 1) {
+@@ -484,6 +484,10 @@ pub const ReliableProvider = struct {
+                 }
+                 return annotated;
+             } else |err| {
++                // A user /stop aborted the in-flight request. It must end the
++                // turn, not be retried or failed over to another provider.
++                if (err == error.Interrupted or err == error.CurlInterrupted) return error.Interrupted;
++
+                 maybeRecordFallbackErrorDetail(prov, err);
+                 self.storeErrorName(err);
+                 const err_slice = self.lastErrorSlice();
+@@ -586,7 +590,7 @@ pub const ReliableProvider = struct {
+             if (target.explicit) {
+                 if (!needs_vision or target.provider.supportsVisionForModel(target.model)) {
+                     if (needs_vision) attempted_vision_provider = true;
+-                    if (self.tryChatProvider(
++                    if (try self.tryChatProvider(
+                         target.provider,
+                         allocator,
+                         request,
+@@ -601,7 +605,7 @@ pub const ReliableProvider = struct {
+             // Try primary provider (skip if it lacks vision and request needs it)
+             if (!needs_vision or self.inner.supportsVisionForModel(current_model)) {
+                 if (needs_vision) attempted_vision_provider = true;
+-                if (self.tryChatProvider(
++                if (try self.tryChatProvider(
+                     self.inner,
+                     allocator,
+                     request,
+@@ -615,7 +619,7 @@ pub const ReliableProvider = struct {
+             for (self.extras) |entry| {
+                 if (!needs_vision or entry.provider.supportsVisionForModel(current_model)) {
+                     if (needs_vision) attempted_vision_provider = true;
+-                    if (self.tryChatProvider(
++                    if (try self.tryChatProvider(
+                         entry.provider,
+                         allocator,
+                         request,
+@@ -1238,6 +1242,24 @@ test "ReliableProvider vtable chat retries then recovers" {
+     try std.testing.expect(mock.call_count == 2);
+ }
+ 
++test "ReliableProvider surfaces a user stop without retrying or failing over" {
++    var mock = MockInnerProvider{
++        .call_count = 0,
++        .fail_until = 100,
++        .fail_error = error.CurlInterrupted,
++        .supports_tools = false,
++    };
++    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 3, 50);
++    const prov = reliable.provider();
++
++    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
++    const request = ChatRequest{ .messages = &msgs };
++    // Regression: a /stop aborts the in-flight request and must end the turn,
++    // not be retried or failed over to another provider.
++    try std.testing.expectError(error.Interrupted, prov.chat(std.testing.allocator, request, "model", 0.5));
++    try std.testing.expectEqual(@as(u32, 1), mock.call_count);
++}
++
+ test "ReliableProvider vtable delegates supportsNativeTools" {
+     var mock_yes = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = true };
+     var reliable_yes = ReliableProvider.initWithProvider(mock_yes.toProvider(), 0, 50);
+diff --git a/src/providers/sse.zig b/src/providers/sse.zig
+index e75e5b6..d0ea384 100644
+--- a/src/providers/sse.zig
++++ b/src/providers/sse.zig
+@@ -629,9 +629,7 @@ fn stopWatcherAndReap(
+     cancel_done: *std.atomic.Value(bool),
+     cancel_watcher: *?std.Thread,
+ ) void {
+-    http_util.stopCancelWatcher(cancel_done, cancel_watcher);
+-    _ = child.kill() catch {};
+-    _ = child.wait() catch {};
++    http_util.stopCancelWatcherAndReap(child, cancel_done, cancel_watcher);
+ }
+ 
+ /// True when a stdin write failure must be reported as a user interrupt.
+@@ -767,10 +765,7 @@ pub fn curlStream(
+     var cancel_done = std.atomic.Value(bool).init(false);
+     var cancel_watcher: ?std.Thread = null;
+     var cancel_ctx: http_util.CancelWatcherCtx = undefined;
+-    if (cancel_flag) |flag| {
+-        cancel_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
+-        cancel_watcher = std.Thread.spawn(.{}, http_util.cancelWatcherMain, .{&cancel_ctx}) catch null;
+-    }
++    http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
+     // Safety net only: every path below stops the watcher before reaping curl
+     // (see stopWatcherAndReap), because joining after wait() leaves a PID-reuse
+     // window. This defer is a no-op once that has happened.
+@@ -812,6 +807,13 @@ pub fn curlStream(
+     defer tool_call_accumulator.deinit(allocator);
+ 
+     outer: while (true) {
++        // /stop: abort before draining the deltas curl already buffered in its
++        // stdout pipe. Reading them out (each through the stream callback) kept
++        // the turn alive for seconds after the stop.
++        if (http_util.interruptRequested()) {
++            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++            return error.Interrupted;
++        }
+         const n = stdout_file.read(&read_buf) catch |err| {
+             if (log_enabled) {
+                 debug_log.debug("stdout read error: {}", .{err});
+@@ -879,6 +881,13 @@ pub fn curlStream(
+                 switch (result) {
+                     .delta => |content| {
+                         defer content.deinit(allocator);
++                        // Check between deltas too: one 4 KiB read can carry
++                        // dozens of buffered deltas, and each callback may block
++                        // on a full outbound queue.
++                        if (http_util.interruptRequested()) {
++                            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++                            return error.Interrupted;
++                        }
+                         try appendDeltaContent(allocator, &accumulated, &in_reasoning, callback, ctx, content);
+                     },
+                     .usage => |u| stream_usage = u,
+@@ -1168,19 +1177,26 @@ pub fn curlStreamAnthropic(
+ 
+     try child.spawn();
+ 
++    // Abort the in-flight stream when the agent /stop raises the interrupt
++    // flag: the watcher kills curl and the read loop below returns
++    // error.Interrupted instead of running the request to completion.
++    var cancel_done = std.atomic.Value(bool).init(false);
++    var cancel_watcher: ?std.Thread = null;
++    var cancel_ctx: http_util.CancelWatcherCtx = undefined;
++    http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
++    defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
++
+     if (child.stdin) |stdin_file| {
+         stdin_file.writeAll(body) catch {
+             stdin_file.close();
+             child.stdin = null;
+-            _ = child.kill() catch {};
+-            _ = child.wait() catch {};
++            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+             return error.CurlWriteError;
+         };
+         stdin_file.close();
+         child.stdin = null;
+     } else {
+-        _ = child.kill() catch {};
+-        _ = child.wait() catch {};
++        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+         return error.CurlWriteError;
+     }
+ 
+@@ -1199,6 +1215,12 @@ pub fn curlStreamAnthropic(
+     var read_buf: [4096]u8 = undefined;
+ 
+     outer: while (true) {
++        // /stop: stop reading at the next delta boundary instead of draining
++        // every delta the provider already buffered.
++        if (http_util.interruptRequested()) {
++            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++            return error.Interrupted;
++        }
+         const n = file.read(&read_buf) catch break;
+         if (n == 0) break;
+ 
+@@ -1216,6 +1238,10 @@ pub fn curlStreamAnthropic(
+                     },
+                     .delta => |text| {
+                         defer allocator.free(text);
++                        if (http_util.interruptRequested()) {
++                            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++                            return error.Interrupted;
++                        }
+                         try accumulated.appendSlice(allocator, text);
+                         callback(ctx, root.StreamChunk.textDelta(text));
+                     },
+@@ -1237,12 +1263,22 @@ pub fn curlStreamAnthropic(
+     // Free owned event string
+     if (current_event.len > 0) allocator.free(@constCast(current_event));
+ 
++    // A /stop killed curl before the stream finished: report the interrupt
++    // instead of salvaging the partial text as a completed response.
++    if (!saw_done and http_util.interruptRequested()) {
++        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
++        return error.Interrupted;
++    }
++
+     // Drain remaining stdout to prevent deadlock on wait()
+     while (true) {
+         const n = file.read(&read_buf) catch break;
+         if (n == 0) break;
+     }
+ 
++    // Join the watcher before reaping curl (PID-reuse window; see
++    // stopCancelWatcherAndReap). The stdout stream is already at EOF.
++    http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+     const term = child.wait() catch |err| {
+         log.err("curlStreamAnthropic child.wait failed: {}", .{err});
+         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+@@ -1525,6 +1561,92 @@ test "stdinWriteFailureIsInterrupt reports a stop, not a write error" {
+     try std.testing.expect(stdinWriteFailureIsInterrupt(&flag));
+ }
+ 
++test "curlStream aborts a never-ending stream promptly when the interrupt flag is raised" {
++    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
++
++    const allocator = std.testing.allocator;
++
++    // A local server that emits an SSE stream which never ends, so the read loop
++    // can only stop on the interrupt flag.
++    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
++    var server = try addr.listen(.{});
++    defer server.deinit();
++
++    const Ctx = struct {
++        server: *std_compat.net.Server,
++
++        fn serve(ctx: *@This()) void {
++            var conn = ctx.server.accept() catch return;
++            defer conn.stream.close();
++
++            // Read the request head so curl starts streaming.
++            var buf: [4096]u8 = undefined;
++            var filled: usize = 0;
++            while (filled < buf.len) {
++                const n = conn.stream.read(buf[filled..]) catch return;
++                if (n == 0) break;
++                filled += n;
++                if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
++            }
++
++            conn.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n") catch return;
++            // Never-ending stream: this only returns once curl is killed by the
++            // interrupt watcher and the connection drops.
++            while (true) {
++                conn.stream.writeAll("data: {\"choices\":[{\"delta\":{\"content\":\"xxxxxxxxxxxxxxxx\"}}]}\n\n") catch return;
++            }
++        }
++    };
++    var ctx = Ctx{ .server = &server };
++    const server_thread = try std.Thread.spawn(.{}, Ctx.serve, .{&ctx});
++    defer server_thread.join();
++
++    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1/chat/completions", .{server.listen_address.in.getPort()});
++    defer allocator.free(url);
++
++    var flag = std.atomic.Value(bool).init(false);
++    http_util.setThreadInterruptFlag(&flag);
++    defer http_util.setThreadInterruptFlag(null);
++
++    const SlowCallback = struct {
++        fn cb(_: *anyopaque, _: root.StreamChunk) void {
++            // Stand in for the daemon's stream callback, which must publish each
++            // delta; slow enough that draining the buffered deltas would keep the
++            // turn alive for seconds after the stop.
++            std_compat.thread.sleep(5 * std.time.ns_per_ms);
++        }
++    };
++    var cb_ctx: u8 = 0;
++
++    const Raiser = struct {
++        fn run(f: *std.atomic.Value(bool)) void {
++            std_compat.thread.sleep(300 * std.time.ns_per_ms);
++            f.store(true, .release);
++        }
++    };
++    const raiser = try std.Thread.spawn(.{}, Raiser.run, .{&flag});
++    defer raiser.join();
++
++    const start_ms = std_compat.time.milliTimestamp();
++    const result = curlStream(
++        allocator,
++        url,
++        "{}",
++        null,
++        &.{},
++        0,
++        SlowCallback.cb,
++        @ptrCast(&cb_ctx),
++    );
++    const elapsed_ms = std_compat.time.milliTimestamp() - start_ms;
++
++    // Regression: without the read-loop interrupt check the call drained every
++    // delta curl had already buffered (each through the slow callback), so the
++    // turn outlived the stop by seconds.
++    try std.testing.expectError(error.Interrupted, result);
++    try std.testing.expect(elapsed_ms < 2_000);
++}
++
+ test "finalizeStreamResultWithToolCalls flags a cut stream as truncated" {
+     const allocator = std.testing.allocator;
+     var accumulator = ToolCallAccumulator{};
+diff --git a/src/session.zig b/src/session.zig
+index 7379edc..6d325ba 100644
+--- a/src/session.zig
++++ b/src/session.zig
+@@ -2274,6 +2274,42 @@ pub const SessionManager = struct {
+         return requested;
+     }
+ 
++    /// Copy the outbound delivery target of the turn running for `session_key`
++    /// and any active `:thread:` child into `out` (caller frees each string).
++    ///
++    /// A `/stop` uses this to drop the stopped turn's already-queued stream
++    /// chunks. The target has to come from the running session, not from the
++    /// stop command: a Slack slash command carries no thread context, so its
++    /// own chat id names the whole channel and would silence concurrent
++    /// threads.
++    pub fn collectActiveTurnTargets(
++        self: *SessionManager,
++        allocator: Allocator,
++        session_key: []const u8,
++        out: *std.ArrayListUnmanaged([]u8),
++    ) void {
++        self.mutex.lock();
++        defer self.mutex.unlock();
++
++        appendActiveTurnTargetHelper(allocator, self.sessions.get(session_key), out);
++        var it = self.sessions.iterator();
++        while (it.next()) |entry| {
++            const parent = agent_routing.resolveThreadParentSessionKey(entry.key_ptr.*) orelse continue;
++            if (!std.mem.eql(u8, parent, session_key)) continue;
++            appendActiveTurnTargetHelper(allocator, entry.value_ptr.*, out);
++        }
++    }
++
++    fn appendActiveTurnTargetHelper(allocator: Allocator, session: ?*Session, out: *std.ArrayListUnmanaged([]u8)) void {
++        const s = session orelse return;
++        if (!s.turn_running.load(.acquire)) return;
++        const ctx = s.agent.conversation_context orelse return;
++        const target = ctx.delivery_chat_id orelse return;
++        if (target.len == 0) return;
++        const owned = allocator.dupe(u8, target) catch return;
++        out.append(allocator, owned) catch allocator.free(owned);
++    }
++
+     pub fn freeSessionSnapshots(allocator: Allocator, snapshots: []SessionSnapshot) void {
+         for (snapshots) |*snapshot| snapshot.deinit(allocator);
+         allocator.free(snapshots);
+-- 
+2.56.0
+

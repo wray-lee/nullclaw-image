@@ -1,0 +1,155 @@
+From 1d28f208eb32ade25bde61f223c42481f37451a6 Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Sat, 17 Oct 2026 00:30:57 +0900
+Subject: [PATCH] test(streaming): make dense-run regression tests independent
+ of runner speed
+
+Replace the wall-clock bounds in the dense-run strip tests with a test-only
+forward-scan work counter (`helpers.scan_work`), so the linear-complexity
+regression no longer flakes on a slow runner. Production scans pay nothing.
+---
+ src/providers/helpers.zig | 18 ++++++++++++++++++
+ src/streaming.zig         | 26 ++++++++++++++------------
+ 2 files changed, 32 insertions(+), 12 deletions(-)
+
+diff --git a/src/providers/helpers.zig b/src/providers/helpers.zig
+index 60d04fc..7945749 100644
+--- a/src/providers/helpers.zig
++++ b/src/providers/helpers.zig
+@@ -1,4 +1,5 @@
+ const std = @import("std");
++const builtin = @import("builtin");
+ const std_compat = @import("compat");
+ const json_util = @import("../json_util.zig");
+ const http_util = @import("../http_util.zig");
+@@ -173,6 +174,7 @@ pub fn nextToolCallClose(
+ ) ?ToolCallClose {
+     var idx = from;
+     while (idx < body.len) {
++        noteScan();
+         const rel = std.mem.indexOfScalar(u8, body[idx..], open_char) orelse return null;
+         const abs_open = idx + rel;
+         if (abs_open + 1 >= body.len or body[abs_open + 1] != '/') {
+@@ -205,6 +207,20 @@ pub fn nextToolCallClose(
+     return null;
+ }
+ 
++/// Test-only count of the forward-scan steps taken by the shared text
++/// tool-call parser and the batch strip. A linear strip examines each byte a
++/// bounded number of times; the O(N^2) scans this guards against re-walked the
++/// whole remaining text once per opener, so this count grew quadratically. The
++/// complexity regression tests assert a linear bound on it instead of timing
++/// the strip, which made them fail on a slow CI runner.
++pub var scan_work: usize = 0;
++
++/// Bump the test-only scan-work counter (see `scan_work`). A no-op outside
++/// tests, so the production scans pay nothing.
++inline fn noteScan() void {
++    if (comptime builtin.is_test) scan_work += 1;
++}
++
+ /// A single text tool call the dispatcher would execute, extracted by the
+ /// shared `parseDispatcherXmlToolCalls`. These are the agent dispatcher's own
+ /// inner-call parsers, moved here verbatim so the display paths and the
+@@ -935,6 +951,7 @@ pub fn parseDispatcherXmlToolCalls(
+             // even when no marker of a given dialect occurs at all.
+             var search_pos: usize = 0;
+             while (search_pos < remaining.len) {
++                noteScan();
+                 const p = std.mem.indexOfAnyPos(u8, remaining, search_pos, "<[") orelse break;
+                 for (dispatcher_marker_tags) |m| {
+                     if (std.mem.startsWith(u8, remaining[p..], m)) {
+@@ -1367,6 +1384,7 @@ const CloseScanner = struct {
+         }
+         var p = from;
+         while (std.mem.indexOfScalarPos(u8, self.text, p, '<')) |lt| {
++            noteScan();
+             if (matchToolCallClose(self.text, lt, false)) |end| {
+                 self.match_valid = true;
+                 self.match_from = from;
+diff --git a/src/streaming.zig b/src/streaming.zig
+index 8e5ff64..f5cf5be 100644
+--- a/src/streaming.zig
++++ b/src/streaming.zig
+@@ -773,7 +773,6 @@ pub const TagFilter = struct {
+ };
+ 
+ const std = @import("std");
+-const std_compat = @import("compat");
+ 
+ // ---------------------------------------------------------------------------
+ // ThinkPassthroughFilter — thin compatibility wrapper around `TagFilter`'s
+@@ -1484,6 +1483,14 @@ fn assertEverySplit(
+     }
+ }
+ 
++/// Assert the batch strip's forward-scan work stays linear in the input size.
++/// A quadratic strip re-walks the remaining text once per marker, so its step
++/// count is orders of magnitude past this bound; asserting work instead of wall
++/// time keeps the check independent of the CI runner's speed.
++fn expectStripWorkLinear(input_len: usize) !void {
++    try std.testing.expect(providers.helpers.scan_work < 8 * input_len);
++}
++
+ test "TagFilter drops an unterminated close tag before </think>" {
+     // Regression: a close tag that omits its `>` (whitespace delimiter) right
+     // before `</think>` entered `.close_tag`, ate up to the `>` of `</think>`,
+@@ -1902,15 +1909,13 @@ test "TagFilter strips a large multi-marker stream in one pass" {
+         try input.appendSlice(a, "text <tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls -la\"}}</tool_call> more ");
+     }
+ 
+-    const start_ns = std_compat.time.nanoTimestamp();
++    providers.helpers.scan_work = 0;
+     const batch = try providers.stripToolCallMarkup(a, input.items);
+-    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+     defer a.free(batch);
+ 
+     try std.testing.expect(std.mem.indexOf(u8, batch, "<tool_call>") == null);
+     try std.testing.expect(std.mem.indexOf(u8, batch, "more") != null);
+-    // Generous bound; a quadratic implementation blows well past it.
+-    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
++    try expectStripWorkLinear(input.items.len);
+ }
+ 
+ test "TagFilter strips a dense run of unclosed openers in one pass" {
+@@ -1926,16 +1931,14 @@ test "TagFilter strips a dense run of unclosed openers in one pass" {
+         try input.appendSlice(a, "<tool_call>literal ");
+     }
+ 
+-    const start_ns = std_compat.time.nanoTimestamp();
++    providers.helpers.scan_work = 0;
+     const batch = try providers.stripToolCallMarkup(a, input.items);
+-    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+     defer a.free(batch);
+ 
+     // No opener here closes and none is a call the dispatcher would execute, so
+     // every byte is released verbatim.
+     try std.testing.expectEqualStrings(input.items, batch);
+-    // Generous bound; the quadratic implementation blows well past it.
+-    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
++    try expectStripWorkLinear(input.items.len);
+ }
+ 
+ test "TagFilter keeps a dense run of unclosed openers in step with the batch strip" {
+@@ -1961,16 +1964,15 @@ test "TagFilter strips a large dense run of closed calls in one pass" {
+         try input.appendSlice(a, "A<tool_call>{\"name\":\"shell\",\"arguments\":{}}</tool_call>B");
+     }
+ 
+-    const start_ns = std_compat.time.nanoTimestamp();
++    providers.helpers.scan_work = 0;
+     const batch = try providers.stripToolCallMarkup(a, input.items);
+-    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
+     defer a.free(batch);
+ 
+     // Every block is a call the dispatcher executes, so only the `A`/`B` text
+     // survives.
+     try std.testing.expect(std.mem.indexOf(u8, batch, "<tool_call>") == null);
+     try std.testing.expect(std.mem.indexOf(u8, batch, "AB") != null);
+-    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
++    try expectStripWorkLinear(input.items.len);
+ }
+ 
+ test "TagFilter keeps a dense run of closed calls in step with the batch strip" {
+-- 
+2.56.0
+
