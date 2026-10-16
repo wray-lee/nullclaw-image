@@ -1,0 +1,839 @@
+From f1fb9cb986972c240a9158710914ffe1c8911443 Mon Sep 17 00:00:00 2001
+From: wray-lee <wray-lee@outlook.com>
+Date: Fri, 16 Oct 2026 17:00:04 +0900
+Subject: [PATCH] feat(slack): handle the single Slack slash command over
+ Socket Mode
+
+Slack delivers a slash command over Socket Mode as a `slash_commands`
+envelope, which the socket loop acked and silently dropped (it only
+processed `events_api`). Registering one OpenClaw-style command and
+typing "/nullclaw /stop" therefore did nothing.
+
+- Add channels.slack.accounts.<id>.slash_command { enabled, name }
+  (default disabled; name "nullclaw", compared without the leading "/"
+  and case-insensitively).
+- In handleSocketPayload, after the ack (Slack's 3s budget), route
+  `slash_commands` envelopes to handleSlashCommand: match the command
+  name, apply the same DM/group allowlist gates as a normal message, then
+  publish payload.text as a top-level message in payload.channel_id.
+  Everything downstream is unchanged, so /stop reaches the same interrupt
+  path as a typed "/stop".
+- A stop command is always top-level and carries no thread context, so
+  the enqueue-time stop fast-path now interrupts the routed session and
+  any active `:thread:` child of it: `/nullclaw /stop` also interrupts a
+  turn running inside a thread under that channel.
+- Ignore retried slash_commands envelopes (retry_attempt > 0) so a failed
+  ack cannot run the command twice; bound the response_url POST so a slow
+  reply cannot stall the socket read loop.
+- A slash command is an explicit, app-directed invocation, so it counts
+  as a mention for group_policy=mention_only; empty text replies with
+  usage via response_url; an unauthorized sender gets an ephemeral
+  refusal; a command name that does not match the configured name is
+  logged and answered with an ephemeral notice instead of being silent.
+- Extract the inbound-publish tail of processHistoryMessage into
+  publishInboundMessage so both paths derive the same chat_id/session_key.
+- Tests: name match, publish, /stop through the daemon stop fast-path for
+  both the channel session and a busy thread session, unknown name, auth
+  refusal, empty text, envelope ack-before-dispatch, retry suppression,
+  response-body encoding, config parse/defaults.
+- Docs (en/zh).
+---
+ docs/en/configuration.md |  45 +++++
+ docs/zh/configuration.md |  29 +++
+ src/channels/slack.zig   | 397 +++++++++++++++++++++++++++++++++++++++
+ src/config.zig           |  31 +++
+ src/config_types.zig     |  13 ++
+ src/daemon.zig           | 107 ++++++++++-
+ src/session.zig          |  32 ++++
+ 7 files changed, 651 insertions(+), 3 deletions(-)
+
+diff --git a/docs/en/configuration.md b/docs/en/configuration.md
+index aa8b4b5..eee47f5 100644
+--- a/docs/en/configuration.md
++++ b/docs/en/configuration.md
+@@ -1138,6 +1138,51 @@ Parameters:
+ - `streaming` (default: `false`) - Show the reply while it is still being generated. See below
+ - `status_reactions` (default: `false`) - Show the task lifecycle as a reaction on the message that triggered it: `accepted`, `running`, then `done` or `failed`. Needs the `reactions:write` scope. See below
+ - `reaction_emojis` (default: `eyes`, `hourglass_flowing_sand`, `white_check_mark`, `x`) - Per-state overrides for `accepted`, `running`, `done`, `failed`. Slack takes short names, not the emoji themselves; an empty string clears the reaction for that state
++- `slash_command` (default: disabled) - Single-command Slack integration: register one slash command and handle its text like a normal message. See below
++
++#### Slack slash command
++
++Slack only delivers a slash command when the app registers it, and Slack's UI
++supports one command per registration. Set `slash_command.enabled = true` and
++register the same name in your Slack app:
++
++```json
++"slash_command": { "enabled": true, "name": "nullclaw" }
++```
++
++`name` is the command without the leading `/` (default `nullclaw`); the match is
++case-insensitive. In Socket Mode the command's request URL in the app config is
++ignored, because Slack sends the payload over the WebSocket.
++
++Type `/nullclaw <message>` and the text after the command is handled exactly as
++if the user had typed it in that channel. Every normal command works, including
++`/nullclaw /stop`, which interrupts the running turn for that channel (or the
++user's DM) the same way a typed `/stop` does; because a slash command is always
++top-level it also interrupts a turn running inside a thread under that channel.
++The command is an explicit invocation of the app, so it is treated as a mention:
++the `allow_from` and DM/group allowlist gates still apply, but `group_policy =
++mention_only` does not block it. Restrict `allow_from` (or the group allowlist)
++if you do not want every admitted member to be able to drive the agent from a
++mention-only room. An empty command shows a short usage reply; an unauthorized
++sender gets a short ephemeral refusal, and a command name that does not match the
++configured `name` is logged and answered with an ephemeral notice instead of
++being silently dropped.
++
++Add to the app manifest under `features` (Socket Mode):
++
++```json
++"features": {
++  "slash_commands": [
++    {
++      "command": "/nullclaw",
++      "description": "Send a message to nullclaw",
++      "should_escape": false
++    }
++  ]
++}
++```
++
++and add the `commands` scope to `oauth_config.scopes.bot`.
+ 
+ #### Slack status reactions
+ 
+diff --git a/docs/zh/configuration.md b/docs/zh/configuration.md
+index 0c9b12d..a9b59a6 100644
+--- a/docs/zh/configuration.md
++++ b/docs/zh/configuration.md
+@@ -940,8 +940,37 @@ Slack 示例：
+ - `reply_to_mode`（默认 `off`）——`off` 仅在触发消息本身已是 thread 回复时才用 thread；`all` 始终在 thread 中回复
+ - `status_reactions`（默认 `false`）——在触发消息上用 reaction 显示任务状态：`accepted`、`running`，最后是 `done` 或 `failed`。需要 `reactions:write` 权限
+ - `reaction_emojis`（默认 `eyes`、`hourglass_flowing_sand`、`white_check_mark`、`x`）——按状态覆盖 `accepted`、`running`、`done`、`failed`。Slack 用短名而非 emoji 本身；空字符串表示该状态不加 reaction（并移除已有的）
++- `slash_command`（默认关闭）——单命令 Slack 集成：注册一个斜杠命令，并把其后的文本当作普通消息处理。见下文
+ - `streaming`（默认 `false`）——在回复仍在生成时就展示，见下文
+ 
++#### Slack 斜杠命令
++
++只有应用注册了斜杠命令，Slack 才会投递它，且 Slack 界面每次注册只支持一个命令。设置 `slash_command.enabled = true`，并在 Slack 应用里注册同名命令：
++
++```json
++"slash_command": { "enabled": true, "name": "nullclaw" }
++```
++
++`name` 是不带前导 `/` 的命令名（默认 `nullclaw`），匹配不区分大小写。Socket Mode 下应用配置里的请求 URL 会被忽略，因为 Slack 通过 WebSocket 投递 payload。
++
++输入 `/nullclaw <消息>` 后，命令之后的文本会像用户在该频道里直接输入一样被处理。所有普通命令都可用，包括 `/nullclaw /stop`——它会像手动输入 `/stop` 一样中断该频道（或该用户 DM）正在运行的回合；由于斜杠命令始终是顶层的，它也会中断该频道下某个 thread 里正在运行的回合。斜杠命令是对应用的显式调用，因此被视为一次 mention：`allow_from` 以及 DM/群组 allowlist 检查依然生效，但 `group_policy = mention_only` 不会拦截它。若不希望所有被允许的成员都能在 mention_only 房间里驱动 agent，请收紧 `allow_from`（或群组 allowlist）。空命令会返回一条简短用法提示；未授权发送者会收到一条短暂的 ephemeral 拒绝；与配置的 `name` 不匹配的命令名会被记录日志并以 ephemeral 提示回应，而不是被静默丢弃。
++
++在应用 manifest 的 `features` 下添加（Socket Mode）：
++
++```json
++"features": {
++  "slash_commands": [
++    {
++      "command": "/nullclaw",
++      "description": "Send a message to nullclaw",
++      "should_escape": false
++    }
++  ]
++}
++```
++
++并在 `oauth_config.scopes.bot` 中加入 `commands` scope。
++
+ #### Slack 状态 reaction
+ 
+ `status_reactions = true` 时，nullclaw 用 `reactions.add` 在触发消息上加 reaction，随任务推进在 `accepted`、`running`、`done`/`failed` 之间切换，并在该状态的短名为空时用 `reactions.remove` 移除。Slack 的 reaction 是累加而非替换，因此会显式移除上一个状态。
+diff --git a/src/channels/slack.zig b/src/channels/slack.zig
+index b00f62c..5f0225a 100644
+--- a/src/channels/slack.zig
++++ b/src/channels/slack.zig
+@@ -106,6 +106,31 @@ fn buildThreadStatusRequestBody(
+     return try body_list.toOwnedSlice(allocator);
+ }
+ 
++/// Build the JSON body for an ephemeral slash-command reply. Split out of
++/// respondToSlashCommand so the encoding is unit-testable without a network call.
++fn buildSlashResponseBody(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
++    var body_list: std.ArrayListUnmanaged(u8) = .empty;
++    errdefer body_list.deinit(allocator);
++    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_list);
++    errdefer body_writer.deinit();
++    const bw = &body_writer.writer;
++    try bw.writeAll("{\"text\":");
++    try root.appendJsonStringW(bw, text);
++    try bw.writeAll(",\"response_type\":\"ephemeral\"}");
++    body_list = body_writer.toArrayList();
++    return try body_list.toOwnedSlice(allocator);
++}
++
++/// Slack re-delivers an envelope (after a failed ack) with `retry_attempt`
++/// set. Return it, or 0 when absent, so a first delivery is always processed.
++fn socketRetryAttempt(obj: std.json.ObjectMap) u64 {
++    const val = obj.get("retry_attempt") orelse return 0;
++    return switch (val) {
++        .integer => |n| if (n > 0) @intCast(n) else 0,
++        else => 0,
++    };
++}
++
+ /// Slack targets are `channel_id` or `channel_id:thread_ts`; a reaction is
+ /// keyed by channel only, so the thread suffix is dropped.
+ fn slackChannelIdOf(target: []const u8) ?[]const u8 {
+@@ -241,6 +266,8 @@ pub const SlackChannel = struct {
+     bot_user_id: ?[]u8 = null,
+     bot_team_id: ?[]u8 = null,
+     bot_api_app_id: ?[]u8 = null,
++    slash_command_enabled: bool = false,
++    slash_command_name: []const u8 = "nullclaw",
+ 
+     pub const API_BASE = "https://slack.com/api";
+     pub const DEFAULT_WEBHOOK_PATH = "/slack/events";
+@@ -326,6 +353,8 @@ pub const SlackChannel = struct {
+         ch.signing_secret = cfg.signing_secret;
+         ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
+         ch.reply_to_mode = cfg.reply_to_mode;
++        ch.slash_command_enabled = cfg.slash_command.enabled;
++        ch.slash_command_name = if (cfg.slash_command.name.len == 0) "nullclaw" else cfg.slash_command.name;
+         ch.streaming_enabled = cfg.streaming;
+         ch.status_reactions_enabled = cfg.status_reactions;
+         ch.reaction_emojis = cfg.reaction_emojis;
+@@ -607,6 +636,22 @@ pub const SlackChannel = struct {
+         return channel_id.len > 0 and channel_id[0] == 'D';
+     }
+ 
++    /// Strip a leading `/` and surrounding whitespace from a slash command name.
++    fn normalizeSlashCommandName(raw: []const u8) []const u8 {
++        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
++        if (trimmed.len > 0 and trimmed[0] == '/') return std.mem.trim(u8, trimmed[1..], " \t\r\n");
++        return trimmed;
++    }
++
++    /// Compare a configured slash command name with the one Slack delivered,
++    /// ignoring a leading `/` and case.
++    fn slashCommandNameMatches(configured: []const u8, incoming: []const u8) bool {
++        const want = normalizeSlashCommandName(configured);
++        const got = normalizeSlashCommandName(incoming);
++        if (want.len == 0 or got.len == 0) return false;
++        return std.ascii.eqlIgnoreCase(want, got);
++    }
++
+     fn normalizedBotToken(self: *const SlackChannel) []const u8 {
+         return std.mem.trim(u8, self.bot_token, TOKEN_TRIM_CHARS);
+     }
+@@ -759,6 +804,23 @@ pub const SlackChannel = struct {
+         const is_dm = isDirectConversationId(channel_id);
+         if (!self.shouldHandle(sender_id, is_dm, text, self.bot_user_id)) return;
+ 
++        try self.publishInboundMessage(sender_id, channel_id, text, message_ts, thread_ts);
++    }
++
++    /// Build and publish an inbound Slack message onto the bus. Shared by the
++    /// Socket Mode event pipeline and the single slash command so both derive
++    /// the same chat_id/session_key and reach the same command handling: a
++    /// `/stop` typed in a channel and `/name /stop` interrupt the same turn.
++    fn publishInboundMessage(
++        self: *SlackChannel,
++        sender_id: []const u8,
++        channel_id: []const u8,
++        text: []const u8,
++        message_ts: ?[]const u8,
++        thread_ts: ?[]const u8,
++    ) !void {
++        const is_dm = isDirectConversationId(channel_id);
++
+         // Determine effective thread_ts for the reply target.
+         // A message with thread_ts == ts is a top-level post that merely started a
+         // thread; only thread_ts != ts means it is an actual thread reply.
+@@ -826,6 +888,93 @@ pub const SlackChannel = struct {
+         }
+     }
+ 
++    /// Handle a Slack `slash_commands` Socket Mode envelope for the single
++    /// configured command. The envelope is already acked by the caller.
++    pub fn handleSlashCommand(self: *SlackChannel, payload_obj: std.json.ObjectMap) void {
++        if (!self.slash_command_enabled) {
++            log.warn("Slack slash command received but channels.slack.slash_command.enabled is false; ignoring", .{});
++            return;
++        }
++
++        const command_val = payload_obj.get("command") orelse return;
++        if (command_val != .string) return;
++        if (!slashCommandNameMatches(self.slash_command_name, command_val.string)) {
++            // A registered command that does not match the configured name is a
++            // misconfiguration (for example the app registers "/openclaw" while
++            // the default name is "nullclaw"). Make it observable instead of
++            // silently dropping the invocation.
++            log.warn("Slack slash command {s} does not match the configured name {s}; set channels.slack.slash_command.name", .{ command_val.string, self.slash_command_name });
++            self.respondToSlashCommand(payload_obj, "This command is not configured on this app.");
++            return;
++        }
++
++        if (self.shouldDropMismatchedSocketEvent(payload_obj)) return;
++
++        const user_val = payload_obj.get("user_id") orelse return;
++        if (user_val != .string or user_val.string.len == 0) return;
++        const sender_id = user_val.string;
++        if (self.bot_user_id) |bot_uid| {
++            if (std.mem.eql(u8, sender_id, bot_uid)) return;
++        }
++
++        const channel_val = payload_obj.get("channel_id") orelse return;
++        if (channel_val != .string or channel_val.string.len == 0) return;
++        const channel_id = channel_val.string;
++
++        const text = if (payload_obj.get("text")) |text_val|
++            if (text_val == .string) std.mem.trim(u8, text_val.string, " \t\r\n") else ""
++        else
++            "";
++
++        const is_dm = isDirectConversationId(channel_id);
++        // SECURITY/UX NOTE: a slash command is an explicit, app-directed
++        // invocation, so it is treated as a mention for the group policy. The
++        // same DM/allowlist gates as a normal message still apply (an
++        // unauthorized sender is refused below), but `group_policy =
++        // mention_only` does NOT block it, because Slack never puts a bot
++        // mention in the slash text. Anyone the allowlists admit can therefore
++        // drive the agent with `/name <text>` in a mention-only room; tighten
++        // `allow_from` or the group allowlist to restrict this.
++        if (!root.checkPolicyScoped("slack channel", self.policy, sender_id, is_dm, true)) {
++            log.warn("Slack slash command from unauthorized sender dropped channel={s}", .{channel_id});
++            self.respondToSlashCommand(payload_obj, "You are not authorized to use this command.");
++            return;
++        }
++
++        if (text.len == 0) {
++            self.respondToSlashCommand(payload_obj, "Send a message after the command, for example `/stop`.");
++            return;
++        }
++
++        // Feed the text as if the user typed it in this channel (top level), so
++        // the normal command handling runs. A `/stop` therefore reaches the same
++        // interrupt path as a typed message.
++        self.publishInboundMessage(sender_id, channel_id, text, null, null) catch |err| {
++            log.warn("Slack slash command publish failed: {}", .{err});
++        };
++    }
++
++    /// Best-effort ephemeral reply to a slash command via its response_url.
++    /// Slack only needs a plain JSON POST; failures are logged, never
++    /// propagated. The POST is bounded so a slow or unreachable response_url
++    /// cannot stall the Socket Mode read loop and delay acks for later
++    /// envelopes (which makes Slack retry and re-deliver them).
++    fn respondToSlashCommand(self: *SlackChannel, payload_obj: std.json.ObjectMap, text: []const u8) void {
++        if (builtin.is_test) return;
++
++        const url_val = payload_obj.get("response_url") orelse return;
++        if (url_val != .string or url_val.string.len == 0) return;
++
++        const body = buildSlashResponseBody(self.allocator, text) catch return;
++        defer self.allocator.free(body);
++
++        const resp = root.http_util.curlPostWithProxy(self.allocator, url_val.string, body, &.{}, null, "2") catch |err| {
++            log.warn("Slack slash response_url post failed: {}", .{err});
++            return;
++        };
++        self.allocator.free(resp);
++    }
++
+     fn pollChannelHistory(self: *SlackChannel, channel_id: []const u8) !void {
+         var url_buf: [1024]u8 = undefined;
+         var w: std.Io.Writer = .fixed(&url_buf);
+@@ -1041,6 +1190,21 @@ pub const SlackChannel = struct {
+             }
+         }
+ 
++        if (std.mem.eql(u8, msg_type, "slash_commands")) {
++            // Slack delivers the single configured slash command over Socket
++            // Mode as a `slash_commands` envelope. The envelope is already
++            // acked above; decide here whether to act on it.
++            //
++            // A failed ack makes Slack resend the envelope with
++            // retry_attempt > 0. Ignore those: the command already ran and
++            // re-processing it would double the side effects.
++            if (socketRetryAttempt(parsed.value.object) > 0) return;
++            const slash_payload = parsed.value.object.get("payload") orelse return;
++            if (slash_payload != .object) return;
++            self.handleSlashCommand(slash_payload.object);
++            return;
++        }
++
+         if (!std.mem.eql(u8, msg_type, "events_api")) return;
+ 
+         const payload_val = parsed.value.object.get("payload") orelse return;
+@@ -3464,3 +3628,236 @@ test "SlackChannel start + stop concurrency stress test" {
+     try std.testing.expect(ch_struct.socket_thread == null);
+     try std.testing.expect(ch_struct.poll_thread == null);
+ }
++
++// -- Single-command slash support -------------------------------------------
++
++fn slashCommandTestPayload(alloc: std.mem.Allocator, command: []const u8, text: []const u8) !std.json.Parsed(std.json.Value) {
++    const json = try std.fmt.allocPrint(
++        alloc,
++        "{{\"command\":\"{s}\",\"text\":\"{s}\",\"user_id\":\"U1\",\"channel_id\":\"C1\",\"channel_name\":\"general\",\"team_id\":\"T1\",\"response_url\":\"https://example.invalid/hook\"}}",
++        .{ command, text },
++    );
++    defer alloc.free(json);
++    return std.json.parseFromSlice(std.json.Value, alloc, json, .{});
++}
++
++test "slack slash command name match ignores leading slash and case" {
++    try std.testing.expect(SlackChannel.slashCommandNameMatches("nullclaw", "/NULLCLAW"));
++    try std.testing.expect(SlackChannel.slashCommandNameMatches("/nullclaw", "nullclaw"));
++    try std.testing.expect(!SlackChannel.slashCommandNameMatches("nullclaw", "/other"));
++    try std.testing.expect(!SlackChannel.slashCommandNameMatches("", "/nullclaw"));
++}
++
++test "slack slash command publishes the text as a top-level channel message" {
++    const alloc = std.testing.allocator;
++    var eb = bus_mod.Bus.init();
++    defer eb.close();
++
++    const allowed = [_][]const u8{"*"};
++    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
++    ch.account_id = "sl-main";
++    ch.policy = .{ .dm = .allow, .group = .open };
++    ch.slash_command_enabled = true;
++    ch.slash_command_name = "nullclaw";
++    ch.setBus(&eb);
++
++    const parsed = try slashCommandTestPayload(alloc, "/nullclaw", "hello there");
++    defer parsed.deinit();
++    ch.handleSlashCommand(parsed.value.object);
++
++    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
++    defer msg.deinit(alloc);
++    try std.testing.expectEqualStrings("slack", msg.channel);
++    try std.testing.expectEqualStrings("U1", msg.sender_id);
++    try std.testing.expectEqualStrings("C1", msg.chat_id);
++    try std.testing.expectEqualStrings("slack:sl-main:channel:C1", msg.session_key);
++    try std.testing.expectEqualStrings("hello there", msg.content);
++}
++
++test "slack slash command /stop is published verbatim as a stop command" {
++    const alloc = std.testing.allocator;
++    var eb = bus_mod.Bus.init();
++    defer eb.close();
++
++    const allowed = [_][]const u8{"*"};
++    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
++    ch.account_id = "sl-main";
++    ch.policy = .{ .dm = .allow, .group = .open };
++    ch.slash_command_enabled = true;
++    ch.slash_command_name = "nullclaw";
++    ch.setBus(&eb);
++
++    const parsed = try slashCommandTestPayload(alloc, "/nullclaw", "/stop");
++    defer parsed.deinit();
++    ch.handleSlashCommand(parsed.value.object);
++
++    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
++    defer msg.deinit(alloc);
++    // The text is fed through verbatim, so the core sees the same stop command
++    // a typed "/stop" produces. The interrupt itself is covered end to end by
++    // the daemon fast-path tests, which consume this exact message.
++    try std.testing.expectEqualStrings("/stop", msg.content);
++    try std.testing.expect(@import("../control_plane.zig").isStopLikeCommand(msg.content));
++    try std.testing.expectEqualStrings("slack:sl-main:channel:C1", msg.session_key);
++}
++
++test "slack slash command ignores an unknown command name" {
++    const alloc = std.testing.allocator;
++    var eb = bus_mod.Bus.init();
++    defer eb.close();
++
++    const allowed = [_][]const u8{"*"};
++    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
++    ch.account_id = "sl-main";
++    ch.policy = .{ .dm = .allow, .group = .open };
++    ch.slash_command_enabled = true;
++    ch.slash_command_name = "nullclaw";
++    ch.setBus(&eb);
++
++    const parsed = try slashCommandTestPayload(alloc, "/other", "hi");
++    defer parsed.deinit();
++    ch.handleSlashCommand(parsed.value.object);
++
++    // consumeInbound() blocks when empty; use a zero timeout to assert nothing was published.
++    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
++}
++
++test "slack slash command refuses an unauthorized sender" {
++    const alloc = std.testing.allocator;
++    var eb = bus_mod.Bus.init();
++    defer eb.close();
++
++    const allowed = [_][]const u8{"*"};
++    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
++    ch.account_id = "sl-main";
++    // Group allowlist that does not contain U1 -> refused even though the slash
++    // invocation counts as a mention.
++    ch.policy = .{ .dm = .allow, .group = .allowlist, .allowlist = &.{} };
++    ch.slash_command_enabled = true;
++    ch.slash_command_name = "nullclaw";
++    ch.setBus(&eb);
++
++    const parsed = try slashCommandTestPayload(alloc, "/nullclaw", "hi");
++    defer parsed.deinit();
++    ch.handleSlashCommand(parsed.value.object);
++
++    // consumeInbound() blocks when empty; use a zero timeout to assert nothing was published.
++    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
++}
++
++test "slack slash command empty text does not publish" {
++    const alloc = std.testing.allocator;
++    var eb = bus_mod.Bus.init();
++    defer eb.close();
++
++    const allowed = [_][]const u8{"*"};
++    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
++    ch.account_id = "sl-main";
++    ch.policy = .{ .dm = .allow, .group = .open };
++    ch.slash_command_enabled = true;
++    ch.slash_command_name = "nullclaw";
++    ch.setBus(&eb);
++
++    const parsed = try slashCommandTestPayload(alloc, "/nullclaw", "");
++    defer parsed.deinit();
++    ch.handleSlashCommand(parsed.value.object);
++
++    // consumeInbound() blocks when empty; use a zero timeout to assert nothing was published.
++    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
++}
++
++test "slack slash_commands envelope is acked before it is dispatched" {
++    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
++        @TypeOf(std.posix.system.socketpair) == void)
++    {
++        return error.SkipZigTest;
++    } else {
++        const alloc = std.testing.allocator;
++        var eb = bus_mod.Bus.init();
++        defer eb.close();
++
++        const sockets = try websocket.createTestSocketPair();
++        defer std.Io.Threaded.closeFd(sockets[0]);
++        defer std.Io.Threaded.closeFd(sockets[1]);
++
++        const allowed = [_][]const u8{"*"};
++        var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
++        ch.account_id = "sl-main";
++        ch.policy = .{ .dm = .allow, .group = .open };
++        ch.slash_command_enabled = true;
++        ch.slash_command_name = "nullclaw";
++        ch.setBus(&eb);
++
++        var ws = websocket.WsClient{
++            .allocator = alloc,
++            .stream = .{ .handle = sockets[0] },
++            .tls = null,
++            .write_mu = .{},
++        };
++
++        const envelope =
++            \\{"type":"slash_commands","envelope_id":"e1","payload":{"command":"/nullclaw","text":"/stop","user_id":"U1","channel_id":"C1","team_id":"T1","response_url":"https://example.invalid/hook"}}
++        ;
++        try ch.handleSocketPayload(&ws, envelope);
++
++        // The ack frame reaches the socket, and the message is dispatched.
++        // poll first so a missing ack fails the test instead of blocking.
++        var pollfds = [_]std.posix.pollfd{.{ .fd = sockets[1], .events = std.posix.POLL.IN, .revents = 0 }};
++        const ready = try std.posix.poll(&pollfds, 1000);
++        try std.testing.expect(ready > 0);
++        var buf: [64]u8 = undefined;
++        const n = try std.posix.read(sockets[1], &buf);
++        try std.testing.expect(n > 0);
++        try std.testing.expectEqual(@as(u8, 0x81), buf[0]);
++
++        var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
++        defer msg.deinit(alloc);
++        try std.testing.expectEqualStrings("/stop", msg.content);
++    }
++}
++
++test "slack slash response body is a valid ephemeral JSON reply" {
++    const alloc = std.testing.allocator;
++    const body = try buildSlashResponseBody(alloc, "say \"hi\"\nnow");
++    defer alloc.free(body);
++    try std.testing.expectEqualStrings("{\"text\":\"say \\\"hi\\\"\\nnow\",\"response_type\":\"ephemeral\"}", body);
++}
++
++test "slack slash envelope with retry_attempt is acked but not dispatched again" {
++    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
++        @TypeOf(std.posix.system.socketpair) == void)
++    {
++        return error.SkipZigTest;
++    } else {
++        const alloc = std.testing.allocator;
++        var eb = bus_mod.Bus.init();
++        defer eb.close();
++
++        const sockets = try websocket.createTestSocketPair();
++        defer std.Io.Threaded.closeFd(sockets[0]);
++        defer std.Io.Threaded.closeFd(sockets[1]);
++
++        const allowed = [_][]const u8{"*"};
++        var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
++        ch.account_id = "sl-main";
++        ch.policy = .{ .dm = .allow, .group = .open };
++        ch.slash_command_enabled = true;
++        ch.slash_command_name = "nullclaw";
++        ch.setBus(&eb);
++
++        var ws = websocket.WsClient{
++            .allocator = alloc,
++            .stream = .{ .handle = sockets[0] },
++            .tls = null,
++            .write_mu = .{},
++        };
++
++        const envelope =
++            \\{"type":"slash_commands","envelope_id":"e1","retry_attempt":1,"payload":{"command":"/nullclaw","text":"/stop","user_id":"U1","channel_id":"C1","team_id":"T1","response_url":"https://example.invalid/hook"}}
++        ;
++        try ch.handleSocketPayload(&ws, envelope);
++
++        // A retried delivery is acked but must not run the command twice.
++        try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
++    }
++}
+diff --git a/src/config.zig b/src/config.zig
+index 3efbbdf..247f6ff 100644
+--- a/src/config.zig
++++ b/src/config.zig
+@@ -8583,3 +8583,34 @@ test "parse telegram rich_messages defaults off and can be enabled" {
+     }
+     allocator.free(cfg.channels.telegram);
+ }
++
++test "parse slack slash command config" {
++    const allocator = std.testing.allocator;
++    const json =
++        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123", "slash_command": {"enabled": true, "name": "openclaw"}}}}}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try cfg.parseJson(json);
++    try std.testing.expect(cfg.channels.slack.len > 0);
++    try std.testing.expect(cfg.channels.slack[0].slash_command.enabled);
++    try std.testing.expectEqualStrings("openclaw", cfg.channels.slack[0].slash_command.name);
++    allocator.free(cfg.channels.slack[0].account_id);
++    allocator.free(cfg.channels.slack[0].bot_token);
++    allocator.free(cfg.channels.slack[0].slash_command.name);
++    allocator.free(cfg.channels.slack);
++}
++
++test "slack slash command defaults to disabled with name nullclaw" {
++    const allocator = std.testing.allocator;
++    const json =
++        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
++    ;
++    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
++    try cfg.parseJson(json);
++    try std.testing.expect(cfg.channels.slack.len > 0);
++    try std.testing.expect(!cfg.channels.slack[0].slash_command.enabled);
++    try std.testing.expectEqualStrings("nullclaw", cfg.channels.slack[0].slash_command.name);
++    allocator.free(cfg.channels.slack[0].account_id);
++    allocator.free(cfg.channels.slack[0].bot_token);
++    allocator.free(cfg.channels.slack);
++}
+diff --git a/src/config_types.zig b/src/config_types.zig
+index a66646b..95c7d2c 100644
+--- a/src/config_types.zig
++++ b/src/config_types.zig
+@@ -715,6 +715,17 @@ pub const SlackReactionEmojisConfig = struct {
+     failed: []const u8 = "x",
+ };
+ 
++/// Single-command Slack slash integration (OpenClaw-style). When enabled the
++/// Slack app registers exactly ONE slash command; Slack delivers it over Socket
++/// Mode as a `slash_commands` envelope and the text after the command name is
++/// handled as an ordinary inbound message.
++pub const SlackSlashCommandConfig = struct {
++    /// Accept the configured slash command. Off by default.
++    enabled: bool = false,
++    /// Command name without the leading `/`. Compared case-insensitively.
++    name: []const u8 = "nullclaw",
++};
++
+ pub const SlackConfig = struct {
+     account_id: []const u8 = "default",
+     mode: SlackReceiveMode = .socket,
+@@ -727,6 +738,8 @@ pub const SlackConfig = struct {
+     dm_policy: []const u8 = "pairing",
+     group_policy: []const u8 = "mention_only",
+     reply_to_mode: SlackReplyToMode = .off,
++    /// Single-command slash integration. See SlackSlashCommandConfig.
++    slash_command: SlackSlashCommandConfig = .{},
+     /// Stream replies while the model is still generating them.
+     /// In a thread this uses Slack's native chat.startStream/appendStream/stopStream;
+     /// elsewhere it falls back to a chat.postMessage that is edited with chat.update.
+diff --git a/src/daemon.zig b/src/daemon.zig
+index 8abc923..5544be1 100644
+--- a/src/daemon.zig
++++ b/src/daemon.zig
+@@ -1298,9 +1298,11 @@ fn tryHandleStopCommandBeforeEnqueue(
+     defer if (routed_session_key) |key| allocator.free(key);
+     const session_key = routed_session_key orelse msg.session_key;
+ 
+-    var interrupt = session_mgr.requestTurnInterrupt(session_key);
+-    defer interrupt.deinit(allocator);
+-    if (!interrupt.requested) return false;
++    // A stop command carries no thread context (Slack slash commands are always
++    // top-level), so the busy turn may live in a `:thread:` child of the routed
++    // session rather than in the routed session itself. Interrupt the routed
++    // session and any active thread child beneath it.
++    if (!session_mgr.requestTurnInterruptWithThreads(session_key)) return false;
+ 
+     log.info("stop command interrupting running turn before enqueue session=0x{x}", .{
+         std.hash.Wyhash.hash(0, session_key),
+@@ -3889,3 +3891,102 @@ test "markError records AddressInUse for gateway component" {
+     try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
+     try std.testing.expectEqualStrings("AddressInUse", state.components[0].?.last_error.?);
+ }
++
++/// Produce the InboundMessage a single-command Slack `/name /stop` publishes.
++fn produceSlashStopMessage(allocator: std.mem.Allocator) !bus_mod.InboundMessage {
++    const slack_mod = channels_mod.slack;
++    var eb = bus_mod.Bus.init();
++    defer eb.close();
++
++    const allowed = [_][]const u8{"*"};
++    var ch = slack_mod.SlackChannel.init(allocator, "tok", null, "C1", &allowed);
++    ch.account_id = "sl-main";
++    ch.policy = .{ .dm = .allow, .group = .open };
++    ch.slash_command_enabled = true;
++    ch.slash_command_name = "nullclaw";
++    ch.setBus(&eb);
++
++    const payload_json =
++        \\{"command":"/nullclaw","text":"/stop","user_id":"U1","channel_id":"C1","team_id":"T1","response_url":"https://example.invalid/hook"}
++    ;
++    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
++    defer parsed.deinit();
++    ch.handleSlashCommand(parsed.value.object);
++
++    return eb.consumeInbound() orelse error.TestExpectedEqual;
++}
++
++test "Slack slash /stop interrupts the busy channel and thread sessions before enqueue" {
++    const allocator = std.testing.allocator;
++    const providers_mod = @import("providers/root.zig");
++    const session_mod = @import("session.zig");
++
++    const MockProvider = struct {
++        fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
++            return a.dupe(u8, "ok");
++        }
++        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers_mod.ChatRequest, _: []const u8, _: f64) anyerror!providers_mod.ChatResponse {
++            return error.ShouldNotChat;
++        }
++        fn supportsNativeTools(_: *anyopaque) bool {
++            return false;
++        }
++        fn getName(_: *anyopaque) []const u8 {
++            return "slash-mock";
++        }
++        fn deinitFn(_: *anyopaque) void {}
++    };
++    var provider_state: u8 = 0;
++    const provider_vtable = providers_mod.Provider.VTable{
++        .chatWithSystem = MockProvider.chatWithSystem,
++        .chat = MockProvider.chat,
++        .supportsNativeTools = MockProvider.supportsNativeTools,
++        .getName = MockProvider.getName,
++        .deinit = MockProvider.deinitFn,
++    };
++    const provider = providers_mod.Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
++
++    var noop = observability.NoopObserver{};
++    const config = Config{
++        .workspace_dir = "/tmp",
++        .config_path = "/tmp/config.json",
++        .default_model = "test/mock-model",
++        .allocator = allocator,
++    };
++    var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
++    defer sm.deinit();
++
++    // The message the Slack channel actually publishes for `/nullclaw /stop`.
++    var msg = try produceSlashStopMessage(allocator);
++    defer msg.deinit(allocator);
++
++    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
++    defer parsed_meta.deinit();
++    const routed = resolveInboundDispatchSessionKey(allocator, &config, &msg, parsed_meta.fields) orelse return error.TestExpectedEqual;
++    defer allocator.free(routed);
++
++    // Case 1: the routed channel session itself is busy.
++    const channel_session = try sm.getOrCreate(routed);
++    defer channel_session.turn_running.store(false, .release);
++    channel_session.agent.clearInterruptRequest();
++    channel_session.turn_running.store(true, .release);
++
++    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &msg));
++    try std.testing.expect(channel_session.agent.interrupt_requested.load(.acquire));
++
++    // Case 2: the busy turn lives in a thread session under the channel, which
++    // is what a typed thread reply resolves to. The top-level slash command has
++    // no thread context, so it must still reach that session.
++    channel_session.turn_running.store(false, .release);
++    channel_session.agent.clearInterruptRequest();
++
++    const thread_key = try std.fmt.allocPrint(allocator, "{s}:thread:2.0", .{routed});
++    defer allocator.free(thread_key);
++    const thread_session = try sm.getOrCreate(thread_key);
++    defer thread_session.turn_running.store(false, .release);
++    thread_session.agent.clearInterruptRequest();
++    thread_session.turn_running.store(true, .release);
++
++    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &msg));
++    try std.testing.expect(thread_session.agent.interrupt_requested.load(.acquire));
++}
+diff --git a/src/session.zig b/src/session.zig
+index 6989c85..7379edc 100644
+--- a/src/session.zig
++++ b/src/session.zig
+@@ -2242,6 +2242,38 @@ pub const SessionManager = struct {
+         };
+     }
+ 
++    /// Request interruption of a running turn for `session_key` together with
++    /// any active `:thread:` child sessions that name it as their parent.
++    ///
++    /// A top-level stop command carries no thread context (Slack slash commands
++    /// are always top-level), so the busy turn may live in a thread session
++    /// under the routed channel/DM session. This interrupts the routed session
++    /// and every active thread child so `/stop` reaches a turn running inside a
++    /// thread. Returns true when at least one turn was signaled.
++    pub fn requestTurnInterruptWithThreads(self: *SessionManager, session_key: []const u8) bool {
++        self.mutex.lock();
++        defer self.mutex.unlock();
++
++        var requested = false;
++        if (self.sessions.get(session_key)) |session| {
++            if (session.turn_running.load(.acquire)) {
++                session.agent.requestInterrupt();
++                requested = true;
++            }
++        }
++
++        var it = self.sessions.iterator();
++        while (it.next()) |entry| {
++            const parent = agent_routing.resolveThreadParentSessionKey(entry.key_ptr.*) orelse continue;
++            if (!std.mem.eql(u8, parent, session_key)) continue;
++            const session = entry.value_ptr.*;
++            if (!session.turn_running.load(.acquire)) continue;
++            session.agent.requestInterrupt();
++            requested = true;
++        }
++        return requested;
++    }
++
+     pub fn freeSessionSnapshots(allocator: Allocator, snapshots: []SessionSnapshot) void {
+         for (snapshots) |*snapshot| snapshot.deinit(allocator);
+         allocator.free(snapshots);
+-- 
+2.56.0
+
